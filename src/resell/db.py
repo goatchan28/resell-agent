@@ -57,6 +57,30 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         )
         """,
     ),
+    # 2 -- uploaded images, keyed by content hash so re-uploading the same photo
+    # is a lookup rather than an API call
+    (
+        """
+        CREATE TABLE images (
+            environment    TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            image_id       TEXT NOT NULL,
+            eps_url        TEXT,
+            expires_at     TEXT,
+            local_path     TEXT NOT NULL,
+            size_bytes     INTEGER,
+            width          INTEGER,
+            height         INTEGER,
+            image_format   TEXT,
+            uploaded_at    TEXT NOT NULL,
+            PRIMARY KEY (environment, content_sha256)
+        )
+        """,
+        "CREATE INDEX idx_images_expires ON images (expires_at)",
+    ),
+    # 3 -- local_path is the original (the identity); uploaded_path is what eBay
+    # actually received, which differs whenever a JPEG derivative was needed.
+    ("ALTER TABLE images ADD COLUMN uploaded_path TEXT",),
 )
 
 

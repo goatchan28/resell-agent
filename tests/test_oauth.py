@@ -278,3 +278,305 @@ def test_default_retry_safety_by_method():
     # createOffer / publishOffer / createImageFromFile are all POST, and every one
     # of them creates something new on success. Retrying is not free.
     assert "POST" not in idempotent
+
+
+# --- provisioning ------------------------------------------------------------
+
+
+def test_policy_field_names_are_correct_plurals():
+    """Regression: these were derived algorithmically and came out as
+    "paymentPolicys", so every existence check silently missed and each run
+    recreated policies that already existed."""
+    from resell.ebay.provision import POLICY_FIELDS
+
+    assert POLICY_FIELDS["payment_policy"] == ("paymentPolicies", "paymentPolicyId")
+    assert POLICY_FIELDS["return_policy"] == ("returnPolicies", "returnPolicyId")
+    assert POLICY_FIELDS["fulfillment_policy"] == (
+        "fulfillmentPolicies",
+        "fulfillmentPolicyId",
+    )
+    for container, id_field in POLICY_FIELDS.values():
+        assert not container.endswith("Policys")
+        assert id_field.endswith("PolicyId")
+
+
+def test_only_shipping_service_errors_trigger_fallback():
+    """A rejected service code is worth retrying with another code. Anything
+    else -- not opted in, bad auth, malformed payload -- recurs identically, so
+    retrying just burns calls and muddies the error."""
+    from resell.ebay.client import EbayApiError
+    from resell.ebay.provision import _looks_like_bad_service
+
+    bad_service = EbayApiError(
+        400, [{"errorId": 20400, "message": "Invalid shippingServiceCode value"}],
+        method="POST", url="/x",
+    )
+    not_opted_in = EbayApiError(
+        400, [{"errorId": 20403, "message": "User is not eligible for Business Policy."}],
+        method="POST", url="/x",
+    )
+    assert _looks_like_bad_service(bad_service) is True
+    assert _looks_like_bad_service(not_opted_in) is False
+
+
+# --- image validation --------------------------------------------------------
+
+
+def _png_bytes(width: int, height: int, salt: bytes = b"") -> bytes:
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"tEXt", salt) + chunk(b"IEND", b"")
+
+
+def _jpeg_bytes(width: int, height: int, exif_pad: int = 0) -> bytes:
+    import struct
+
+    out = b"\xff\xd8"
+    if exif_pad:
+        payload = b"Exif\x00\x00" + b"\x00" * exif_pad
+        out += b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+    sof = struct.pack(">BHHB", 8, height, width, 3) + b"\x00" * 9
+    return out + b"\xff\xc0" + struct.pack(">H", len(sof) + 2) + sof + b"\xff\xd9"
+
+
+def test_format_sniffing_ignores_extension():
+    """Extensions lie, especially after a rename or an export. Magic bytes do not."""
+    from resell.images import sniff_format
+
+    assert sniff_format(_png_bytes(10, 10)) == "png"
+    assert sniff_format(_jpeg_bytes(10, 10)) == "jpeg"
+    assert sniff_format(b"GIF89a" + b"\x00" * 20) == "gif"
+    assert sniff_format(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "webp"
+    assert sniff_format(b"\x00\x00\x00\x18ftypheic") == "heic"
+    assert sniff_format(b"\x00\x00\x00\x18ftypavif") == "avif"
+    assert sniff_format(b"8BPS" + b"\x00" * 20) is None
+
+
+def test_jpeg_dimensions_survive_large_exif(tmp_path: Path):
+    """Phone photos carry kilobytes of EXIF before the frame header, so a fixed
+    offset read gets garbage. The parser must walk the marker segments."""
+    from resell.images import inspect
+
+    path = tmp_path / "photo.jpg"
+    path.write_bytes(_jpeg_bytes(4032, 3024, exif_pad=8000))
+    facts = inspect(path)
+    assert (facts.width, facts.height) == (4032, 3024)
+
+
+def test_dimension_limit_is_the_sum_not_each_side(tmp_path: Path):
+    """eBay's limit is height + width <= 15000, so 8000x8000 fails while
+    9000x5000 passes despite having a longer side."""
+    from resell.images import inspect
+
+    fails = tmp_path / "big.png"
+    fails.write_bytes(_png_bytes(8000, 8000))
+    assert not inspect(fails).ok
+
+    passes = tmp_path / "wide.png"
+    passes.write_bytes(_png_bytes(9000, 5000))
+    assert inspect(passes).ok
+
+
+def test_low_resolution_warns_but_does_not_block(tmp_path: Path):
+    """A small photo is a quality problem, not a rejection. Blocking on it would
+    stop a listing eBay would have accepted."""
+    from resell.images import inspect
+
+    path = tmp_path / "small.png"
+    path.write_bytes(_png_bytes(300, 300))
+    facts = inspect(path)
+    assert facts.ok is True
+    assert facts.warnings
+
+
+def test_animated_gif_rejected(tmp_path: Path):
+    from resell.images import inspect
+
+    path = tmp_path / "anim.gif"
+    import struct
+
+    path.write_bytes(
+        b"GIF89a" + struct.pack("<HH", 600, 600) + b"\xf7\x00\x00" + b"\x00" * 768
+        + (b"\x21\xf9\x04" + b"\x00" * 5) * 3 + b"\x3b"
+    )
+    facts = inspect(path)
+    assert not facts.ok
+    assert facts.animated
+
+
+def test_set_level_limits(tmp_path: Path):
+    from resell.images import inspect_all
+
+    path = tmp_path / "a.png"
+    path.write_bytes(_png_bytes(1600, 1200))
+
+    _, errors = inspect_all([path] * 25)
+    assert any("24" in e for e in errors)
+
+    _, errors = inspect_all([path, path])
+    assert any("more than once" in e for e in errors)
+
+    _, errors = inspect_all([])
+    assert errors
+
+    _, errors = inspect_all([path])
+    assert errors == []
+
+
+# --- media uploader helpers --------------------------------------------------
+
+
+def test_rate_limiter_allows_burst_then_blocks():
+    """50 requests per 5 seconds, per eBay's documented Media API POST limit."""
+    from resell.ebay.media import RateLimiter
+
+    slept: list[float] = []
+    clock_value = [0.0]
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        clock_value[0] += seconds
+
+    limiter = RateLimiter()
+    for _ in range(50):
+        limiter.acquire(sleep=sleep, clock=lambda: clock_value[0])
+    assert slept == []
+
+    limiter.acquire(sleep=sleep, clock=lambda: clock_value[0])
+    assert len(slept) == 1
+    assert 5.0 <= slept[0] <= 5.1
+
+
+def test_image_id_parsed_from_location_header():
+    """The id arrives only in the location header, as a full getImage URI."""
+    from resell.ebay.media import EbayMediaUploader
+
+    extract = EbayMediaUploader._image_id_from
+    assert extract("https://apim.ebay.com/commerce/media/v1_beta/image/IMG-123", None) == "IMG-123"
+    assert extract("https://apim.ebay.com/commerce/media/v1_beta/image/IMG-123/", None) == "IMG-123"
+    assert extract("", {"imageId": "IMG-456"}) == "IMG-456"
+    assert extract("", None) is None
+
+
+def test_expiry_provenance_is_recorded():
+    """An assumed expiry and a stated one can land on the same date, which made
+    them indistinguishable in storage. The re-upload-before-expiry logic is only
+    as trustworthy as this date, so provenance is tracked separately."""
+    from resell.ebay.media import UploadedImage
+
+    stated = UploadedImage("id", "url", None, expiry_source="ebay")
+    assumed = UploadedImage("id", "url", None, expiry_source="assumed")
+    assert stated.expiry_source != assumed.expiry_source
+    assert UploadedImage("id", "url", None).expiry_source == "unknown"
+
+
+# --- HEIC handling -----------------------------------------------------------
+
+
+def _fake_heic(claimed_width: int, claimed_height: int, padding: int) -> bytes:
+    import struct
+
+    ftyp = struct.pack(">I", 20) + b"ftyp" + b"heic" + b"\x00" * 8
+    ispe = struct.pack(">I", 20) + b"ispe" + b"\x00" * 4 + struct.pack(">II", claimed_width, claimed_height)
+    return ftyp + b"\x00" * 40 + ispe + b"\x00" * padding
+
+
+def test_heic_dimensions_are_not_claimed(tmp_path: Path):
+    """Regression. The parser used to scan for the first `ispe` box, but iPhone
+    HEIC stores the image as a grid of 512x512 tiles each carrying its own ispe,
+    so it reported a tile size as the image size. Confidently wrong dimensions
+    produced fabricated resolution warnings and would have let an oversized image
+    past the 15,000px check. Dimensions are now read from the JPEG derivative."""
+    from resell.images import inspect
+
+    path = tmp_path / "IMG_3079.HEIC"
+    path.write_bytes(_fake_heic(512, 512, 3246 * 1024))
+    facts = inspect(path)
+
+    assert facts.image_format == "heic"
+    assert facts.width is None and facts.height is None
+    assert facts.dimensions == "unknown"
+    assert facts.ok is True  # unknown dimensions do not block; conversion follows
+
+
+def test_implausible_dimensions_discarded_for_any_format(tmp_path: Path):
+    """Format-agnostic guard: a compressed image cannot use 8+ bytes per pixel.
+    This is the check that would have caught the HEIC tile bug automatically."""
+    from resell.images import _dimensions_are_credible, inspect
+
+    assert _dimensions_are_credible(512, 512, 3_246_000) is False
+    assert _dimensions_are_credible(4032, 3024, 3_000_000) is True
+    # Tiny files are exempt, where header and metadata overhead dominates.
+    assert _dimensions_are_credible(10, 10, 5_000) is True
+
+    liar = tmp_path / "liar.png"
+    liar.write_bytes(_png_bytes(100, 100) + b"\x00" * (5 * 1024 * 1024))
+    facts = inspect(liar)
+    assert facts.width is None
+    assert any("implausible" in w for w in facts.warnings)
+
+
+def test_conversion_only_for_formats_eps_rejects():
+    from resell.derivatives import DIRECT_UPLOAD_FORMATS
+    from resell.images import NEEDS_LOCAL_CONVERSION
+
+    assert "jpeg" in DIRECT_UPLOAD_FORMATS
+    assert "png" in DIRECT_UPLOAD_FORMATS
+    assert "gif" in DIRECT_UPLOAD_FORMATS
+    # HEIC is documented as supported by the Media API but rejected by EPS with
+    # error 190203, which is the whole reason this layer exists.
+    assert "heic" in NEEDS_LOCAL_CONVERSION
+    assert not (DIRECT_UPLOAD_FORMATS & NEEDS_LOCAL_CONVERSION)
+
+
+def test_derivative_is_keyed_on_original_content(tmp_path: Path):
+    """Identity must follow the original file, not the re-encoded output, so the
+    same photo dedupes across runs even though encoding is not byte-stable."""
+    import resell.derivatives as derivatives
+
+    source = tmp_path / "shot.HEIC"
+    source.write_bytes(_fake_heic(512, 512, 200_000))
+    digest = derivatives.source_digest(source)
+
+    calls: list[int] = []
+
+    def fake_convert(src: Path, dst: Path, quality: int) -> None:
+        calls.append(quality)
+        dst.write_bytes(_jpeg_bytes(4032, 3024) + b"\x00" * 1000)
+
+    original_convert = derivatives._convert
+    derivatives._convert = fake_convert
+    try:
+        first = derivatives.ensure_uploadable(source, tmp_path / "cache")
+        assert first.converted is True
+        assert first.upload_path.name == f"{digest[:16]}.jpg"
+        assert source.exists()  # original preserved as source of truth
+
+        second = derivatives.ensure_uploadable(source, tmp_path / "cache")
+        assert second.upload_path == first.upload_path
+        assert len(calls) == 1  # cached, not re-encoded
+    finally:
+        derivatives._convert = original_convert
+
+
+def test_oversized_derivative_raises_rather_than_uploading(tmp_path: Path):
+    import resell.derivatives as derivatives
+
+    source = tmp_path / "huge.HEIC"
+    source.write_bytes(_fake_heic(512, 512, 200_000))
+
+    def always_huge(src: Path, dst: Path, quality: int) -> None:
+        dst.write_bytes(_jpeg_bytes(4032, 3024) + b"\x00" * (20 * 1024 * 1024))
+
+    original_convert = derivatives._convert
+    derivatives._convert = always_huge
+    try:
+        with pytest.raises(derivatives.ConversionError, match="over eBay's 12 MB limit"):
+            derivatives.ensure_uploadable(source, tmp_path / "cache")
+    finally:
+        derivatives._convert = original_convert

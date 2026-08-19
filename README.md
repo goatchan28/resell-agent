@@ -164,8 +164,116 @@ macOS Keychain.
   separate field in `EbayEnvironment` rather than assumed identical; confirm it
   on the first real upload.
 
+```bash
+uv run resell account provision
+```
+
+Idempotently ensures the four things `publishOffer` requires: payment, return and
+fulfillment policies, plus one merchant inventory location. Check-then-create on
+a stable name, so re-running is harmless and resuming after a partial failure
+does not duplicate anything.
+
+Two deliberate choices here:
+
+**Shipping service is a constant, not a Metadata lookup.** The authoritative code
+list lives in the Trading API's `GeteBayDetails`, so dynamic discovery would
+reintroduce an XML dependency in order to solve a problem we do not have — one
+seller, one marketplace, one shipping method needs one valid service, not a menu.
+Override with `EBAY_SHIPPING_SERVICE`; a small fallback list handles a rejected
+code. Revisit for a second marketplace or weight-based service selection.
+
+**The location check uses the keyed route, not the list.** `GET /location` is
+currently throwing 500/25001 in sandbox while `GET /location/{key}` is a separate
+route, so this routes around the outage and simultaneously answers whether it is
+cosmetic or blocking.
+
+### Known unknown: seller registration
+
+`getPrivileges` returns `sellerRegistrationCompleted: false` for sandbox test
+users. This is not merely cosmetic — `publishOffer` can fail with error 25018
+("Incomplete account information") when an account is not provisioned as a
+seller, and the sandbox UI cannot be used to fix it.
+
+However, eBay documents that a test user created through the Sandbox User
+Registration Tool can list items without further validation; `ValidateTestUserRegistration`
+is the remedy only for manually registered accounts. So the field appears
+unreliable in sandbox rather than authoritative.
+
+Unresolved by documentation, decisively settled by attempting a publish. If 25018
+appears, the fix is `ValidateTestUserRegistration` — a Trading API call, which
+would reintroduce XML as a one-time provisioning dependency (not in the item
+pipeline). `sellerRegistrationCompleted` is a genuine production precondition and
+belongs as a deterministic gateway check before any production publish.
+
+### Photos
+
+```bash
+uv run resell images check ~/Desktop/photos/*.jpg     # offline, no credentials
+uv run resell images upload ~/Desktop/photos/*.jpg    # to eBay Picture Services
+```
+
+`images.py` validates locally against eBay's documented limits — 12 MB (error
+190201), 15,000 px height+width (190202), the eight accepted formats (190203),
+24 per listing, no animated GIFs — so a bad photo fails in microseconds rather
+than costing an API call and a rate-limit slot.
+
+Dimensions come from parsing file headers directly, no Pillow. Note the limit is
+height **+** width, so 8000x8000 fails while 9000x5000 passes.
+
+HEIC and AVIF dimensions are deliberately **not** parsed. An earlier version
+scanned for the first `ispe` box, which is wrong for real iPhone photos: HEIC
+stores the image as a grid of 512x512 tiles, each with its own `ispe`, so it
+reported a tile size as the image size — fabricating resolution warnings and
+potentially passing an oversized image. Dimensions are read from the JPEG
+derivative instead, which is both parseable and what actually reaches eBay.
+
+A format-agnostic plausibility guard backs this up: claimed dimensions implying
+more than 8 bytes per pixel are discarded as not credible for a compressed
+format. That check is what would have caught the tile bug automatically, so it
+now runs on every image.
+
+### HEIC conversion
+
+eBay's Media API docs list HEIC, AVIF and WEBP as supported. **EPS rejects HEIC
+with error 190203.** The Trading API's own EPS documentation lists only JPG, GIF,
+PNG, BMP and TIF, and sellers report HEIC failing in eBay's first-party Seller
+Hub as well — so the Media API docs overstate what the backend accepts.
+
+`derivatives.py` handles this without manual intervention:
+
+- The original is never modified or discarded. It stays the source of truth, so a
+  future Facebook Marketplace or Mercari adapter can send the original or its own
+  preferred representation.
+- Formats EPS rejects get a JPEG derivative, cached under `data/derivatives/` and
+  keyed by the **original's** content hash — so identity follows the source file
+  and dedupe survives the fact that re-encoding is not byte-stable.
+- Quality steps down from 92 through 70 only if needed to fit under 12 MB, and
+  raises rather than uploading something that cannot fit.
+- Conversion uses macOS `sips`: already present, no dependency, and Apple's own
+  decoder, so every iPhone HEIC variant works including HDR and Live Photo
+  containers. Pillow is the fallback on other platforms.
+- `--no-convert` forces original bytes at eBay, for probing what EPS accepts.
+
+Errors block; warnings do not. Low resolution is a quality problem, not a
+rejection — blocking on it would stop a listing eBay would have accepted.
+
+`ebay/media.py` wraps `createImageFromFile` behind a one-method `ImageUploader`
+interface, so the `v1_beta` path is a one-file change if it moves:
+
+- **Content-hash dedupe.** Uploads are keyed by SHA-256 of the file, so
+  re-uploading the same photo is a database lookup. Makes the step safely
+  repeatable, which is what the state machine will require of it.
+- **Expiry is tracked.** eBay no longer extends unused EPS URLs past 30 days and
+  this pipeline has a human approval gate that can take days, so an image within
+  two days of expiry is re-uploaded rather than handed over as a dead URL.
+- **Host is resolved, not assumed.** eBay documents these methods on
+  `apim.ebay.com` while the rest of the platform is on `api.ebay.com`. The
+  uploader tries the documented host, falls back once on 404, and caches the
+  winner — so the inconsistency costs at most one wasted call, ever.
+- **Not retry_safe.** A retried POST creates a second EPS image.
+
 ## Next
 
-Media API uploader (`createImageFromFile`) plus the local pre-flight validator —
-dimensions, file size, format, count — so bad photos fail before spending a call.
-Then the item state machine.
+The item state machine, then `createOrReplaceInventoryItem` → `createOffer` →
+`publishOffer`. The publish attempt is also what settles the open error 25018
+question above.

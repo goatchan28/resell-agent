@@ -282,6 +282,104 @@ def cmd_account_optin(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_account_provision(args: argparse.Namespace) -> int:
+    """Ensure the three business policies and one inventory location exist."""
+    config, conn = _open_db_and_config()
+    from resell.ebay.client import EbayClient
+    from resell.ebay.provision import provision
+
+    with EbayClient(config, conn) as client:
+        steps = provision(client)
+
+    print(f"\nProvisioning {config.env.name} / {config.marketplace_id}\n")
+    width = max(len(s.name) for s in steps)
+    for step in steps:
+        mark = {"exists": "=", "created": "+", "failed": "x"}[step.status]
+        line = f"  {mark} {step.name:<{width}}  {step.status:<8}"
+        if step.identifier:
+            line += f" {step.identifier}"
+        print(line)
+        if step.detail and step.status != "failed":
+            print(f"      {step.detail}")
+        elif step.status == "failed":
+            for detail_line in step.detail.splitlines():
+                print(f"      {detail_line}")
+
+    failed = [s for s in steps if s.status == "failed"]
+    if failed:
+        print(f"\n{len(failed)} step(s) failed. Publishing is blocked until they pass.")
+        return 1
+    print("\nAll publish preconditions satisfied. IDs saved for the publish flow.")
+    return 0
+
+
+def cmd_images_check(args: argparse.Namespace) -> int:
+    """Validate photos locally. No network, no credentials, no API calls spent."""
+    from resell.images import inspect_all
+
+    results, set_errors = inspect_all(args.paths)
+    for facts in results:
+        mark = "ok " if facts.ok else "BAD"
+        size = f"{facts.size_bytes / 1024:.0f} KB"
+        print(f"  {mark} {facts.path.name:<28} {str(facts.image_format or '?'):<5} "
+              f"{facts.dimensions:<12} {size:>9}")
+        for error in facts.errors:
+            print(f"      error:   {error}")
+        for warning in facts.warnings:
+            print(f"      warning: {warning}")
+    for error in set_errors:
+        print(f"  BAD set: {error}")
+
+    bad = [f for f in results if not f.ok]
+    if bad or set_errors:
+        print(f"\n{len(bad)} file(s) and {len(set_errors)} set-level problem(s).")
+        return 1
+    warnings = sum(len(f.warnings) for f in results)
+    print(f"\n{len(results)} image(s) valid" + (f", {warnings} warning(s)" if warnings else ""))
+    return 0
+
+
+def cmd_images_upload(args: argparse.Namespace) -> int:
+    """Validate, then upload to eBay Picture Services."""
+    config, conn = _open_db_and_config()
+    from resell.ebay.client import EbayClient
+    from resell.ebay.media import EbayMediaUploader, upload_all
+
+    with EbayClient(config, conn) as client:
+        uploader = EbayMediaUploader(client, conn, convert=not args.no_convert)
+        results = upload_all(uploader, args.paths)
+
+    failures = 0
+    for path, outcome in results:
+        if isinstance(outcome, Exception):
+            failures += 1
+            print(f"  FAILED {path.name}")
+            for line in str(outcome).splitlines():
+                print(f"      {line}", file=sys.stderr)
+            continue
+        tag = "reused" if outcome.reused else "uploaded"
+        print(f"  {tag:<8} {path.name:<28} {outcome.image_id}")
+        if outcome.converted_from:
+            print(f"      converted: {outcome.converted_from}")
+        if outcome.eps_url:
+            print(f"      {outcome.eps_url}")
+        if outcome.expires_at:
+            note = {
+                "ebay": "per eBay",
+                "assumed": "ASSUMED - eBay returned no date",
+                "stored": "recorded at upload",
+            }.get(outcome.expiry_source, outcome.expiry_source)
+            print(f"      expires {outcome.expires_at.date().isoformat()}  ({note})")
+        if not outcome.usable:
+            print("      warning: no EPS URL resolved; not usable in a listing yet")
+
+    if failures:
+        print(f"\n{failures} of {len(results)} failed.", file=sys.stderr)
+        return 1
+    print(f"\n{len(results)} image(s) hosted by eBay.")
+    return 0
+
+
 def cmd_events(args: argparse.Namespace) -> int:
     config, conn = _open_db_and_config(require_credentials=False)
     for row in reversed(db.recent_events(conn, args.limit)):
@@ -335,6 +433,23 @@ def build_parser() -> argparse.ArgumentParser:
     account_sub.add_parser(
         "optin", help="opt the seller into business policies"
     ).set_defaults(func=cmd_account_optin)
+    account_sub.add_parser(
+        "provision", help="ensure business policies and inventory location exist"
+    ).set_defaults(func=cmd_account_provision)
+
+    images = subparsers.add_parser("images", help="listing photo handling")
+    images_sub = images.add_subparsers(dest="images_command", required=True)
+    check = images_sub.add_parser("check", help="validate photos locally, offline")
+    check.add_argument("paths", nargs="+")
+    check.set_defaults(func=cmd_images_check)
+    upload = images_sub.add_parser("upload", help="upload photos to eBay Picture Services")
+    upload.add_argument("paths", nargs="+")
+    upload.add_argument(
+        "--no-convert",
+        action="store_true",
+        help="send original bytes even for formats EPS rejects (diagnostic only)",
+    )
+    upload.set_defaults(func=cmd_images_upload)
 
     subparsers.add_parser("smoke", help="verify auth against eBay").set_defaults(
         func=cmd_smoke

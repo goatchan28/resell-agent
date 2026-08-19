@@ -580,3 +580,57 @@ def test_oversized_derivative_raises_rather_than_uploading(tmp_path: Path):
             derivatives.ensure_uploadable(source, tmp_path / "cache")
     finally:
         derivatives._convert = original_convert
+
+
+# --- execution spike ---------------------------------------------------------
+
+
+def test_only_required_aspects_are_filled():
+    """Optional aspects are omitted; free-text required aspects get eBay's
+    conventional placeholder rather than being left empty (which fails publish)."""
+    from resell.ebay.client import EbayClient  # noqa: F401  (import shape check)
+    from resell.spike import required_aspects
+
+    class FakeClient:
+        def get(self, path, **kwargs):
+            return {
+                "aspects": [
+                    {
+                        "localizedAspectName": "Format",
+                        "aspectConstraint": {"aspectRequired": True},
+                        "aspectValues": [{"localizedValue": "Paperback"}, {"localizedValue": "Hardcover"}],
+                    },
+                    {
+                        "localizedAspectName": "Author",
+                        "aspectConstraint": {"aspectRequired": True},
+                        "aspectValues": [],
+                    },
+                    {
+                        "localizedAspectName": "Genre",
+                        "aspectConstraint": {"aspectRequired": False},
+                        "aspectValues": [{"localizedValue": "Sci-Fi"}],
+                    },
+                ]
+            }
+
+    filled = required_aspects(FakeClient(), "0", "261186")
+    assert filled == {"Format": ["Paperback"], "Author": ["Does not apply"]}
+    assert "Genre" not in filled
+
+
+def test_publish_diagnosis_identifies_each_known_cause():
+    from resell.spike import diagnose_publish_failure
+
+    assert "25018 CONFIRMED" in diagnose_publish_failure([25018], "")
+    assert "shipping service" in diagnose_publish_failure([25007], "")
+    assert "system error" in diagnose_publish_failure([25001], "").lower()
+    assert "aspect" in diagnose_publish_failure([], "Missing required item specific").lower()
+    assert "Unrecognised" in diagnose_publish_failure([12345], "")
+
+
+def test_write_calls_carry_content_language():
+    """The Inventory API requires Content-Language on writes, and the error it
+    returns when the header is absent does not mention the header."""
+    from resell.spike import WRITE_HEADERS
+
+    assert WRITE_HEADERS["Content-Language"] == "en-US"

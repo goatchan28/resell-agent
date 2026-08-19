@@ -237,6 +237,18 @@ class Gateway:
         approval" actually true, and leaves the item one re-approval away rather
         than sending it back through pricing.
         """
+        # Every caller is already blocked on terminal states, so this is belt and
+        # braces -- but the approval that authorised a live listing is the record of
+        # what was published, and no future code path should be able to erase it.
+        if current_state(self.conn, sku) in TERMINAL_STATES:
+            log_event(
+                self.conn,
+                "approval.void_refused",
+                {"reason": reason, "why": "item is terminal; approval is a historical record"},
+                item_id=sku,
+            )
+            return 0
+
         cursor = self.conn.execute(
             "UPDATE approval SET voided_at = ?, voided_reason = ? "
             "WHERE sku = ? AND voided_at IS NULL",
@@ -298,20 +310,29 @@ class Gateway:
             )
         return Accepted("IngestItem", sku, None, ItemState.INTAKE, f"allocated {sku}")
 
-    def _require_mutable_photos(self, sku: str, command: str) -> None:
-        """Photo changes are refused once the item is terminal.
+    def _require_not_terminal(self, sku: str, command: str, what: str) -> None:
+        """Refuse authoritative mutations once the item is terminal.
 
-        A published listing lives on eBay; changing the local photo set would
-        silently desync the two, and listing revision is not implemented. Better to
-        refuse than to diverge.
+        A published listing lives on eBay; changing the local record of what the
+        item *is* would silently desync the two, and listing revision is not
+        implemented. Worse, voiding the approval afterwards destroys the record of
+        what was actually agreed and published -- at that point the approval is
+        historical evidence, not a pending permission.
+
+        Note what is deliberately still allowed: record_evidence. Observations are
+        append-only and non-authoritative, so a fact learned about a listed item has
+        somewhere to go. It is promoted into a new identification only once a
+        revision workflow exists to carry it to eBay.
         """
         state = current_state(self.conn, sku)
         if state in TERMINAL_STATES:
             raise Rejected(
                 command,
                 [
-                    f"item is {state}; the photo set cannot change. "
-                    "Revising a published listing is not implemented."
+                    f"item is {state}; {what} cannot change.",
+                    "Revising a published listing is not implemented, and changing "
+                    "this would void the approval recording what was published.",
+                    "New facts can still be recorded as evidence.",
                 ],
             )
 
@@ -326,7 +347,7 @@ class Gateway:
         validation_errors: list[str] | None,
     ) -> Accepted:
         get_item(self.conn, sku)
-        self._require_mutable_photos(sku, "AttachPhoto")
+        self._require_not_terminal(sku, "AttachPhoto", "the photo set")
         position = (
             self.conn.execute(
                 "SELECT COALESCE(MAX(position), 0) + 1 FROM photo WHERE sku = ?", (sku,)
@@ -359,7 +380,7 @@ class Gateway:
         is part of the listing's meaning, not just tidiness.
         """
         get_item(self.conn, sku)
-        self._require_mutable_photos(sku, "RemovePhoto")
+        self._require_not_terminal(sku, "RemovePhoto", "the photo set")
 
         if (position is None) == (content_sha256 is None):
             raise Rejected("RemovePhoto", ["give exactly one of position or content_sha256"])
@@ -458,6 +479,7 @@ class Gateway:
         real money moves.
         """
         get_item(self.conn, sku)
+        self._require_not_terminal(sku, "ProposeIdentification", "the identification")
         with transaction(self.conn):
             row = self.conn.execute(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM identification WHERE sku = ?",
@@ -582,19 +604,31 @@ class Gateway:
         return result
 
     def revise(self, sku: str, reason: str = "operator requested revision") -> Accepted:
-        """Back to pricing from proposed / approved / publish_failed. Voids approvals."""
-        self._void_approvals(sku, reason)
-        return self._transition(sku, ItemState.PRICING, command="Revise", detail=reason)
+        """Back to pricing from proposed / approved / publish_failed. Voids approvals.
+
+        Wrapped in a transaction so a rejected transition rolls the side effects
+        back. Previously the approvals were voided first and the legality check ran
+        second, which meant a refused command still destroyed state -- a rejected
+        command must leave nothing behind.
+        """
+        with transaction(self.conn):
+            self._void_approvals(sku, reason)
+            return self._transition(
+                sku, ItemState.PRICING, command="Revise", detail=reason
+            )
 
     def abandon(self, sku: str, reason: str) -> Accepted:
         if not reason.strip():
             raise Rejected("Abandon", ["a reason is required"])
-        self._void_approvals(sku, "item abandoned")
-        self.conn.execute(
-            "UPDATE listing SET active = 0, updated_at = ? WHERE sku = ? AND active = 1",
-            (now_iso(), sku),
-        )
-        return self._transition(sku, ItemState.ABANDONED, command="Abandon", detail=reason)
+        with transaction(self.conn):
+            self._void_approvals(sku, "item abandoned")
+            self.conn.execute(
+                "UPDATE listing SET active = 0, updated_at = ? WHERE sku = ? AND active = 1",
+                (now_iso(), sku),
+            )
+            return self._transition(
+                sku, ItemState.ABANDONED, command="Abandon", detail=reason
+            )
 
     # --- operator-only commands ---------------------------------------------
 

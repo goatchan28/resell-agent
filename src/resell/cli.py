@@ -380,47 +380,6 @@ def cmd_images_upload(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_spike(args: argparse.Namespace) -> int:
-    """Throwaway: prove inventory item -> offer -> published listing."""
-    config, conn = _open_db_and_config()
-    from resell.ebay.client import EbayClient
-    from resell.spike import SpikeAborted, diagnose_publish_failure, run
-
-    print(f"\nExecution spike: {config.env.name} / {config.marketplace_id}\n")
-    with EbayClient(config, conn) as client:
-        try:
-            steps = run(client, conn)
-        except SpikeAborted as exc:
-            print(f"aborted: {exc}", file=sys.stderr)
-            return 2
-
-    for step in steps:
-        print(f"  {'ok ' if step.ok else 'FAIL'} {step.name:<30} {step.detail.splitlines()[0][:80]}")
-        if not step.ok:
-            for line in step.detail.splitlines()[1:]:
-                print(f"       {line}", file=sys.stderr)
-
-    failed = [s for s in steps if not s.ok]
-    if failed:
-        last = failed[-1]
-        print()
-        if last.name == "publishOffer":
-            print(diagnose_publish_failure(last.data.get("errorIds", []), last.detail))
-        else:
-            print(f"Stopped at {last.name}. Publishing not reached.")
-        return 1
-
-    listing_id = next(
-        (s.data.get("listingId") for s in reversed(steps) if s.data.get("listingId")), None
-    )
-    print(f"\nPUBLISHED. listingId={listing_id}")
-    print(
-        "\nThis settles it: sellerRegistrationCompleted: false does NOT block "
-        "publishing in Sandbox.\nNo Trading API or XML dependency is needed."
-    )
-    return 0
-
-
 def cmd_events(args: argparse.Namespace) -> int:
     config, conn = _open_db_and_config(require_credentials=False)
     for row in reversed(db.recent_events(conn, args.limit)):
@@ -499,9 +458,6 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("smoke", help="verify auth against eBay").set_defaults(
         func=cmd_smoke
     )
-    subparsers.add_parser(
-        "spike", help="THROWAWAY: publish one hardcoded Sandbox listing"
-    ).set_defaults(func=cmd_spike)
 
     events = subparsers.add_parser("events", help="tail the event log")
     events.add_argument("-n", "--limit", type=int, default=20)

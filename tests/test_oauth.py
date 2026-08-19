@@ -5,6 +5,7 @@ Every test here runs without network access, credentials, or httpx.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -580,63 +581,6 @@ def test_oversized_derivative_raises_rather_than_uploading(tmp_path: Path):
             derivatives.ensure_uploadable(source, tmp_path / "cache")
     finally:
         derivatives._convert = original_convert
-
-
-# --- execution spike ---------------------------------------------------------
-
-
-def test_only_required_aspects_are_filled():
-    """Optional aspects are omitted; free-text required aspects get eBay's
-    conventional placeholder rather than being left empty (which fails publish)."""
-    from resell.ebay.client import EbayClient  # noqa: F401  (import shape check)
-    from resell.spike import required_aspects
-
-    class FakeClient:
-        def get(self, path, **kwargs):
-            return {
-                "aspects": [
-                    {
-                        "localizedAspectName": "Format",
-                        "aspectConstraint": {"aspectRequired": True},
-                        "aspectValues": [{"localizedValue": "Paperback"}, {"localizedValue": "Hardcover"}],
-                    },
-                    {
-                        "localizedAspectName": "Author",
-                        "aspectConstraint": {"aspectRequired": True},
-                        "aspectValues": [],
-                    },
-                    {
-                        "localizedAspectName": "Genre",
-                        "aspectConstraint": {"aspectRequired": False},
-                        "aspectValues": [{"localizedValue": "Sci-Fi"}],
-                    },
-                ]
-            }
-
-    filled = required_aspects(FakeClient(), "0", "261186")
-    assert filled == {"Format": ["Paperback"], "Author": ["Does not apply"]}
-    assert "Genre" not in filled
-
-
-def test_publish_diagnosis_identifies_each_known_cause():
-    from resell.spike import diagnose_publish_failure
-
-    assert "25018 CONFIRMED" in diagnose_publish_failure([25018], "")
-    assert "shipping service" in diagnose_publish_failure([25007], "")
-    assert "system error" in diagnose_publish_failure([25001], "").lower()
-    assert "aspect" in diagnose_publish_failure([], "Missing required item specific").lower()
-    assert "Unrecognised" in diagnose_publish_failure([12345], "")
-
-
-def test_write_calls_carry_content_language():
-    """The Inventory API requires Content-Language on writes, and the error it
-    returns when the header is absent does not mention the header."""
-    from resell.spike import WRITE_HEADERS
-
-    assert WRITE_HEADERS["Content-Language"] == "en-US"
-
-
-# --- domain: states, sku, pricing --------------------------------------------
 
 
 def test_sku_is_sequential_zero_padded_and_sortable():
@@ -1423,3 +1367,542 @@ def test_migration_6_heals_approved_without_a_live_approval(tmp_path: Path):
     assert conn.execute(
         "SELECT COUNT(*) FROM events WHERE kind = 'item.state_repaired'"
     ).fetchone()[0] == 2
+
+
+# --- publish executor --------------------------------------------------------
+
+
+def test_publish_error_classification():
+    from resell.ebay.client import EbayApiError
+    from resell.ebay.publisher import classify_publish_error
+
+    def err(error_id: int, status: int = 400, message: str = "x") -> EbayApiError:
+        return EbayApiError(
+            status, [{"errorId": error_id, "message": message}], method="POST", url="/x"
+        )
+
+    assert "25018" in classify_publish_error(err(25018))
+    assert "shipping service" in classify_publish_error(err(25007))
+    assert "system error" in classify_publish_error(err(25001, status=500)).lower()
+    assert "aspect" in classify_publish_error(err(999, message="Missing item specific")).lower()
+    assert "Unrecognised" in classify_publish_error(err(4242))
+
+
+def test_photo_integrity_refuses_content_that_changed_on_disk(tmp_path: Path):
+    """The approval covers specific photo content by hash. If a file is edited
+    after approval, publishing it would send eBay something never approved."""
+    import hashlib
+
+    from resell.ebay.publisher import PublishAborted, Publisher
+    from resell.gateway import Gateway
+
+    conn = db.connect(tmp_path / "integrity.db")
+    gateway = Gateway(conn, environment="sandbox")
+    photo = tmp_path / "p.jpg"
+    photo.write_bytes(_jpeg_bytes(1600, 1200) + b"\x00" * 1000)
+
+    sku = gateway.ingest_item(purchase_cost_cents=2500).sku
+    gateway.attach_photo(
+        sku, source_path=str(photo),
+        content_sha256=hashlib.sha256(photo.read_bytes()).hexdigest(),
+        image_format="jpeg", size_bytes=photo.stat().st_size, validation_errors=None,
+    )
+    publisher = Publisher.__new__(Publisher)
+    publisher.conn = conn
+    publisher.gateway = gateway
+
+    # Unchanged: passes.
+    assert len(publisher._verify_photo_integrity(sku)) == 1
+
+    photo.write_bytes(_jpeg_bytes(1600, 1200) + b"\x00" * 2000)
+    with pytest.raises(PublishAborted, match="changed on disk"):
+        publisher._verify_photo_integrity(sku)
+
+    photo.unlink()
+    with pytest.raises(PublishAborted, match="file is missing"):
+        publisher._verify_photo_integrity(sku)
+
+
+def test_local_check_failure_leaves_the_item_recoverable(tmp_path: Path):
+    """`publishing` has only two exits (listed, publish_failed), so entering it and
+    then aborting on a local problem would strand the item. Checks therefore run
+    before the transition."""
+    import hashlib
+
+    from resell.domain import TRANSITIONS, ItemState
+    from resell.ebay.publisher import PublishAborted, Publisher
+    from resell.gateway import Gateway
+
+    conn = db.connect(tmp_path / "recover.db")
+    gateway = Gateway(conn, environment="sandbox")
+    photo = tmp_path / "p.jpg"
+    photo.write_bytes(_jpeg_bytes(1600, 1200) + b"\x00" * 1000)
+    digest = hashlib.sha256(photo.read_bytes()).hexdigest()
+
+    sku = gateway.ingest_item(purchase_cost_cents=2500).sku
+    gateway.attach_photo(
+        sku, source_path=str(photo), content_sha256=digest,
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(
+        sku, title="t", category_id="3002", condition_id="USED_EXCELLENT"
+    )
+    gateway.begin_pricing(sku)
+    accepted = gateway.propose_listing(sku, _valid_proposal(sku, (digest,)))
+    gateway.approve(sku, accepted.data["proposal_hash"], operator=True)
+
+    photo.write_bytes(_jpeg_bytes(1600, 1200) + b"\x00" * 5000)  # edit after approval
+
+    publisher = Publisher.__new__(Publisher)
+    publisher.conn = conn
+    publisher.gateway = gateway
+    with pytest.raises(PublishAborted):
+        publisher.publish(sku)
+
+    state = conn.execute("SELECT state FROM item WHERE sku = ?", (sku,)).fetchone()[0]
+    assert state == "approved"
+    # And `approved` has a way out, unlike `publishing`.
+    assert ItemState.PROPOSED in TRANSITIONS[ItemState.APPROVED]
+    assert TRANSITIONS[ItemState.PUBLISHING] == frozenset(
+        {ItemState.LISTED, ItemState.PUBLISH_FAILED}
+    )
+
+
+def test_publish_progress_makes_each_stage_skippable(tmp_path: Path):
+    """Resumption is driven by the listing row, so an interrupted publish continues
+    at the next call rather than repeating a non-idempotent one."""
+    from resell.gateway import Gateway, active_listing
+
+    conn = db.connect(tmp_path / "progress.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = _build_approved(gateway, conn)
+    gateway.begin_publishing(sku)
+
+    listing = active_listing(conn, sku, "EBAY_US", "sandbox")
+    assert not listing["has_inventory_item"]
+    assert listing["offer_id"] is None
+    assert listing["listing_id"] is None
+
+    gateway.record_publish_progress(sku, has_inventory_item=True)
+    gateway.record_publish_progress(sku, offer_id="OFF-777")
+    listing = active_listing(conn, sku, "EBAY_US", "sandbox")
+    assert listing["has_inventory_item"] == 1
+    assert listing["offer_id"] == "OFF-777"
+    assert listing["listing_id"] is None
+    # Without a listing_id the item still cannot be marked listed.
+    from resell.gateway import Rejected
+
+    with pytest.raises(Rejected, match="does not prove publication"):
+        gateway.mark_listed(sku)
+
+    gateway.record_publish_progress(sku, listing_id="110590224174")
+    assert gateway.mark_listed(sku).to_state.value == "listed"
+
+
+def test_taxonomy_4xx_aborts_while_5xx_proceeds(tmp_path: Path):
+    """A 5xx means Taxonomy is down, which should not block a publish the proposal
+    gate already validated. A 4xx means eBay rejected OUR request — almost always an
+    invalid category — and proceeding would fail later with an inventory item and
+    offer already written."""
+    from resell.ebay.client import EbayApiError
+    from resell.ebay.publisher import PublishAborted, Publisher
+
+    class FakeListing(dict):
+        def __getitem__(self, key):
+            return dict.get(self, key)
+
+    listing = FakeListing(
+        sku="MP-000001", marketplace="EBAY_US", category_id="3002", aspects="{}"
+    )
+
+    publisher = Publisher.__new__(Publisher)
+
+    def raise_status(status: int):
+        def _raise(_listing):
+            raise EbayApiError(
+                status, [{"errorId": 62003, "message": "The specified category ID is not valid."}],
+                method="GET", url="/taxonomy",
+            )
+        return _raise
+
+    publisher.required_aspects = raise_status(500)
+    step = publisher._check_aspects(listing)
+    assert step.ok
+    assert "500" in step.detail
+
+    publisher.required_aspects = raise_status(400)
+    with pytest.raises(PublishAborted) as info:
+        publisher._check_aspects(listing)
+    message = str(info.value)
+    assert "not a valid leaf category" in message
+    assert "suggest-category" in message  # the remedy is named
+
+
+def test_identify_merges_by_default_and_replaces_on_request(tmp_path: Path, monkeypatch):
+    """Regression: correcting one field with `identify --category X` silently
+    discarded title, condition and aspects, because a new identification supersedes
+    rather than edits. The domain semantics are right; the flag interface was a
+    trap."""
+    import argparse
+
+    monkeypatch.setenv("RESELL_DB", str(tmp_path / "identify.db"))
+    monkeypatch.setenv("EBAY_ENV", "sandbox")
+    monkeypatch.setenv("EBAY_CLIENT_ID", "a")
+    monkeypatch.setenv("EBAY_CLIENT_SECRET", "b")
+    monkeypatch.setenv("EBAY_RUNAME", "X-Y-Z-abc")
+
+    from resell import cli_item
+    from resell.gateway import Gateway, current_identification
+
+    conn = db.connect(tmp_path / "identify.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = gateway.ingest_item(purchase_cost_cents=2500).sku
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256=_digest("a"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+
+    def identify(**overrides):
+        args = argparse.Namespace(
+            sku=sku, title=None, description=None, brand=None, model=None, variant=None,
+            category=None, condition=None, aspect=None, confidence=None, reasoning=None,
+            replace=False,
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        assert cli_item.cmd_item_identify(args) == 0
+
+    identify(
+        title="Blazer 42R", description="Navy wool.", brand="Brooks Brothers",
+        category="3002", condition="USED_EXCELLENT", aspect=["Brand=Brooks Brothers"],
+    )
+    identify(category="3001")
+
+    current = current_identification(conn, sku)
+    assert current["version"] == 2
+    assert current["category_id"] == "3001"        # the correction applied
+    assert current["title"] == "Blazer 42R"        # and nothing else was lost
+    assert current["condition_id"] == "USED_EXCELLENT"
+    assert current["brand"] == "Brooks Brothers"
+    assert json.loads(current["aspects"]) == {"Brand": ["Brooks Brothers"]}
+
+    identify(category="57001", replace=True)
+    current = current_identification(conn, sku)
+    assert current["version"] == 3
+    assert current["category_id"] == "57001"
+    assert current["title"] is None               # --replace means replace
+
+    # Superseded versions remain, so wiped values are recoverable.
+    versions = conn.execute(
+        "SELECT version, title FROM identification WHERE sku = ? ORDER BY version", (sku,)
+    ).fetchall()
+    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert versions[0]["title"] == "Blazer 42R"
+
+
+# --- aspect schema -----------------------------------------------------------
+
+
+def _aspect_response() -> dict:
+    return {
+        "aspects": [
+            {
+                "localizedAspectName": "Brand",
+                "aspectConstraint": {
+                    "aspectRequired": True, "aspectMode": "FREE_TEXT",
+                    "itemToAspectCardinality": "SINGLE", "aspectDataType": "STRING",
+                    "aspectMaxLength": 65,
+                },
+                "aspectValues": [{"localizedValue": "Brooks Brothers"}],
+            },
+            {
+                "localizedAspectName": "Size Type",
+                "aspectConstraint": {
+                    "aspectRequired": True, "aspectMode": "SELECTION_ONLY",
+                    "itemToAspectCardinality": "SINGLE", "aspectDataType": "STRING",
+                },
+                "aspectValues": [
+                    {"localizedValue": "Regular"}, {"localizedValue": "Big & Tall"}
+                ],
+            },
+            {
+                "localizedAspectName": "Outer Shell Material",
+                "aspectConstraint": {
+                    "aspectRequired": False, "aspectMode": "FREE_TEXT",
+                    "itemToAspectCardinality": "SINGLE", "aspectDataType": "STRING",
+                },
+                "aspectValues": [],
+            },
+        ]
+    }
+
+
+def test_aspect_schema_carries_mode_and_allowed_values():
+    """The reasoning plane must be handed a form with eBay's own options, not a
+    blank field to invent strings into."""
+    from resell.ebay.publisher import Publisher
+
+    class FakeClient:
+        def get(self, path, **kwargs):
+            if "get_default_category_tree_id" in path:
+                return {"categoryTreeId": "0"}
+            return _aspect_response()
+
+    publisher = Publisher.__new__(Publisher)
+    publisher.client = FakeClient()
+
+    specs = {spec.name: spec for spec in publisher.aspect_schema("EBAY_US", "57988")}
+    assert set(specs) == {"Brand", "Size Type", "Outer Shell Material"}
+
+    brand = specs["Brand"]
+    assert brand.required and not brand.selection_only
+    assert brand.max_length == 65
+
+    size_type = specs["Size Type"]
+    assert size_type.selection_only
+    assert size_type.allowed_values == ("Regular", "Big & Tall")
+
+    assert not specs["Outer Shell Material"].required
+
+
+def test_unknown_values_warn_only_for_selection_only_aspects():
+    """eBay does not guarantee aspectValues is exhaustive, so an absent value is a
+    warning rather than a hard failure — blocking on it could refuse a legitimate
+    publish."""
+    from resell.ebay.publisher import AspectSpec
+
+    selection = AspectSpec(
+        name="Style", required=True, mode="SELECTION_ONLY", cardinality="SINGLE",
+        data_type="STRING", max_length=None, allowed_values=("Blazer", "Sport Coat"),
+    )
+    assert selection.unknown_values(["Blazerish"]) == ["Blazerish"]
+    assert selection.unknown_values(["Blazer"]) == []
+    # Case-insensitive, since eBay's casing is not something to trip over.
+    assert selection.unknown_values(["blazer"]) == []
+
+    free_text = AspectSpec(
+        name="Brand", required=True, mode="FREE_TEXT", cardinality="SINGLE",
+        data_type="STRING", max_length=65, allowed_values=("Nike",),
+    )
+    assert free_text.unknown_values(["Some Obscure Maker"]) == []
+
+
+def test_emitted_aspect_flags_preserve_names_with_spaces():
+    """Regression: spaces were stripped to dodge shell quoting, emitting
+    `--aspect SizeType="?"` — an aspect eBay does not have. Quoting the whole
+    Name=Value pair is the shell-safe form that keeps the name intact."""
+    names = ["Size Type", "Outer Shell Material"]
+    flags = " ".join(f'--aspect "{name}=?"' for name in names)
+    assert '--aspect "Size Type=?"' in flags
+    assert "SizeType" not in flags
+
+    # And the parser handles the quoted form: shlex mirrors what the shell passes.
+    import shlex
+
+    argv = shlex.split(f"identify MP-000001 {flags}")
+    supplied = [argv[i + 1] for i, token in enumerate(argv) if token == "--aspect"]
+    assert supplied[0] == "Size Type=?"
+    name, _, value = supplied[0].partition("=")
+    assert name == "Size Type"
+    assert value == "?"
+
+
+# --- item condition ----------------------------------------------------------
+
+
+def test_condition_id_maps_to_the_inventory_api_enum():
+    """getItemConditionPolicies returns numeric IDs; createOrReplaceInventoryItem
+    takes an enum string. There is no NEW_WITH_TAGS — clothing's "New with tags" is
+    condition ID 1000, whose enum is plain NEW."""
+    from resell.ebay.publisher import CONDITION_ID_TO_ENUM
+
+    assert CONDITION_ID_TO_ENUM["1000"] == "NEW"
+    assert CONDITION_ID_TO_ENUM["1500"] == "NEW_OTHER"
+    assert CONDITION_ID_TO_ENUM["1750"] == "NEW_WITH_DEFECTS"
+    assert CONDITION_ID_TO_ENUM["3000"] == "USED_EXCELLENT"
+    assert CONDITION_ID_TO_ENUM["7000"] == "FOR_PARTS_OR_NOT_WORKING"
+    assert "NEW_WITH_TAGS" not in set(CONDITION_ID_TO_ENUM.values())
+
+
+def test_condition_policy_parses_and_flags_unmapped_ids():
+    """An ID eBay adds later must surface as unmapped rather than silently vanish."""
+    from resell.ebay.publisher import Publisher
+
+    class FakeClient:
+        def get(self, path, **kwargs):
+            return {
+                "itemConditionPolicies": [
+                    {
+                        "categoryId": "57988",
+                        "itemConditionRequired": True,
+                        "itemConditions": [
+                            {"conditionId": "1000", "conditionDescription": "New with tags"},
+                            {"conditionId": "3000", "conditionDescription": "Pre-owned - Good"},
+                            {"conditionId": "9999", "conditionDescription": "Future condition"},
+                        ],
+                    }
+                ]
+            }
+
+    publisher = Publisher.__new__(Publisher)
+    publisher.client = FakeClient()
+    policy = publisher.condition_policy("EBAY_US", "57988")
+
+    assert policy.required is True
+    assert policy.allowed_enums() == {"NEW", "USED_EXCELLENT"}
+    labels = {o.condition_id: o.description for o in policy.options}
+    # eBay's label is category-specific and is what the operator should read.
+    assert labels["1000"] == "New with tags"
+    unmapped = [o for o in policy.options if o.enum_value is None]
+    assert [o.condition_id for o in unmapped] == ["9999"]
+
+
+def test_condition_policy_absent_category_is_not_an_error():
+    from resell.ebay.publisher import Publisher
+
+    class FakeClient:
+        def get(self, path, **kwargs):
+            return {"itemConditionPolicies": []}
+
+    publisher = Publisher.__new__(Publisher)
+    publisher.client = FakeClient()
+    policy = publisher.condition_policy("EBAY_US", "12345")
+    assert policy.options == ()
+    assert policy.required is False
+
+
+def test_publish_rejects_a_condition_the_category_disallows():
+    from resell.ebay.publisher import PublishAborted, Publisher
+
+    class FakeListing(dict):
+        def __getitem__(self, key):
+            return dict.get(self, key)
+
+    class FakeClient:
+        def get(self, path, **kwargs):
+            return {
+                "itemConditionPolicies": [
+                    {
+                        "categoryId": "57988",
+                        "itemConditionRequired": True,
+                        "itemConditions": [
+                            {"conditionId": "1000", "conditionDescription": "New with tags"},
+                            {"conditionId": "3000", "conditionDescription": "Pre-owned - Good"},
+                        ],
+                    }
+                ]
+            }
+
+    publisher = Publisher.__new__(Publisher)
+    publisher.client = FakeClient()
+
+    ok = FakeListing(
+        sku="MP-000001", marketplace="EBAY_US", category_id="57988", condition_id="NEW"
+    )
+    step = publisher._check_condition(ok)
+    assert step.ok
+    assert "New with tags" in step.detail
+
+    bad = FakeListing(
+        sku="MP-000001", marketplace="EBAY_US", category_id="57988",
+        condition_id="FOR_PARTS_OR_NOT_WORKING",
+    )
+    with pytest.raises(PublishAborted, match="not accepted by category"):
+        publisher._check_condition(bad)
+
+
+def test_rejected_commands_leave_no_trace(tmp_path: Path):
+    """Regression: revise and abandon voided approvals and deactivated the listing
+    BEFORE checking transition legality, so a refused command still destroyed state.
+    Found while probing what a listed item permits — the probe itself corrupted the
+    item it was probing."""
+    from resell.gateway import Gateway, Rejected, active_listing, live_approval
+
+    conn = db.connect(tmp_path / "atomic.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = _build_approved(gateway, conn)
+    gateway.begin_publishing(sku)
+    gateway.record_publish_progress(sku, offer_id="OFF-1")
+    gateway.record_publish_progress(sku, listing_id="110590224450")
+    gateway.mark_listed(sku)
+
+    assert live_approval(conn, sku) is not None
+    assert active_listing(conn, sku, "EBAY_US", "sandbox") is not None
+
+    for command in (
+        lambda: gateway.revise(sku, "fix aspects"),
+        lambda: gateway.abandon(sku, "wrong data"),
+    ):
+        with pytest.raises(Rejected, match="not a legal transition"):
+            command()
+        # The record of what was published must survive a refused command.
+        assert live_approval(conn, sku) is not None
+        assert active_listing(conn, sku, "EBAY_US", "sandbox") is not None
+        assert conn.execute(
+            "SELECT state FROM item WHERE sku = ?", (sku,)
+        ).fetchone()[0] == "listed"
+
+
+def test_listed_items_refuse_authoritative_mutation_but_accept_evidence(tmp_path: Path):
+    """`attach_photo` and `remove_photo` already refused on terminal states while
+    `propose_identification` did not — an oversight, not an exemption. Changing the
+    identification of a listed item desyncs the local record from eBay and voids the
+    approval that documents what was actually published.
+
+    Evidence stays open on purpose: a fact learned about a listed item needs
+    somewhere to go, and observations are append-only and non-authoritative."""
+    from resell.gateway import (
+        Gateway, Rejected, active_listing, current_identification, live_approval,
+    )
+
+    conn = db.connect(tmp_path / "terminal.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = _build_approved(gateway, conn)
+    gateway.begin_publishing(sku)
+    gateway.record_publish_progress(sku, offer_id="OFF-1")
+    gateway.record_publish_progress(sku, listing_id="110590224450")
+    gateway.mark_listed(sku)
+
+    version_before = current_identification(conn, sku)["version"]
+    hash_before = live_approval(conn, sku)["proposal_hash"]
+
+    with pytest.raises(Rejected, match="the identification cannot change"):
+        gateway.propose_identification(sku, title="corrected", aspects={"Size": ["42R"]})
+    with pytest.raises(Rejected, match="the photo set cannot change"):
+        gateway.remove_photo(sku, position=1)
+
+    # Observation is still allowed, and is where a correction lives until a revision
+    # workflow can carry it to eBay.
+    gateway.record_evidence(
+        sku, kind="operator_correction", source="operator",
+        payload={"observed_size": "42R", "note": "listed value is wrong"},
+    )
+
+    assert current_identification(conn, sku)["version"] == version_before
+    assert live_approval(conn, sku)["proposal_hash"] == hash_before
+    assert active_listing(conn, sku, "EBAY_US", "sandbox") is not None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM evidence WHERE sku = ? AND kind = 'operator_correction'", (sku,)
+    ).fetchone()[0] == 1
+
+
+def test_void_approvals_refuses_on_terminal_items(tmp_path: Path):
+    """Defense in depth. Every caller is blocked, but the approval that authorised a
+    live listing is the record of what was published and no future code path should
+    be able to erase it."""
+    from resell.gateway import Gateway, live_approval
+
+    conn = db.connect(tmp_path / "void.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = _build_approved(gateway, conn)
+    gateway.begin_publishing(sku)
+    gateway.record_publish_progress(sku, listing_id="110590224450")
+    gateway.mark_listed(sku)
+
+    assert gateway._void_approvals(sku, "direct call") == 0
+    assert live_approval(conn, sku) is not None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM events WHERE kind = 'approval.void_refused'"
+    ).fetchone()[0] == 1

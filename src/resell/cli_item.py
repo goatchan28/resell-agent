@@ -26,6 +26,7 @@ from resell.domain import (
 )
 from resell.gateway import (
     Gateway,
+    current_state,
     Rejected,
     active_listing,
     current_identification,
@@ -134,8 +135,18 @@ def cmd_item_start(args: argparse.Namespace) -> int:
 
 
 def cmd_item_identify(args: argparse.Namespace) -> int:
-    """Manual stand-in for vision identification."""
-    _, _, gateway = _open()
+    """Manual stand-in for vision identification.
+
+    Merges with the current identification by default. The gateway stores full
+    immutable versions -- a new identification supersedes the old rather than
+    editing it -- but a flag interface that silently discards every field you did
+    not retype is a trap, and one that is easy to fall into when correcting a
+    single value like the category.
+
+    `--replace` gives the clean slate for when that is genuinely what you want.
+    """
+    _, conn, gateway = _open()
+
     aspects: dict[str, list[str]] = {}
     for pair in args.aspect or []:
         name, _, value = pair.partition("=")
@@ -143,24 +154,51 @@ def cmd_item_identify(args: argparse.Namespace) -> int:
             print(f"bad --aspect {pair!r}; expected Name=Value", file=sys.stderr)
             return 2
         aspects.setdefault(name, []).append(value)
+
+    supplied: dict[str, object] = {
+        "brand": args.brand,
+        "model": args.model,
+        "variant": args.variant,
+        "title": args.title,
+        "description": args.description,
+        "condition_id": args.condition,
+        "category_id": args.category,
+        "aspects": aspects or None,
+        "confidence": args.confidence,
+        "reasoning": args.reasoning,
+    }
+
+    carried: list[str] = []
+    if not args.replace:
+        previous = current_identification(conn, args.sku)
+        if previous is not None:
+            for field in (
+                "brand", "model", "variant", "title", "description",
+                "condition_id", "category_id", "reasoning",
+            ):
+                if supplied[field] is None and previous[field]:
+                    supplied[field] = previous[field]
+                    carried.append(field)
+            if supplied["aspects"] is None and previous["aspects"]:
+                supplied["aspects"] = json.loads(previous["aspects"])
+                carried.append("aspects")
+
     try:
-        return _report(
-            gateway.propose_identification(
-                args.sku,
-                brand=args.brand,
-                model=args.model,
-                variant=args.variant,
-                title=args.title,
-                description=args.description,
-                condition_id=args.condition,
-                category_id=args.category,
-                aspects=aspects or None,
-                confidence=args.confidence,
-                reasoning=args.reasoning,
-            )
-        )
+        accepted = gateway.propose_identification(args.sku, **supplied)
     except Rejected as exc:
         return _rejected(exc)
+
+    _report(accepted)
+    if carried:
+        print(f"    carried forward: {', '.join(carried)}")
+    elif args.replace:
+        print("    --replace: nothing carried forward")
+    missing = [
+        field for field in ("title", "category_id", "condition_id") if not supplied[field]
+    ]
+    if missing:
+        print(f"    still missing (required to price): {', '.join(missing)}")
+    return 0
 
 
 def cmd_item_ask(args: argparse.Namespace) -> int:
@@ -252,7 +290,13 @@ def cmd_item_approve(args: argparse.Namespace) -> int:
 
 
 def cmd_item_revise(args: argparse.Namespace) -> int:
-    _, _, gateway = _open()
+    _, conn, gateway = _open()
+    # "Put this back into an editable state" is already satisfied when the item is
+    # in `pricing`, so reporting an illegal self-transition is unhelpful noise.
+    if current_state(conn, args.sku) == ItemState.PRICING:
+        gateway._void_approvals(args.sku, args.reason)
+        print(f"ok  Revise  {args.sku}  already in pricing; nothing to do")
+        return 0
     try:
         return _report(gateway.revise(args.sku, args.reason))
     except Rejected as exc:
@@ -265,6 +309,257 @@ def cmd_item_abandon(args: argparse.Namespace) -> int:
         return _report(gateway.abandon(args.sku, args.reason))
     except Rejected as exc:
         return _rejected(exc)
+
+
+def cmd_item_suggest_category(args: argparse.Namespace) -> int:
+    """Ask eBay which leaf categories match a description, and verify each one.
+
+    Suggestions alone are not enough: getCategorySuggestions returns plausible
+    matches, some of which are noise, and none of which are guaranteed to accept an
+    aspect lookup. Verifying each candidate turns a list of guesses into a list of
+    categories that provably work, and reports what each one requires -- which is
+    the information actually needed to fill in an identification.
+    """
+    config, conn, gateway = _open(require_credentials=True)
+    from resell.ebay.client import EbayApiError, EbayClient
+    from resell.ebay.publisher import Publisher
+
+    query = args.query
+    if not query:
+        identification = current_identification(conn, args.sku)
+        query = (identification["title"] if identification else None) or ""
+        if not query:
+            print("no title on the identification; pass --query", file=sys.stderr)
+            return 2
+
+    with EbayClient(config, conn) as client:
+        publisher = Publisher(gateway, client, conn)
+        try:
+            suggestions = publisher.suggest_categories(config.marketplace_id, query)
+        except EbayApiError as exc:
+            print(f"Taxonomy lookup failed:\n{exc}", file=sys.stderr)
+            return 1
+
+        if not suggestions:
+            print(f"no category suggestions for {query!r}")
+            return 1
+
+        candidates = suggestions[: args.limit]
+        if args.no_verify:
+            print(f"\nsuggestions for {query!r} on {config.marketplace_id}:\n")
+            for suggestion in candidates:
+                print(f"  {suggestion['categoryId']:<10} {suggestion['path']}")
+            return 0
+
+        tree_id = publisher.category_tree_id(config.marketplace_id)
+        print(f"\nsuggestions for {query!r} on {config.marketplace_id}, each verified:\n")
+        usable: list[tuple[str, list[str], str]] = []
+        for suggestion in candidates:
+            category_id = suggestion["categoryId"]
+            try:
+                body = client.get(
+                    f"/commerce/taxonomy/v1/category_tree/{tree_id}"
+                    "/get_item_aspects_for_category",
+                    auth="app",
+                    params={"category_id": category_id},
+                )
+            except EbayApiError as exc:
+                print(f"  UNUSABLE  {category_id:<10} {suggestion['path']}")
+                print(f"            HTTP {exc.status_code}: "
+                      f"{(exc.errors[0].get('message') if exc.errors else '')[:70]}")
+                continue
+
+            required = sorted(
+                aspect["localizedAspectName"]
+                for aspect in (body or {}).get("aspects") or []
+                if (aspect.get("aspectConstraint") or {}).get("aspectRequired")
+                and aspect.get("localizedAspectName")
+            )
+            usable.append((category_id, required, suggestion["path"]))
+            print(f"  ok        {category_id:<10} {suggestion['path']}")
+            print(f"            requires: {', '.join(required) if required else '(none)'}")
+
+    if not usable:
+        print("\nNo suggested category accepted an aspect lookup. Try a different --query.")
+        return 1
+
+    category_id, required, _ = usable[0]
+    aspect_flags = " ".join(f'--aspect "{name}=?"' for name in required)
+    print(
+        f"\nTo use {category_id}, supply its required aspects. `identify` merges, so\n"
+        f"only the changed fields are needed:\n\n"
+        f"  resell item identify {args.sku} --category {category_id} {aspect_flags}\n"
+    )
+    if required:
+        print("Replace each \"?\" with the real value; aspect names must match exactly.")
+    return 0
+
+
+def cmd_item_aspects(args: argparse.Namespace) -> int:
+    """Show a category's aspect form, with eBay's allowed values.
+
+    Narrow on purpose: enough to supply valid values by hand, and the same typed
+    schema the reasoning plane will be handed as a form to fill.
+    """
+    config, conn, gateway = _open(require_credentials=True)
+    from resell.ebay.client import EbayApiError, EbayClient
+    from resell.ebay.publisher import Publisher
+
+    category_id = args.category
+    identification = current_identification(conn, args.sku) if args.sku else None
+    if not category_id:
+        category_id = identification["category_id"] if identification else None
+        if not category_id:
+            print("no category on the identification; pass --category", file=sys.stderr)
+            return 2
+
+    with EbayClient(config, conn) as client:
+        try:
+            schema = Publisher(gateway, client, conn).aspect_schema(
+                config.marketplace_id, category_id
+            )
+        except EbayApiError as exc:
+            print(f"aspect lookup failed for category {category_id}:\n{exc}", file=sys.stderr)
+            return 1
+
+    current = {}
+    if identification and identification["aspects"]:
+        current = json.loads(identification["aspects"])
+
+    specs = [s for s in schema if s.required or args.all]
+    if args.name:
+        wanted = {n.casefold() for n in args.name}
+        specs = [s for s in specs if s.name.casefold() in wanted]
+    if not specs:
+        print(f"category {category_id}: no matching aspects")
+        return 0
+
+    print(f"\ncategory {category_id} on {config.marketplace_id} — "
+          f"{sum(1 for s in schema if s.required)} required of {len(schema)} total\n")
+
+    for spec in specs:
+        have = current.get(spec.name) or []
+        status = "SET" if have else ("MISSING" if spec.required else "-")
+        flags = f"{spec.mode.lower()}, {spec.cardinality.lower()}, {spec.data_type.lower()}"
+        print(f"  {status:<8} {spec.name}   [{flags}]")
+        if have:
+            unknown = spec.unknown_values([str(v) for v in have])
+            note = "  <- not in eBay's list" if unknown else ""
+            print(f"           current: {have}{note}")
+        if spec.allowed_values:
+            shown = spec.allowed_values if args.full else spec.allowed_values[: args.values]
+            print(f"           allowed ({len(spec.allowed_values)}): {' | '.join(shown)}")
+            if not args.full and len(spec.allowed_values) > len(shown):
+                print(f"           ... {len(spec.allowed_values) - len(shown)} more "
+                      f"(--full, or --name \"{spec.name}\" --full)")
+        elif spec.selection_only:
+            print("           allowed: eBay returned no values despite selection_only")
+        else:
+            limit = f", max {spec.max_length} chars" if spec.max_length else ""
+            print(f"           free text{limit}")
+
+    outstanding = [s.name for s in schema if s.required and not current.get(s.name)]
+    if outstanding and args.sku:
+        flags = " ".join(f'--aspect "{n}=?"' for n in outstanding)
+        print(f"\nstill needed:\n  resell item identify {args.sku} {flags}\n")
+        print("Aspect names must match eBay's spelling exactly, including spaces.")
+    return 0
+
+
+def cmd_item_conditions(args: argparse.Namespace) -> int:
+    """Show the item conditions a category accepts, with the enum to supply.
+
+    eBay returns numeric condition IDs; the Inventory API takes an enum string. Both
+    are shown, alongside eBay's own label for this category -- the label for a given
+    ID varies by category, so "New with tags" in clothing and "Brand New" elsewhere
+    are the same ID 1000 and the same enum NEW.
+    """
+    config, conn, gateway = _open(require_credentials=True)
+    from resell.ebay.client import EbayApiError, EbayClient
+    from resell.ebay.publisher import Publisher
+
+    category_id = args.category
+    identification = current_identification(conn, args.sku) if args.sku else None
+    if not category_id:
+        category_id = identification["category_id"] if identification else None
+        if not category_id:
+            print("no category on the identification; pass --category", file=sys.stderr)
+            return 2
+
+    with EbayClient(config, conn) as client:
+        try:
+            policy = Publisher(gateway, client, conn).condition_policy(
+                config.marketplace_id, category_id
+            )
+        except EbayApiError as exc:
+            print(f"condition lookup failed for category {category_id}:\n{exc}", file=sys.stderr)
+            return 1
+
+    if not policy.options:
+        print(f"\ncategory {category_id}: eBay returned no condition policy "
+              f"(condition may not apply here)")
+        return 0
+
+    current = identification["condition_id"] if identification else None
+    print(f"\ncategory {category_id} on {config.marketplace_id} — condition is "
+          f"{'REQUIRED' if policy.required else 'optional'}\n")
+    print(f"  {'':<8} {'id':<7} {'enum to supply':<26} eBay's label for this category")
+    for option in policy.options:
+        marker = "current" if option.enum_value and option.enum_value == current else ""
+        enum = option.enum_value or "(no enum mapping)"
+        print(f"  {marker:<8} {option.condition_id:<7} {enum:<26} {option.description}")
+
+    unmapped = [o.condition_id for o in policy.options if not o.enum_value]
+    if unmapped:
+        print(f"\n  note: no enum mapping known for condition id(s) {', '.join(unmapped)}; "
+              f"eBay may have added a condition since this table was written.")
+
+    if current and current not in policy.allowed_enums():
+        print(f"\n  WARNING: the current condition {current!r} is not in this category's list.")
+    if args.sku:
+        print(f"\nto set it:\n  resell item identify {args.sku} --condition ENUM_VALUE\n")
+    return 0
+
+
+def cmd_item_publish(args: argparse.Namespace) -> int:
+    """Drive an approved item to a live eBay listing."""
+    config, conn, gateway = _open(require_credentials=True)
+    from resell.ebay.client import EbayClient
+    from resell.ebay.publisher import PublishAborted, Publisher
+
+    print(f"\n{args.sku} -> {config.marketplace_id} / {config.env.name}"
+          f"{'  [DRY RUN]' if args.dry_run else ''}\n")
+    with EbayClient(config, conn) as client:
+        publisher = Publisher(gateway, client, conn)
+        try:
+            steps = publisher.dry_run(args.sku) if args.dry_run else publisher.publish(args.sku)
+        except (PublishAborted, Rejected) as exc:
+            reasons = exc.reasons if isinstance(exc, Rejected) else [str(exc)]
+            print("ABORTED before any eBay write:", file=sys.stderr)
+            for reason in reasons:
+                for line in str(reason).splitlines():
+                    print(f"    {line}", file=sys.stderr)
+            return 1
+
+    width = max(len(step.name) for step in steps)
+    for step in steps:
+        lines = step.detail.splitlines() or [""]
+        print(f"  {'ok  ' if step.ok else 'FAIL'} {step.name:<{width}}  {lines[0]}")
+        for line in lines[1:]:
+            print(f"       {line}")
+
+    if any(not step.ok for step in steps):
+        return 1
+    listing_id = next(
+        (s.data.get("listingId") for s in reversed(steps) if s.data.get("listingId")), None
+    )
+    if args.dry_run:
+        print("\nDry run only. Nothing was uploaded or written to eBay.")
+    elif listing_id:
+        print(f"\nPUBLISHED  listingId={listing_id}")
+        print(f"  https://www.sandbox.ebay.com/itm/{listing_id}"
+              if config.env.name == "sandbox" else f"  https://www.ebay.com/itm/{listing_id}")
+    return 0
 
 
 def cmd_item_show(args: argparse.Namespace) -> int:
@@ -296,6 +591,18 @@ def cmd_item_show(args: argparse.Namespace) -> int:
                 print(f"    {field}: {identification[field]}")
         if identification["aspects"]:
             print(f"    aspects: {identification['aspects']}")
+
+    history = conn.execute(
+        "SELECT version, title, category_id, condition_id, superseded_at "
+        "FROM identification WHERE sku = ? AND superseded_at IS NOT NULL "
+        "ORDER BY version DESC LIMIT 5",
+        (args.sku,),
+    ).fetchall()
+    if history:
+        print("\n  superseded identifications (values are recoverable):")
+        for row in history:
+            print(f"    v{row['version']}  category={row['category_id']} "
+                  f"condition={row['condition_id']}  {(row['title'] or '')[:44]}")
 
     questions = unresolved_blocking_questions(conn, args.sku)
     if questions:
@@ -560,6 +867,10 @@ def register(subparsers) -> None:
     identify.add_argument("--aspect", action="append", metavar="Name=Value")
     identify.add_argument("--confidence", type=float)
     identify.add_argument("--reasoning")
+    identify.add_argument(
+        "--replace", action="store_true",
+        help="start from scratch instead of merging with the current identification",
+    )
     identify.set_defaults(func=cmd_item_identify)
 
     ask = sub.add_parser("ask", help="open a question for the operator")
@@ -609,6 +920,42 @@ def register(subparsers) -> None:
     abandon.add_argument("sku")
     abandon.add_argument("--reason", required=True)
     abandon.set_defaults(func=cmd_item_abandon)
+
+    suggest = sub.add_parser(
+        "suggest-category", help="ask eBay for valid leaf categories"
+    )
+    suggest.add_argument("sku")
+    suggest.add_argument("--query", help="defaults to the identification title")
+    suggest.add_argument("--limit", type=int, default=6)
+    suggest.add_argument(
+        "--no-verify", action="store_true",
+        help="list suggestions without checking that each accepts an aspect lookup",
+    )
+    suggest.set_defaults(func=cmd_item_suggest_category)
+
+    aspects = sub.add_parser("aspects", help="show a category's aspect form and allowed values")
+    aspects.add_argument("sku", nargs="?")
+    aspects.add_argument("--category", help="defaults to the identification's category")
+    aspects.add_argument("--all", action="store_true", help="include optional aspects")
+    aspects.add_argument("--name", action="append", help="only this aspect (repeatable)")
+    aspects.add_argument("--values", type=int, default=12, help="allowed values to show")
+    aspects.add_argument("--full", action="store_true", help="show every allowed value")
+    aspects.set_defaults(func=cmd_item_aspects)
+
+    conditions = sub.add_parser(
+        "conditions", help="show the item conditions a category accepts"
+    )
+    conditions.add_argument("sku", nargs="?")
+    conditions.add_argument("--category", help="defaults to the identification's category")
+    conditions.set_defaults(func=cmd_item_conditions)
+
+    publish = sub.add_parser("publish", help="approved -> live eBay listing")
+    publish.add_argument("sku")
+    publish.add_argument(
+        "--dry-run", action="store_true",
+        help="check everything without uploading or writing to eBay",
+    )
+    publish.set_defaults(func=cmd_item_publish)
 
     show = sub.add_parser("show", help="full item state")
     show.add_argument("sku")

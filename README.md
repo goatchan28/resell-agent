@@ -326,6 +326,15 @@ Money is integer cents throughout.
   proposal is still *valid*. Removing every photo changes the hash and voids the
   old approval, but nothing stopped a fresh approval of a photoless listing until
   validation ran on entry.
+- **Authoritative mutation is frozen once published; observation is not.**
+  `propose_identification`, `attach_photo` and `remove_photo` are all refused on a
+  terminal item. Changing what the item *is* would desync the local record from a
+  live eBay listing with no reconciliation path, and voiding the approval afterwards
+  would destroy the record of what was actually agreed and published — at that point
+  the approval is historical evidence, not a pending permission. `record_evidence`
+  stays open, so a fact learned about a listed item has somewhere to go until a
+  revision workflow can carry it to eBay. `_void_approvals` also refuses on terminal
+  items as defense in depth.
 - **The photo set is frozen once published.** A live eBay listing would silently
   desync from local changes, and listing revision is not implemented, so photo
   mutation on a terminal item is refused rather than allowed to diverge.
@@ -401,7 +410,69 @@ on items that are never approved and start the 30-day expiry clock during an
 open-ended human review. The Media layer guarantees fresh hosted URLs at publish;
 the expiry check remains as a retry safety net.
 
+### Publishing
+
+```bash
+uv run resell item publish MP-000001 --dry-run   # checks only; uploads nothing
+uv run resell item publish MP-000001
+```
+
+`ebay/publisher.py` drives the three calls the spike established:
+
+| Call | Method | Idempotency | Handling |
+|---|---|---|---|
+| `createOrReplaceInventoryItem` | PUT | idempotent by SKU | skipped if already done |
+| `createOffer` | POST | **not** idempotent | stored id, then eBay's own offers, then create |
+| `publishOffer` | POST | proven only by `listingId` | refuses to claim success without one |
+
+Progress is written to the `listing` row after each call, so an interruption
+resumes at the next step. Verified against every interruption point: a failure at
+`createOffer` costs two writes on retry instead of five, and a failure at
+`publishOffer` costs one. Rerunning a published item makes zero calls.
+
+The `createOffer` read-before-write covers the nastiest case — an offer created but
+whose id was never persisted. Creating again would error and, without the read,
+never recover.
+
+**Checks run before entering `publishing`.** That state has only two exits (`listed`,
+`publish_failed`), so entering it and then aborting on a local problem would strand
+the item. Photo integrity and required aspects are verified while still in
+`approved`, which is recoverable. An abort *after* the transition is recorded as
+`publish_failed`, which can be revised or retried.
+
+**Photo integrity is re-checked at publish.** The approval covers specific photo
+content by hash; if a file was edited or moved after approval, publishing is refused
+rather than sending eBay something never approved.
+
+**Required aspects are verified from Taxonomy before any write.** Missing aspects are
+the most common publish failure, and failing here costs nothing while failing at
+`publishOffer` leaves an inventory item and offer behind. If Taxonomy is unavailable
+the publish proceeds on the proposal gate rather than blocking.
+
+`--dry-run` deliberately does not upload: an upload is a real side effect with a
+30-day expiry clock, so a dry run must not start one.
+
+Verified against Sandbox: published `MP-000001` as listingId 110590224450, and a
+second `publish` reported `already listed` with zero eBay calls. The throwaway
+spike was deleted at that point.
+
+### What deterministic validation does and does not prove
+
+Every pre-write check passed on that publish, and three aspect values were still
+factually wrong -- Size 38 on a jacket whose title and operator answer both say
+42R, Style "One Piece" on a blazer, Color Black/White on a navy item.
+
+That is not a validation failure. Each value was legal: present, correctly spelled,
+and drawn from eBay's own allowed list. Legality is all a deterministic gate can
+establish. Whether a value is *true* is a question only evidence can answer, which
+is why identification is evidence-backed and `send_to_model` exists.
+
+The lesson for the reasoning plane: handing the model an enumerated list is
+necessary but not sufficient. It must select from that list *by reference to
+observations about the item*, and the evidence trail is what makes a wrong choice
+auditable afterwards.
+
 ## Next
 
-Wire the gateway to the eBay calls (replacing `spike.py`), then the reasoning
-plane: vision identification, comps research, and the operator-as-tool loop.
+The reasoning plane: vision identification, comps research, and the
+operator-as-tool loop.

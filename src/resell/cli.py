@@ -478,6 +478,10 @@ def build_parser() -> argparse.ArgumentParser:
         "provision", help="ensure business policies and inventory location exist"
     ).set_defaults(func=cmd_account_provision)
 
+    from resell import cli_item
+
+    cli_item.register(subparsers)
+
     images = subparsers.add_parser("images", help="listing photo handling")
     images_sub = images.add_subparsers(dest="images_command", required=True)
     check = images_sub.add_parser("check", help="validate photos locally, offline")
@@ -507,6 +511,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Piping output to `head` closes the pipe early; without this the interpreter
+    # prints a BrokenPipeError traceback over the useful output.
+    try:
+        import signal
+
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (AttributeError, ValueError):
+        pass
+
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

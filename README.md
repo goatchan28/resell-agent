@@ -272,8 +272,136 @@ interface, so the `v1_beta` path is a one-file change if it moves:
   winner — so the inconsistency costs at most one wasted call, ever.
 - **Not retry_safe.** A retried POST creates a second EPS image.
 
+## Item model and state machine
+
+`domain.py` holds the pure rules (states, transitions, SKU format, pricing floor,
+proposal identity). `gateway.py` is the deterministic effect gateway: the model
+proposes typed commands, the gateway executes only when the transition is legal
+and every precondition holds.
+
+### Entities
+
+`item` (SKU, cost, intent, state) · `photo` (ordered, locally validated) ·
+`evidence` (append-only, with provenance and a `send_to_model` flag) ·
+`identification` (versioned beliefs, superseded not overwritten) ·
+`open_question` (blocking unknowns) · `listing` (per marketplace + environment,
+holding all three eBay identifiers) · `approval` (immutable, content-bound) ·
+`model_call` (per-item AI cost).
+
+Money is integer cents throughout.
+
+### Invariants
+
+- **SKU is `MP-000001`, sequential, immutable, never reused.** Allocated from an
+  AUTOINCREMENT table so a delete cannot cause reuse — a reused SKU would collide
+  with eBay's record of the previous item. Zero-padded so lexical order matches
+  numeric, because eBay sorts SKUs as strings.
+- **Evidence is append-only, enforced by SQLite triggers.** A revised belief is a
+  new `identification` row, never an edit to the observation behind it.
+- **Approval binds to content, not to an item.** `approval.proposal_hash` covers
+  title, price, category, condition, aspects, policies, location and the photo
+  *content hashes*. Any change voids it. This is what stops "you approved it, the
+  model revised it, we published something you never saw."
+- **Only the operator can approve or answer a question.** `operator=True` is
+  unreachable from the reasoning plane — structural, not conventional.
+- **Confidence is stored, never a gate.** The `identifying → pricing` gate is
+  required information present and no unresolved blocking unknowns. If the model
+  is unsure it opens a question, which is a checkable fact; a confidence number is
+  not.
+- **The floor is `minimum_net_proceeds`, not margin over cost.** Purchase cost is
+  stored and drives profit/margin/ROI reporting, but never blocks a sale — a
+  decluttered item has no meaningful cost basis and a cost floor would block
+  exactly the case where any sale is a good sale. `acquisition_intent`
+  (`resale`/`declutter`/`unknown`) is recorded now so an intent-specific policy is
+  additive later. Seller-borne shipping is subtracted, since the provisioned
+  policy sets free shipping.
+- **`listed` requires a real `listing_id`.** An HTTP 2xx is not proof — a stubbed
+  2xx with no listingId looked exactly like success during the spike.
+- **`approved` implies a live matching approval.** Voiding an approval reverts the
+  state to `proposed` along with it, so the label never claims approval that no
+  longer exists — and recovery is one re-approval rather than a trip back through
+  pricing.
+- **Entry preconditions re-validate content, not just the hash.** A hash match
+  proves the proposal has not changed since approval; it does not prove the
+  proposal is still *valid*. Removing every photo changes the hash and voids the
+  old approval, but nothing stopped a fresh approval of a photoless listing until
+  validation ran on entry.
+- **The photo set is frozen once published.** A live eBay listing would silently
+  desync from local changes, and listing revision is not implemented, so photo
+  mutation on a terminal item is refused rather than allowed to diverge.
+- **Preconditions are enforced on state ENTRY, not by callers.** They used to live
+  in the public commands, which meant the invariant held only while every caller
+  remembered — and calling the private `_transition` directly moved an item to
+  `publishing` with a voided approval. Found by `resell item verify-safeguards`
+  against a real database, not by the unit tests. `_entry_preconditions` now runs
+  inside `_transition`, so no code path into a gated state can skip its conditions.
+- **Publishing progress lives on the `listing` row**, not in extra item states, so
+  a partial failure resumes at the right eBay call. `createOrReplaceInventoryItem`
+  is an idempotent PUT; `createOffer` is not, so `offer_id` is persisted the moment
+  it exists.
+
+### Fees are provisional until proven otherwise
+
+`FeeBasis` is part of the type: `provisional_estimate` (generic development
+default), `category_verified`, or `ebay_quoted`. Every proceeds figure carries its
+basis and reports itself as "estimated" or "computed" accordingly, so nothing can
+present a generic guess as a guarantee. **Production publishing is refused unless
+the basis is authoritative** — that gate exists now so a category-aware or
+eBay-quoted fee source cannot be forgotten at cutover. The 13.35% + $0.40 default
+is a development convenience, not accounting.
+
+Fees are applied to the gross (item price plus any shipping charged to the buyer),
+matching how eBay assesses the final value fee.
+
+### Shipping is represented, not assumed
+
+`ShippingTerms` covers `seller_paid`, `buyer_paid`, `calculated` and
+`local_pickup`. The listing stores `seller_shipping_cost_cents` and
+`buyer_shipping_charge_cents` separately rather than one column meaning
+"seller-borne", so switching arrangements is a caller change rather than a
+migration. Only `seller_paid` is implemented in V1, matching the provisioned
+free-shipping policy; the others validate as "representable but not implemented"
+so an unsupported arrangement fails loudly instead of mis-computing proceeds.
+
+### Manual operation and safeguard verification
+
+```bash
+uv run resell item create --cost-cents 2500 --intent resale
+uv run resell item photos MP-000001 photos/*.jpg
+uv run resell item start MP-000001
+uv run resell item identify MP-000001 --title "..." --category 3002 --condition USED_EXCELLENT --aspect Size=42R
+uv run resell item price MP-000001
+uv run resell item propose MP-000001 --price-cents 8900 --seller-shipping-cents 1200
+uv run resell item approve MP-000001 --hash <hash>
+uv run resell item show MP-000001
+uv run resell item remove-photo MP-000001 --position 4
+uv run resell item verify-safeguards
+```
+
+`verify-safeguards` builds its own throwaway fixture item, drives it to a known
+state, then attempts fifteen forbidden operations against the live database —
+model self-approval, evidence tampering, approval forgery, SKU reuse, forced
+transitions, approving a photoless proposal — and every one must be refused. It
+costs one SKU, which is retired rather than reused, and the fixture is abandoned
+and left as an audit record.
+
+Building its own fixture is the point. An earlier version probed whichever item
+you named, and three checks reported false results because their premises were
+never established: tampering with an empty evidence table raises nothing, and a
+"forced transition past a voided approval" succeeds when the approval is in fact
+live. One of those checks also mutated real state on success. A check whose
+premise is not constructed proves nothing.
+
+This command found the entry-precondition hole the unit tests missed.
+
+### Proposal does not require uploaded images
+
+Only locally validated photos. Uploading at proposal time would burn EPS uploads
+on items that are never approved and start the 30-day expiry clock during an
+open-ended human review. The Media layer guarantees fresh hosted URLs at publish;
+the expiry check remains as a retry safety net.
+
 ## Next
 
-The item state machine, then `createOrReplaceInventoryItem` → `createOffer` →
-`publishOffer`. The publish attempt is also what settles the open error 25018
-question above.
+Wire the gateway to the eBay calls (replacing `spike.py`), then the reasoning
+plane: vision identification, comps research, and the operator-as-tool loop.

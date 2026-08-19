@@ -634,3 +634,792 @@ def test_write_calls_carry_content_language():
     from resell.spike import WRITE_HEADERS
 
     assert WRITE_HEADERS["Content-Language"] == "en-US"
+
+
+# --- domain: states, sku, pricing --------------------------------------------
+
+
+def test_sku_is_sequential_zero_padded_and_sortable():
+    from resell.domain import format_sku, parse_sku
+
+    assert format_sku(1) == "MP-000001"
+    assert format_sku(42) == "MP-000042"
+    assert format_sku(999999) == "MP-999999"
+    # Lexical order must match numeric order; eBay sorts SKUs as strings.
+    assert sorted([format_sku(2), format_sku(10), format_sku(1)]) == [
+        "MP-000001", "MP-000002", "MP-000010",
+    ]
+    assert parse_sku("MP-000042") == 42
+    with pytest.raises(ValueError):
+        format_sku(0)
+    with pytest.raises(ValueError):
+        parse_sku("2026-08-19-0001")
+
+
+def test_terminal_states_have_no_exits():
+    from resell.domain import TERMINAL_STATES, TRANSITIONS, ItemState
+
+    for state in TERMINAL_STATES:
+        assert TRANSITIONS[state] == frozenset()
+    assert ItemState.LISTED in TERMINAL_STATES
+
+
+def test_every_state_appears_in_the_transition_table():
+    """A state missing from the table would fail closed, but silently — better to
+    catch it here than to discover an item can never leave a state."""
+    from resell.domain import TRANSITIONS, ItemState
+
+    assert set(TRANSITIONS) == set(ItemState)
+    for targets in TRANSITIONS.values():
+        for target in targets:
+            assert target in TRANSITIONS
+
+
+def test_publication_floor_is_net_proceeds_not_cost_margin():
+    """A cost-based floor would block decluttered items, where cost basis is zero
+    or unknown and any sale is a good sale."""
+    from resell.domain import meets_publication_floor
+
+    ok, _ = meets_publication_floor(1999, seller_shipping_cost_cents=400)
+    assert ok is True
+    # Seller-borne shipping must reduce proceeds — forgetting it is how a listing
+    # loses money while looking fine.
+    ok, reason = meets_publication_floor(600, seller_shipping_cost_cents=400)
+    assert ok is False
+    assert "shipping" in reason
+
+
+def test_profitability_reports_but_never_gates():
+    from resell.domain import profitability
+
+    unknown = profitability(1999, None, seller_shipping_cost_cents=400)
+    assert unknown["profit_cents"] is None
+    assert unknown["net_proceeds_cents"] == 1292
+
+    # A zero cost basis must not raise or report infinite ROI.
+    free = profitability(1999, 0, seller_shipping_cost_cents=400)
+    assert free["profit_cents"] == 1292
+    assert free["roi_pct"] is None
+
+    bought = profitability(1999, 1200, seller_shipping_cost_cents=400)
+    assert bought["profit_cents"] == 92
+    assert bought["roi_pct"] == 7.7
+
+
+def test_proposal_hash_ignores_key_and_list_order():
+    from resell.domain import Proposal, ShippingTerms
+
+    base = dict(
+        sku="MP-000001", marketplace="EBAY_US", title="t", description="d",
+        category_id="1", condition_id="USED_GOOD", price_cents=1999, currency="USD",
+        shipping_terms=ShippingTerms.SELLER_PAID, seller_shipping_cost_cents=0,
+        buyer_shipping_charge_cents=0, fulfillment_policy_id="f", payment_policy_id="p",
+        return_policy_id="r", merchant_location_key="l",
+    )
+    a = Proposal(aspects={"B": ["2", "1"], "A": ["x"]}, photo_hashes=("h2", "h1"), **base)
+    b = Proposal(aspects={"A": ["x"], "B": ["1", "2"]}, photo_hashes=("h1", "h2"), **base)
+    assert a.content_hash() == b.content_hash()
+
+    changed = Proposal(aspects={"A": ["x"], "B": ["1", "2"]}, photo_hashes=("h1",), **base)
+    assert changed.content_hash() != a.content_hash()
+
+
+def test_proposal_validation_collects_all_problems():
+    """One round trip should tell the model everything to fix, not just the first
+    thing."""
+    from resell.domain import Proposal, ShippingTerms
+
+    bad = Proposal(
+        sku="MP-000001", marketplace="EBAY_US", title="x" * 90, description="",
+        category_id="", condition_id="", aspects={}, price_cents=100, currency="USD",
+        shipping_terms=ShippingTerms.SELLER_PAID, seller_shipping_cost_cents=0,
+        buyer_shipping_charge_cents=0, photo_hashes=(), fulfillment_policy_id="",
+        payment_policy_id="", return_policy_id="", merchant_location_key="",
+    )
+    problems = bad.validate(required_aspects={"Author"})
+    assert len(problems) >= 8
+    assert any("80 limit" in p for p in problems)
+    assert any("'Author'" in p for p in problems)
+    assert any("floor" in p for p in problems)
+
+
+# --- gateway -----------------------------------------------------------------
+
+
+def _gateway(tmp_path: Path):
+    from resell.gateway import Gateway
+
+    conn = db.connect(tmp_path / "gw.db")
+    return Gateway(conn, environment="sandbox"), conn
+
+
+def _digest(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _valid_proposal(sku: str, photo_hashes: tuple[str, ...]):
+    from resell.domain import Proposal, ShippingTerms
+
+    return Proposal(
+        sku=sku, marketplace="EBAY_US", title="Dune by Frank Herbert paperback",
+        description="Good condition.", category_id="261186", condition_id="USED_GOOD",
+        aspects={"Author": ["Frank Herbert"], "Format": ["Paperback"]},
+        price_cents=1999, currency="USD",
+        shipping_terms=ShippingTerms.SELLER_PAID, seller_shipping_cost_cents=400,
+        buyer_shipping_charge_cents=0,
+        photo_hashes=photo_hashes, fulfillment_policy_id="FUL-1",
+        payment_policy_id="PAY-1", return_policy_id="RET-1",
+        merchant_location_key="resell-primary",
+    )
+
+
+def test_sku_never_reused_after_delete(tmp_path: Path):
+    """A reused SKU would collide with eBay's record of the previous item."""
+    gateway, conn = _gateway(tmp_path)
+    first = gateway.ingest_item(purchase_cost_cents=100).sku
+    conn.execute("DELETE FROM item WHERE sku = ?", (first,))
+    assert gateway.ingest_item(purchase_cost_cents=100).sku != first
+
+
+def test_confidence_is_stored_but_never_gates(tmp_path: Path):
+    from resell.domain import ItemState
+
+    gateway, conn = _gateway(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=None, acquisition_intent="declutter").sku
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256=_digest("a"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(
+        sku, title="t", category_id="1", condition_id="USED_GOOD", confidence=0.05
+    )
+    # Very low confidence still passes: the gate is required-information plus no
+    # unresolved blocking unknowns, not a number the model picked.
+    assert gateway.begin_pricing(sku).to_state == ItemState.PRICING
+    stored = conn.execute("SELECT confidence FROM identification WHERE sku = ?", (sku,)).fetchone()
+    assert stored[0] == 0.05
+
+
+def test_operator_only_commands_reject_the_model(tmp_path: Path):
+    from resell.gateway import Rejected
+
+    gateway, conn = _gateway(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=None).sku
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256=_digest("a"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.ask_operator(sku, question="Is it cracked?")
+    question_id = conn.execute("SELECT id FROM open_question WHERE sku = ?", (sku,)).fetchone()["id"]
+
+    with pytest.raises(Rejected, match="only the operator"):
+        gateway.answer_question(question_id, "no")
+    with pytest.raises(Rejected, match="only the operator"):
+        gateway.approve(sku, "anyhash")
+
+
+def test_approval_is_voided_by_content_change(tmp_path: Path):
+    """The invariant that stops "you approved it, then it changed, then we
+    published something you never saw"."""
+    from resell.gateway import Rejected, live_approval
+
+    gateway, conn = _gateway(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=1200, acquisition_intent="resale").sku
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256=_digest("a"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(sku, title="t", category_id="261186", condition_id="USED_GOOD")
+    gateway.begin_pricing(sku)
+    accepted = gateway.propose_listing(
+        sku, _valid_proposal(sku, (_digest("a"),)), required_aspects={"Author", "Format"}
+    )
+    gateway.approve(sku, accepted.data["proposal_hash"], operator=True)
+    assert live_approval(conn, sku) is not None
+
+    gateway.attach_photo(
+        sku, source_path="/b.jpg", content_sha256=_digest("b"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    assert live_approval(conn, sku) is None
+    # Voiding reverts the state too, so `approved` never lies about reality.
+    assert conn.execute("SELECT state FROM item WHERE sku = ?", (sku,)).fetchone()[0] == "proposed"
+    with pytest.raises(Rejected, match="not a legal transition"):
+        gateway.begin_publishing(sku)
+
+
+def test_approve_requires_matching_hash(tmp_path: Path):
+    from resell.gateway import Rejected
+
+    gateway, conn = _gateway(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=None).sku
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256=_digest("a"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(sku, title="t", category_id="261186", condition_id="USED_GOOD")
+    gateway.begin_pricing(sku)
+    gateway.propose_listing(
+        sku, _valid_proposal(sku, (_digest("a"),)), required_aspects=set()
+    )
+    with pytest.raises(Rejected, match="does not match"):
+        gateway.approve(sku, "0" * 64, operator=True)
+
+
+def test_listed_requires_a_listing_id(tmp_path: Path):
+    """An HTTP 2xx is not proof of publication — a stubbed 2xx with no listingId
+    looked exactly like success during the spike."""
+    from resell.domain import ItemState
+    from resell.gateway import Rejected
+
+    gateway, conn = _gateway(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=None).sku
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256=_digest("a"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(sku, title="t", category_id="261186", condition_id="USED_GOOD")
+    gateway.begin_pricing(sku)
+    accepted = gateway.propose_listing(
+        sku, _valid_proposal(sku, (_digest("a"),)), required_aspects=set()
+    )
+    gateway.approve(sku, accepted.data["proposal_hash"], operator=True)
+    gateway.begin_publishing(sku)
+
+    with pytest.raises(Rejected, match="does not prove publication"):
+        gateway.mark_listed(sku)
+
+    gateway.record_publish_progress(sku, offer_id="OFF-1")
+    gateway.record_publish_progress(sku, listing_id="110590224174")
+    assert gateway.mark_listed(sku).to_state == ItemState.LISTED
+
+    with pytest.raises(Rejected, match="not a legal transition"):
+        gateway.revise(sku)
+
+
+def test_evidence_immutability_is_database_enforced(tmp_path: Path):
+    gateway, conn = _gateway(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=None).sku
+    gateway.record_evidence(sku, kind="web_search", source="https://x", payload={"a": 1})
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("UPDATE evidence SET kind = 'tampered'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM evidence")
+
+
+def test_send_to_model_filters_prompt_context(tmp_path: Path):
+    """A record can be retained for audit without being eligible for a prompt."""
+    gateway, conn = _gateway(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=None).sku
+    gateway.record_evidence(sku, kind="visible", source="s", payload={"a": 1})
+    gateway.record_evidence(sku, kind="withheld", source="s", payload={"b": 2}, send_to_model=False)
+
+    kinds = [item["kind"] for item in gateway.model_context(sku)["evidence"]]
+    assert "visible" in kinds
+    assert "withheld" not in kinds
+    assert conn.execute("SELECT COUNT(*) FROM evidence WHERE sku = ?", (sku,)).fetchone()[0] == 2
+
+
+def test_proposal_photos_must_belong_to_the_item(tmp_path: Path):
+    from resell.gateway import Rejected
+
+    gateway, conn = _gateway(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=None).sku
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256=_digest("a"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(sku, title="t", category_id="261186", condition_id="USED_GOOD")
+    gateway.begin_pricing(sku)
+    with pytest.raises(Rejected, match="not an attached validated photo"):
+        gateway.propose_listing(sku, _valid_proposal(sku, (_digest("elsewhere"),)))
+
+
+def test_proposal_does_not_require_uploaded_images(tmp_path: Path):
+    """Uploads happen at publish, not at proposal: uploading earlier would burn
+    EPS uploads on items that are never approved and start the 30-day expiry
+    clock during an open-ended human review."""
+    from resell.domain import ItemState
+
+    gateway, conn = _gateway(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=None).sku
+    gateway.attach_photo(
+        sku, source_path="/a.HEIC", content_sha256=_digest("a"),
+        image_format="heic", size_bytes=3_000_000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(sku, title="t", category_id="261186", condition_id="USED_GOOD")
+    gateway.begin_pricing(sku)
+
+    assert conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] == 0
+    accepted = gateway.propose_listing(sku, _valid_proposal(sku, (_digest("a"),)))
+    assert accepted.to_state == ItemState.PROPOSED
+
+
+# --- fee provenance and shipping decoupling ----------------------------------
+
+
+def test_fee_basis_marks_estimates_as_estimates():
+    """A floor result must never present a generic estimate as a guarantee."""
+    from resell.domain import FeeBasis, FeeModel, compute_proceeds
+
+    provisional = compute_proceeds(1999, seller_shipping_cost_cents=400)
+    assert provisional.fee_basis == FeeBasis.PROVISIONAL_ESTIMATE
+    assert provisional.is_estimate is True
+    assert "estimated" in provisional.describe()
+
+    verified = compute_proceeds(
+        1999,
+        seller_shipping_cost_cents=400,
+        fees=FeeModel(rate=0.13, fixed_cents=30, basis=FeeBasis.CATEGORY_VERIFIED),
+    )
+    assert verified.is_estimate is False
+    assert "computed" in verified.describe()
+
+
+def test_production_publishing_requires_an_authoritative_fee_basis(tmp_path: Path):
+    from resell.domain import FeeBasis, FeeModel, ItemState
+    from resell.gateway import Gateway, Rejected
+
+    conn = db.connect(tmp_path / "prod.db")
+    production = Gateway(conn, environment="production", fees=FeeModel())
+    sku = production.ingest_item(purchase_cost_cents=2500).sku
+
+    # Legality is checked before preconditions, so a fresh item is refused for
+    # being in `intake`. The fee objection is asserted against the entry guard,
+    # which is where it lives.
+    with pytest.raises(Rejected, match="not a legal transition"):
+        production.begin_publishing(sku)
+    reasons = production._entry_preconditions(sku, ItemState.PUBLISHING)
+    assert any("cannot back a" in reason for reason in reasons)
+
+    # Sandbox is unaffected: a provisional estimate is fine for development.
+    sandbox = Gateway(conn, environment="sandbox", fees=FeeModel())
+    reasons = sandbox._entry_preconditions(sku, ItemState.PUBLISHING)
+    assert not any("fee basis" in reason for reason in reasons)
+
+    # With a verified basis, the fee objection disappears in production too; what
+    # remains is the missing approval.
+    verified = Gateway(
+        conn,
+        environment="production",
+        fees=FeeModel(basis=FeeBasis.CATEGORY_VERIFIED, source="checked 2026-08"),
+    )
+    reasons = verified._entry_preconditions(sku, ItemState.PUBLISHING)
+    assert reasons
+    assert not any("fee basis" in reason for reason in reasons)
+
+
+def test_shipping_terms_are_represented_not_assumed():
+    """The schema must not encode seller-paid shipping. All four arrangements are
+    expressible; only seller-paid is implemented, and the rest fail loudly."""
+    from resell.domain import (
+        IMPLEMENTED_SHIPPING_TERMS,
+        Proposal,
+        ShippingTerms,
+        compute_proceeds,
+    )
+
+    assert IMPLEMENTED_SHIPPING_TERMS == frozenset({ShippingTerms.SELLER_PAID})
+    assert len(list(ShippingTerms)) == 4
+
+    seller_paid = compute_proceeds(1999, seller_shipping_cost_cents=400)
+    buyer_paid = compute_proceeds(1999, buyer_shipping_charge_cents=400)
+    # Same postage, opposite payer: buyer-paid nets more, and eBay's fee applies to
+    # the gross including the shipping the buyer was charged.
+    assert buyer_paid.net_cents > seller_paid.net_cents
+    assert buyer_paid.gross_cents == 2399
+    assert seller_paid.gross_cents == 1999
+
+    base = dict(
+        sku="MP-000001", marketplace="EBAY_US", title="t", description="d",
+        category_id="1", condition_id="USED_GOOD", aspects={}, price_cents=5000,
+        currency="USD", photo_hashes=("h",), fulfillment_policy_id="f",
+        payment_policy_id="p", return_policy_id="r", merchant_location_key="l",
+    )
+    unimplemented = Proposal(
+        shipping_terms=ShippingTerms.BUYER_PAID, seller_shipping_cost_cents=0,
+        buyer_shipping_charge_cents=400, **base,
+    )
+    assert any("not implemented" in p for p in unimplemented.validate())
+
+    contradictory = Proposal(
+        shipping_terms=ShippingTerms.SELLER_PAID, seller_shipping_cost_cents=400,
+        buyer_shipping_charge_cents=400, **base,
+    )
+    assert any("cannot also charge the buyer" in p for p in contradictory.validate())
+
+    pickup = Proposal(
+        shipping_terms=ShippingTerms.LOCAL_PICKUP, seller_shipping_cost_cents=400,
+        buyer_shipping_charge_cents=0, **base,
+    )
+    assert any("no shipping cost" in p for p in pickup.validate())
+
+
+def test_preconditions_are_enforced_on_state_entry(tmp_path: Path):
+    """Regression: preconditions used to live in the public commands, so calling
+    the private _transition directly moved an item to `publishing` with a voided
+    approval. Enforcing on entry means no code path can skip them."""
+    from resell.domain import ItemState
+    from resell.gateway import Gateway, Rejected, live_approval
+
+    conn = db.connect(tmp_path / "entry.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = gateway.ingest_item(purchase_cost_cents=2500, acquisition_intent="resale").sku
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256=_digest("a"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(sku, title="t", category_id="3002", condition_id="USED_EXCELLENT")
+    gateway.begin_pricing(sku)
+    accepted = gateway.propose_listing(sku, _valid_proposal(sku, (_digest("a"),)))
+    gateway.approve(sku, accepted.data["proposal_hash"], operator=True)
+
+    # Void the approval by changing the photo set.
+    gateway.attach_photo(
+        sku, source_path="/b.jpg", content_sha256=_digest("b"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    assert live_approval(conn, sku) is None
+
+    # Force the incoherent state the gateway no longer produces, simulating a
+    # hand-edited or corrupted database. The entry guard must still refuse, because
+    # this is defense in depth rather than a consequence of the void behaviour.
+    conn.execute("UPDATE item SET state = 'approved' WHERE sku = ?", (sku,))
+    with pytest.raises(Rejected, match="no live approval"):
+        gateway._transition(sku, ItemState.PUBLISHING, command="Forced")
+    assert conn.execute("SELECT state FROM item WHERE sku = ?", (sku,)).fetchone()[0] == "approved"
+
+
+def test_entry_preconditions_cover_every_gated_state(tmp_path: Path):
+    """A gated state with no entry check would be enterable unconditionally."""
+    from resell.domain import ItemState
+    from resell.gateway import Gateway
+
+    conn = db.connect(tmp_path / "cover.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = gateway.ingest_item(purchase_cost_cents=None).sku
+    for state in (
+        ItemState.IDENTIFYING,
+        ItemState.PRICING,
+        ItemState.APPROVED,
+        ItemState.PUBLISHING,
+        ItemState.LISTED,
+    ):
+        assert gateway._entry_preconditions(sku, state), f"{state} has no entry guard"
+
+
+def test_truncated_hash_is_distinguished_from_a_changed_proposal(tmp_path: Path):
+    """Regression: both sides of the comparison were abbreviated to 16 chars for
+    display, so pasting the truncated value produced an error showing two
+    identical strings that "do not match" — which reads as a broken program."""
+    from resell.gateway import Gateway, Rejected
+
+    conn = db.connect(tmp_path / "hash.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = gateway.ingest_item(purchase_cost_cents=2500).sku
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256=_digest("a"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(sku, title="t", category_id="3002", condition_id="USED_EXCELLENT")
+    gateway.begin_pricing(sku)
+    accepted = gateway.propose_listing(sku, _valid_proposal(sku, (_digest("a"),)))
+    full = accepted.data["proposal_hash"]
+    assert len(full) == 64
+
+    with pytest.raises(Rejected) as info:
+        gateway.approve(sku, full[:16], operator=True)
+    message = "\n".join(info.value.reasons)
+    assert "truncated" in message
+    assert "copy/paste" in message
+    assert full in message  # the usable value is handed back
+
+    with pytest.raises(Rejected) as info:
+        gateway.approve(sku, "0" * 64, operator=True)
+    message = "\n".join(info.value.reasons)
+    assert "truncated" not in message
+    # Never abbreviate the two values being compared.
+    assert full in message
+    assert "0" * 64 in message
+
+    assert gateway.approve(sku, full, operator=True).to_state.value == "approved"
+
+
+# --- approval/state coherence and photo removal ------------------------------
+
+
+def _build_approved(gateway, conn, *, photo_count: int = 2):
+    from resell.domain import Proposal, ShippingTerms
+    from resell.gateway import validated_photos
+
+    sku = gateway.ingest_item(purchase_cost_cents=2500, acquisition_intent="resale").sku
+    for index in range(photo_count):
+        gateway.attach_photo(
+            sku, source_path=f"/p{index}.jpg", content_sha256=_digest(f"{sku}{index}"),
+            image_format="jpeg", size_bytes=1000, validation_errors=None,
+        )
+    gateway.begin_identification(sku)
+    gateway.propose_identification(
+        sku, title="Blazer 42R", category_id="3002", condition_id="USED_EXCELLENT"
+    )
+    gateway.begin_pricing(sku)
+    proposal = Proposal(
+        sku=sku, marketplace="EBAY_US", title="Blazer 42R", description="Navy wool.",
+        category_id="3002", condition_id="USED_EXCELLENT", aspects={"Brand": ["BB"]},
+        price_cents=8900, currency="USD", shipping_terms=ShippingTerms.SELLER_PAID,
+        seller_shipping_cost_cents=1200, buyer_shipping_charge_cents=0,
+        photo_hashes=tuple(p["content_sha256"] for p in validated_photos(conn, sku)),
+        fulfillment_policy_id="FUL", payment_policy_id="PAY", return_policy_id="RET",
+        merchant_location_key="resell-primary",
+    )
+    accepted = gateway.propose_listing(sku, proposal, required_aspects={"Brand"})
+    gateway.approve(sku, accepted.data["proposal_hash"], operator=True)
+    return sku
+
+
+def test_voiding_an_approval_reverts_the_state(tmp_path: Path):
+    """`approved` must imply a live approval. Otherwise the state label lies, and
+    recovery needlessly costs a trip back through pricing."""
+    from resell.domain import ItemState
+    from resell.gateway import Gateway, live_approval
+
+    conn = db.connect(tmp_path / "revert.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = _build_approved(gateway, conn)
+    assert gateway._entry_preconditions(sku, ItemState.PUBLISHING) == []
+
+    gateway.attach_photo(
+        sku, source_path="/extra.jpg", content_sha256=_digest("extra"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    assert live_approval(conn, sku) is None
+    state = conn.execute("SELECT state FROM item WHERE sku = ?", (sku,)).fetchone()[0]
+    assert state == str(ItemState.PROPOSED)
+
+
+def test_remove_photo_voids_approval_and_compacts_positions(tmp_path: Path):
+    """eBay treats the first image as the gallery photo, so contiguous ordering is
+    part of the listing's meaning."""
+    from resell.domain import ItemState
+    from resell.gateway import Gateway, live_approval, validated_photos
+
+    conn = db.connect(tmp_path / "remove.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = _build_approved(gateway, conn, photo_count=4)
+    assert [p["position"] for p in validated_photos(conn, sku)] == [1, 2, 3, 4]
+
+    gateway.remove_photo(sku, position=2)
+    remaining = validated_photos(conn, sku)
+    assert [p["position"] for p in remaining] == [1, 2, 3]
+    assert [p["source_path"] for p in remaining] == ["/p0.jpg", "/p2.jpg", "/p3.jpg"]
+    assert live_approval(conn, sku) is None
+    state = conn.execute("SELECT state FROM item WHERE sku = ?", (sku,)).fetchone()[0]
+    assert state == str(ItemState.PROPOSED)
+
+    # Removal by content hash works too.
+    target = validated_photos(conn, sku)[-1]["content_sha256"]
+    gateway.remove_photo(sku, content_sha256=target)
+    assert len(validated_photos(conn, sku)) == 2
+
+
+def test_remove_photo_selector_and_existence_guards(tmp_path: Path):
+    from resell.gateway import Gateway, Rejected
+
+    conn = db.connect(tmp_path / "guards.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = _build_approved(gateway, conn)
+
+    with pytest.raises(Rejected, match="exactly one of"):
+        gateway.remove_photo(sku)
+    with pytest.raises(Rejected, match="exactly one of"):
+        gateway.remove_photo(sku, position=1, content_sha256="abc")
+    with pytest.raises(Rejected, match="no photo at"):
+        gateway.remove_photo(sku, position=999)
+
+
+def test_photo_set_is_frozen_once_published(tmp_path: Path):
+    """A published listing lives on eBay. Changing the local photo set would
+    silently desync the two, and listing revision is not implemented."""
+    from resell.gateway import Gateway, Rejected
+
+    conn = db.connect(tmp_path / "frozen.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = _build_approved(gateway, conn)
+    gateway.begin_publishing(sku)
+    gateway.record_publish_progress(sku, offer_id="OFF-1")
+    gateway.record_publish_progress(sku, listing_id="110590224174")
+    gateway.mark_listed(sku)
+
+    with pytest.raises(Rejected, match="photo set cannot change"):
+        gateway.remove_photo(sku, position=1)
+    with pytest.raises(Rejected, match="photo set cannot change"):
+        gateway.attach_photo(
+            sku, source_path="/x.jpg", content_sha256=_digest("x"),
+            image_format="jpeg", size_bytes=1, validation_errors=None,
+        )
+
+
+def test_approval_revalidates_content_not_just_the_hash(tmp_path: Path):
+    """A hash match proves the proposal has not changed since approval. It does not
+    prove the proposal is still valid — removing every photo changes the hash and
+    voids the old approval, but nothing stopped a fresh approval of a photoless
+    listing until entry preconditions re-ran validation."""
+    from resell.gateway import Gateway, Rejected, active_listing
+
+    conn = db.connect(tmp_path / "revalidate.db")
+    gateway = Gateway(conn, environment="sandbox")
+    sku = _build_approved(gateway, conn, photo_count=1)
+    gateway.remove_photo(sku, position=1)
+
+    listing = active_listing(conn, sku, "EBAY_US", "sandbox")
+    current = gateway._proposal_from_listing(sku, listing).content_hash()
+    with pytest.raises(Rejected, match="no longer valid: at least one photo"):
+        gateway.approve(sku, current, operator=True)
+
+    # Restoring a photo makes it approvable again.
+    gateway.attach_photo(
+        sku, source_path="/new.jpg", content_sha256=_digest("new"),
+        image_format="jpeg", size_bytes=1000, validation_errors=None,
+    )
+    listing = active_listing(conn, sku, "EBAY_US", "sandbox")
+    restored = gateway._proposal_from_listing(sku, listing).content_hash()
+    assert gateway.approve(sku, restored, operator=True).to_state.value == "approved"
+
+
+def test_verify_safeguards_builds_its_own_fixture(tmp_path: Path, monkeypatch):
+    """Regression: it used to probe whatever item you named, and three checks
+    reported false results because their premises were not established —
+    tampering with an empty evidence table raises nothing, and a "forced
+    transition past a voided approval" succeeds when the approval is live. One
+    check also mutated real state on success."""
+    import argparse
+
+    monkeypatch.setenv("RESELL_DB", str(tmp_path / "verify.db"))
+    monkeypatch.setenv("EBAY_ENV", "sandbox")
+    monkeypatch.setenv("EBAY_CLIENT_ID", "a")
+    monkeypatch.setenv("EBAY_CLIENT_SECRET", "b")
+    monkeypatch.setenv("EBAY_RUNAME", "X-Y-Z-abc")
+
+    from resell import cli_item
+
+    # A pre-existing item must be left alone entirely.
+    from resell.gateway import Gateway
+
+    conn = db.connect(tmp_path / "verify.db")
+    existing = Gateway(conn, environment="sandbox").ingest_item(purchase_cost_cents=100).sku
+    before = conn.execute("SELECT state FROM item WHERE sku = ?", (existing,)).fetchone()[0]
+
+    assert cli_item.cmd_item_verify_safeguards(argparse.Namespace()) == 0
+
+    after = conn.execute("SELECT state FROM item WHERE sku = ?", (existing,)).fetchone()[0]
+    assert after == before
+
+    # The fixture exists, is abandoned, and its SKU is distinct and retired.
+    fixture = conn.execute(
+        "SELECT sku, state FROM item WHERE sku != ? ORDER BY seq DESC LIMIT 1", (existing,)
+    ).fetchone()
+    assert fixture["state"] == "abandoned"
+    assert fixture["sku"] != existing
+    # Evidence must be present, or the append-only checks would pass vacuously.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM evidence WHERE sku = ?", (fixture["sku"],)
+    ).fetchone()[0] >= 1
+
+
+def test_migration_6_heals_approved_without_a_live_approval(tmp_path: Path):
+    """Databases written before void-reverts-state can hold `approved` with no live
+    approval. Publishing was already blocked, but the item could neither publish
+    nor be re-approved (approve requires `proposed`), so it was stuck."""
+    import hashlib
+
+    from resell.domain import Proposal, ShippingTerms
+    from resell.gateway import Gateway, active_listing, live_approval
+
+    path = tmp_path / "legacy.db"
+    full = db.MIGRATIONS
+    db.MIGRATIONS = full[:5]
+    try:
+        conn = db.connect(path)
+        gateway = Gateway(conn, environment="sandbox")
+
+        def build(with_listing: bool) -> str:
+            sku = gateway.ingest_item(purchase_cost_cents=2500).sku
+            digest = hashlib.sha256(f"{sku}a".encode()).hexdigest()
+            gateway.attach_photo(
+                sku, source_path="/a.jpg", content_sha256=digest,
+                image_format="jpeg", size_bytes=1000, validation_errors=None,
+            )
+            gateway.begin_identification(sku)
+            gateway.propose_identification(
+                sku, title="Blazer", category_id="3002", condition_id="USED_EXCELLENT"
+            )
+            gateway.begin_pricing(sku)
+            if with_listing:
+                proposal = Proposal(
+                    sku=sku, marketplace="EBAY_US", title="Blazer", description="Navy.",
+                    category_id="3002", condition_id="USED_EXCELLENT", aspects={},
+                    price_cents=8900, currency="USD",
+                    shipping_terms=ShippingTerms.SELLER_PAID,
+                    seller_shipping_cost_cents=1200, buyer_shipping_charge_cents=0,
+                    photo_hashes=(digest,), fulfillment_policy_id="F",
+                    payment_policy_id="P", return_policy_id="R", merchant_location_key="L",
+                )
+                accepted = gateway.propose_listing(sku, proposal)
+                gateway.approve(sku, accepted.data["proposal_hash"], operator=True)
+            return sku
+
+        stuck = build(True)
+        # Simulate the pre-fix void: mark voided without reverting the state.
+        conn.execute(
+            "UPDATE approval SET voided_at = ?, voided_reason = 'legacy' WHERE sku = ?",
+            (db.now_iso(), stuck),
+        )
+        orphan = build(False)
+        conn.execute("UPDATE item SET state = 'approved' WHERE sku = ?", (orphan,))
+        healthy = build(True)
+        conn.close()
+    finally:
+        db.MIGRATIONS = full
+
+    conn = db.connect(path)
+
+    def state_of(sku: str) -> str:
+        return conn.execute("SELECT state FROM item WHERE sku = ?", (sku,)).fetchone()[0]
+
+    # With a proposal to return to, `proposed`; without one, `pricing`.
+    assert state_of(stuck) == "proposed"
+    assert state_of(orphan) == "pricing"
+    # An item with a genuinely live approval must not be disturbed.
+    assert state_of(healthy) == "approved"
+    assert live_approval(conn, healthy) is not None
+
+    repairs = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE kind = 'item.state_repaired'"
+    ).fetchone()[0]
+    assert repairs == 2
+
+    # The healed item is one re-approval from publishing.
+    gateway = Gateway(conn, environment="sandbox")
+    listing = active_listing(conn, stuck, "EBAY_US", "sandbox")
+    current = gateway._proposal_from_listing(stuck, listing).content_hash()
+    assert gateway.approve(stuck, current, operator=True).to_state.value == "approved"
+    assert gateway._entry_preconditions(stuck, "publishing") == []
+
+    # Reopening must not re-fire the repair.
+    conn.close()
+    conn = db.connect(path)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM events WHERE kind = 'item.state_repaired'"
+    ).fetchone()[0] == 2

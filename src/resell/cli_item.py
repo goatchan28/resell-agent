@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from resell import db
@@ -27,6 +28,7 @@ from resell.domain import (
 from resell.gateway import (
     Gateway,
     current_state,
+    observations_in_scope,
     Rejected,
     active_listing,
     current_identification,
@@ -134,6 +136,37 @@ def cmd_item_start(args: argparse.Namespace) -> int:
         return _rejected(exc)
 
 
+def merged_identification(conn, sku: str, **overrides) -> tuple[dict, list[str]]:
+    """Carry forward the current identification, applying only what was supplied.
+
+    `propose_identification` supersedes rather than edits, which is correct for the
+    domain: a belief is replaced, not patched. But every caller wants a merge, and
+    the one that did not -- `--apply` on aspect mapping -- silently produced an
+    identification with aspects and no category, title or condition.
+
+    One implementation, so that cannot happen again.
+    """
+    fields = {
+        "brand": None, "model": None, "variant": None, "title": None,
+        "description": None, "condition_id": None, "category_id": None,
+        "aspects": None, "confidence": None, "reasoning": None,
+    }
+    fields.update({key: value for key, value in overrides.items() if key in fields})
+
+    carried: list[str] = []
+    previous = current_identification(conn, sku)
+    if previous is not None:
+        for field in ("brand", "model", "variant", "title", "description",
+                      "condition_id", "category_id", "reasoning"):
+            if fields[field] is None and previous[field]:
+                fields[field] = previous[field]
+                carried.append(field)
+        if fields["aspects"] is None and previous["aspects"]:
+            fields["aspects"] = json.loads(previous["aspects"])
+            carried.append("aspects")
+    return fields, carried
+
+
 def cmd_item_identify(args: argparse.Namespace) -> int:
     """Manual stand-in for vision identification.
 
@@ -170,18 +203,7 @@ def cmd_item_identify(args: argparse.Namespace) -> int:
 
     carried: list[str] = []
     if not args.replace:
-        previous = current_identification(conn, args.sku)
-        if previous is not None:
-            for field in (
-                "brand", "model", "variant", "title", "description",
-                "condition_id", "category_id", "reasoning",
-            ):
-                if supplied[field] is None and previous[field]:
-                    supplied[field] = previous[field]
-                    carried.append(field)
-            if supplied["aspects"] is None and previous["aspects"]:
-                supplied["aspects"] = json.loads(previous["aspects"])
-                carried.append("aspects")
+        supplied, carried = merged_identification(conn, args.sku, **supplied)
 
     try:
         accepted = gateway.propose_identification(args.sku, **supplied)
@@ -395,6 +417,350 @@ def cmd_item_suggest_category(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_item_observe(args: argparse.Namespace) -> int:
+    """Run the vision stage: photos in, proposals out, gateway decides.
+
+    The two halves are deliberately visible here. `vision.observe` returns typed
+    proposals and persists nothing; every one is then offered to the gateway, which
+    accepts or refuses it on the same terms as operator input. A model tool call is
+    not a database write.
+    """
+    config, conn, gateway = _open()
+    from resell.reasoning.vision import VisionError, observe_and_record
+
+    photos = validated_photos(conn, args.sku)
+    if not photos:
+        print(f"{args.sku} has no validated photos; run: resell item photos", file=sys.stderr)
+        return 2
+
+    cache_dir = Path(config.db_path).parent / "derivatives"
+    paths = [Path(photo["source_path"]) for photo in photos]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        print(f"photo file(s) missing: {', '.join(missing)}", file=sys.stderr)
+        return 2
+
+    from resell.reasoning.budget import BudgetExceeded, StageBudget
+    from resell.reasoning.vision import spend_so_far
+
+    budget = StageBudget.from_env("observe")
+    if args.max_output_tokens:
+        budget = replace(budget, max_output_tokens=args.max_output_tokens)
+    if args.max_cost_micros:
+        budget = replace(budget, max_cost_micros=args.max_cost_micros)
+    spent = spend_so_far(conn, args.sku, "observe")
+
+    print(f"\n{args.sku}: observing {len(paths)} photo(s)")
+    print(f"  budget: {spent.calls}/{budget.max_calls} calls, "
+          f"${spent.cost_micros / 1_000_000:.4f} of ${budget.max_cost_micros / 1_000_000:.4f} spent")
+    try:
+        result, trace_id = observe_and_record(
+            conn, args.sku, paths, cache_dir=cache_dir, note=args.note,
+            provider=args.provider, model=args.model,
+            budget=budget, spent=spent,
+        )
+    except BudgetExceeded as exc:
+        print(f"\nREFUSED before calling the model: {exc}", file=sys.stderr)
+        return 1
+    except VisionError as exc:
+        print(f"vision stage failed: {exc}", file=sys.stderr)
+        return 1
+    usage = result.result.usage
+    actual = result.actual_cost_micros or 0
+    estimated = result.estimate.worst_case_micros if result.estimate else 0
+    print(f"  {result.provider}/{result.model}  in={usage.input_tokens} "
+          f"out={usage.output_tokens} tok  {result.result.latency_ms}ms  trace={trace_id}")
+    print(f"  cost ${actual / 1_000_000:.4f} against a ${estimated / 1_000_000:.4f} worst case"
+          f"  (rate basis: {result.rates.basis if result.rates else 'unknown'})\n")
+
+    # Attribute every record to the provider and model that produced it, so the
+    # same eval set can later be run elsewhere and compared per observation.
+    source = f"{result.provider}/{result.model}"
+
+    proposal = result.proposal
+    for line in proposal.malformed:
+        print(f"  MALFORMED  {line}")
+
+    accepted = rejected = 0
+    for observation in proposal.observations:
+        try:
+            outcome = gateway.record_observation(
+                args.sku, observation, source=source, model_call_id=trace_id
+            )
+        except Rejected as exc:
+            rejected += 1
+            print(f"  REFUSED    {observation.claim[:56]}")
+            for reason in exc.reasons:
+                print(f"             {reason}")
+            continue
+        accepted += 1
+        cite = f"photo {list(observation.photo_positions)}" if observation.photo_positions else ""
+        claim = observation.claim if args.full else observation.claim[:76]
+        print(f"  ok  [{outcome.data['evidence_id']:>3}] {str(observation.basis):<20} "
+              f"{claim:<76} {cite}" if not args.full
+              else f"  ok  [{outcome.data['evidence_id']:>3}] {str(observation.basis):<20} "
+                   f"{claim}  {cite}")
+
+    for identifier in proposal.identifiers:
+        try:
+            outcome = gateway.record_identifier(
+                args.sku, identifier, source=source, model_call_id=trace_id
+            )
+        except Rejected as exc:
+            rejected += 1
+            print(f"  REFUSED    {identifier.scheme}={identifier.raw_transcription}")
+            for reason in exc.reasons:
+                print(f"             {reason}")
+            continue
+        accepted += 1
+        print(f"  ok  [{outcome.data['evidence_id']:>3}] identifier           {outcome.detail[:70]}")
+
+    finding = proposal.negative_finding
+    if finding:
+        print(f"\n  identity search: {finding.photos_reviewed} photo(s) reviewed; "
+              f"surfaces {list(finding.surfaces_examined) or 'none named'}")
+        if finding.note:
+            print(f"    {finding.note[:100]}")
+        db.kv_set(conn, f"identity_search:{args.sku}", json.dumps({
+            "surfaces_examined": list(finding.surfaces_examined),
+            "photos_reviewed": finding.photos_reviewed,
+            "note": finding.note,
+        }))
+
+    # A model can satisfy the observation contract perfectly while leaving every
+    # product code inside a text_read claim, where it is never check-digit verified
+    # and never reaches eBay's dedicated identifier fields. Heuristic, so it reports
+    # rather than refuses.
+    from resell.reasoning.tools import unstructured_identifier_candidates
+
+    loose = unstructured_identifier_candidates(proposal)
+    if loose:
+        print(f"\n  NOTE: {len(loose)} code-like string(s) were transcribed as prose but not "
+              f"recorded as identifiers,")
+        print("        so they were not check-digit verified and will not reach eBay's "
+              "identifier fields.")
+        print("        (heuristic — it will miss codes containing spaces, and may flag "
+              "non-identifiers)")
+        for token, claim in loose:
+            print(f"          {token:<16} {claim[:62]}")
+        print("\n        Record them (adjust --scheme; run `resell item identifier "
+              "--help` for the list):")
+        for token, claim in loose:
+            print(f"          resell item identifier {args.sku} --scheme other "
+                  f'--value "{token}" --photo 2')
+
+    print(f"\n{accepted} accepted, {rejected} refused, {len(proposal.malformed)} malformed")
+    return 1 if rejected and not accepted else 0
+
+
+def cmd_item_identifier(args: argparse.Namespace) -> int:
+    """Record a product identifier by hand.
+
+    Exists because the vision stage will sometimes transcribe a code as prose, and
+    because an operator reading the tag directly is a stronger source than OCR.
+    """
+    _, _, gateway = _open()
+    from resell.reasoning.schema import IdentifierObservation, IdentifierScheme
+
+    try:
+        scheme = IdentifierScheme(args.scheme)
+    except ValueError:
+        print(f"unknown scheme {args.scheme!r}; one of: "
+              f"{', '.join(str(s) for s in IdentifierScheme)}", file=sys.stderr)
+        return 2
+
+    identifier = IdentifierObservation(
+        scheme=scheme, raw_transcription=args.value,
+        photo_position=args.photo, surface=args.surface,
+    )
+    try:
+        # An operator reading the tag directly is a stronger source than OCR, and
+        # the basis is what lets it settle a disagreement later.
+        outcome = gateway.record_identifier(
+            args.sku, identifier, source="operator", basis="operator"
+        )
+    except Rejected as exc:
+        return _rejected(exc)
+    return _report(outcome)
+
+
+def cmd_item_evidence(args: argparse.Namespace) -> int:
+    """Show what is on record for an item, with provenance."""
+    _, conn, _ = _open()
+    rows = conn.execute(
+        "SELECT id, kind, basis, subject, source, payload, confidence, send_to_model "
+        "FROM evidence WHERE sku = ? ORDER BY id",
+        (args.sku,),
+    ).fetchall()
+    if not rows:
+        print(f"{args.sku}: no evidence recorded")
+        return 0
+
+    print(f"\n{args.sku}: {len(rows)} evidence record(s)\n")
+    for row in rows:
+        payload = json.loads(row["payload"])
+        claim = payload.get("claim") or payload.get("normalized") or payload.get("answer") or ""
+        flags = "" if row["send_to_model"] else "  [withheld from model]"
+        text = str(claim) if args.full else str(claim)[:76]
+        print(f"  [{row['id']:>3}] {str(row['basis'] or row['kind']):<20} {text}{flags}")
+        detail = []
+        if payload.get("photo_positions"):
+            detail.append(f"photos {payload['photo_positions']}")
+        if payload.get("photo_position"):
+            detail.append(f"photo {payload['photo_position']}")
+        if payload.get("surface"):
+            detail.append(payload["surface"])
+        if row["confidence"] is not None:
+            detail.append(f"conf {row['confidence']}")
+        if row["subject"] != "this_item":
+            detail.append(f"subject={row['subject']}")
+        if detail:
+            print(f"        {' · '.join(detail)}")
+    return 0
+
+
+def cmd_item_map_aspects(args: argparse.Namespace) -> int:
+    """Map recorded observations onto the category's aspect form, with citations."""
+    config, conn, gateway = _open(require_credentials=True)
+    from resell.ebay.client import EbayApiError, EbayClient
+    from resell.ebay.publisher import Publisher
+    from resell.reasoning.budget import BudgetExceeded, StageBudget
+    from resell.reasoning.gaps import Resolution
+    from resell.reasoning.mapping import MappingError, map_aspects
+    from resell.reasoning.vision import spend_so_far
+
+    identification = current_identification(conn, args.sku)
+    category_id = args.category or (identification["category_id"] if identification else None)
+    if not category_id:
+        print("no category; pass --category or run: resell item suggest-category",
+              file=sys.stderr)
+        return 2
+
+    observations = observations_in_scope(conn, args.sku)
+    if not observations:
+        print(f"{args.sku} has no observations in scope; run: resell item observe {args.sku}",
+              file=sys.stderr)
+        return 2
+
+    with EbayClient(config, conn) as client:
+        try:
+            specs = Publisher(gateway, client, conn).aspect_schema(
+                config.marketplace_id, category_id
+            )
+        except EbayApiError as exc:
+            print(f"aspect lookup failed for category {category_id}:\n{exc}", file=sys.stderr)
+            return 1
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM evidence WHERE sku = ?", (args.sku,)
+    ).fetchone()[0]
+    budget = StageBudget.from_env("map_aspects")
+    spent = spend_so_far(conn, args.sku, "map_aspects")
+    print(f"\n{args.sku}: mapping {len(observations)} in-scope observation(s) of {total} "
+          f"recorded, onto category {category_id}")
+    print(f"  budget: {spent.calls}/{budget.max_calls} calls, "
+          f"${spent.cost_micros / 1_000_000:.4f} of ${budget.max_cost_micros / 1_000_000:.4f}")
+
+    try:
+        outcome = map_aspects(
+            conn, args.sku, specs=specs, observations=observations,
+            provider=args.provider, model=args.model, budget=budget, spent=spent,
+        )
+    except BudgetExceeded as exc:
+        print(f"\nREFUSED before calling the model: {exc}", file=sys.stderr)
+        return 1
+    except MappingError as exc:
+        print(f"mapping failed: {exc}", file=sys.stderr)
+        return 1
+
+    usage = outcome.result.usage
+    cost = outcome.rates.cost_micros(usage.input_tokens, usage.output_tokens)
+    print(f"  {outcome.result.provider}/{outcome.result.model}  in={usage.input_tokens} "
+          f"out={usage.output_tokens} tok  {outcome.result.latency_ms}ms  "
+          f"trace={outcome.call_id}")
+    print(f"  cost ${cost / 1_000_000:.4f}\n")
+
+    for line in outcome.proposal.malformed:
+        print(f"  MALFORMED  {line}")
+
+    required = {spec.name for spec in specs if spec.required}
+    marks = {
+        Resolution.RESOLVED: "ok  ", Resolution.RESOLVED_BY_OPERATOR: "ok* ",
+        Resolution.RESOLVED_UNVERIFIED: "ok? ",
+        Resolution.UNSUPPORTED: "GAP ", Resolution.AMBIGUOUS: "GAP ",
+        Resolution.CONTRADICTED: "GAP ",
+    }
+    for item in sorted(outcome.outcomes, key=lambda o: (o.aspect_name not in required, o.aspect_name)):
+        flag = "req" if item.aspect_name in required else "opt"
+        shown = " + ".join(item.values) if item.values else "-"
+        print(f"  {marks[item.resolution]} [{flag}] {item.aspect_name:<26} "
+              f"{shown:<28} {item.resolution}")
+        for candidate in item.candidates:
+            if candidate.support:
+                print(f"           cites {sorted(candidate.evidence_ids)} for "
+                      f"{candidate.value!r}")
+        if item.resolution is not Resolution.RESOLVED:
+            print(f"           {item.explanation[:120]}")
+
+    blocking = [gap for gap in outcome.gaps if gap.blocking]
+    if blocking:
+        print(f"\n  {len(blocking)} blocking gap(s):")
+        for gap in blocking:
+            print(f"    [{gap.action}] {gap.question[:110]}")
+
+    if args.apply:
+        return _apply_mapping(conn, gateway, args.sku, outcome, required, category_id)
+    print("\n  Nothing recorded. Re-run with --apply to store the candidates, "
+          "update the identification and open questions for the gaps.")
+    return 0
+
+
+def _apply_mapping(conn, gateway, sku: str, outcome, required: set[str],
+                   category_id: str) -> int:
+    """Persist candidates, update the identification, and open questions for gaps."""
+    from resell.reasoning.gaps import Resolution
+
+    resolved = {
+        item.aspect_name: list(item.values)
+        for item in outcome.outcomes
+        if item.values and item.resolution in
+        (Resolution.RESOLVED, Resolution.RESOLVED_BY_OPERATOR,
+         Resolution.RESOLVED_UNVERIFIED)
+    }
+    # The category is stored alongside the aspects it produced. Aspects without the
+    # category whose form defines them are uninterpretable.
+    fields, carried = merged_identification(
+        conn, sku, aspects=resolved or None, category_id=category_id
+    )
+    try:
+        gateway.propose_identification(sku, **fields)
+    except Rejected as exc:
+        return _rejected(exc)
+
+    identification = current_identification(conn, sku)
+    stored = gateway.record_aspect_candidates(sku, identification["id"], outcome.outcomes)
+    print(f"\n  identification v{identification['version']} for category {category_id} "
+          f"with {len(resolved)} resolved aspect(s); {stored} candidate(s) cited")
+    if carried:
+        print(f"    carried forward from the previous version: {', '.join(carried)}")
+
+    opened = 0
+    for gap in outcome.gaps:
+        if not gap.blocking:
+            continue
+        try:
+            gateway.ask_operator(
+                sku, question=gap.question,
+                why_it_matters=f"required aspect {gap.aspect_name} is {gap.resolution}",
+            )
+            opened += 1
+        except Rejected as exc:
+            print(f"  could not open a question for {gap.aspect_name}: {exc.reasons[0]}")
+    if opened:
+        print(f"  {opened} blocking question(s) opened; answer with: resell item answer ID ANSWER")
+    return 0
+
+
 def cmd_item_aspects(args: argparse.Namespace) -> int:
     """Show a category's aspect form, with eBay's allowed values.
 
@@ -559,6 +925,49 @@ def cmd_item_publish(args: argparse.Namespace) -> int:
         print(f"\nPUBLISHED  listingId={listing_id}")
         print(f"  https://www.sandbox.ebay.com/itm/{listing_id}"
               if config.env.name == "sandbox" else f"  https://www.ebay.com/itm/{listing_id}")
+    return 0
+
+
+def cmd_item_list(args: argparse.Namespace) -> int:
+    """Every item, in SKU order. Includes terminal ones by default.
+
+    Abandoned items are shown rather than hidden: SKUs are never reused, so a gap
+    in the sequence is a question worth being able to answer.
+    """
+    config, conn, _ = _open()
+    clauses, params = [], []
+    if args.state:
+        clauses.append(f"state IN ({','.join('?' * len(args.state))})")
+        params.extend(args.state)
+    if args.active:
+        clauses.append("state NOT IN ('abandoned', 'listed')")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    rows = conn.execute(
+        f"""
+        SELECT i.sku, i.state, i.acquisition_intent, i.purchase_cost_cents,
+               i.identification_effort, i.created_at, i.notes,
+               (SELECT COUNT(*) FROM photo p WHERE p.sku = i.sku) AS photos,
+               (SELECT COUNT(*) FROM evidence e WHERE e.sku = i.sku) AS evidence,
+               (SELECT l.listing_id FROM listing l
+                 WHERE l.sku = i.sku AND l.active = 1) AS listing_id
+          FROM item i {where} ORDER BY i.seq
+        """,
+        params,
+    ).fetchall()
+
+    if not rows:
+        print("no items")
+        return 0
+
+    print(f"\n{'sku':<11} {'state':<15} {'intent':<10} {'cost':>8} {'ph':>3} {'ev':>3}  detail")
+    for row in rows:
+        cost = "-" if row["purchase_cost_cents"] is None else f"${row['purchase_cost_cents'] / 100:.2f}"
+        detail = row["listing_id"] or (row["notes"] or "")[:44]
+        print(f"{row['sku']:<11} {row['state']:<15} {row['acquisition_intent']:<10} "
+              f"{cost:>8} {row['photos']:>3} {row['evidence']:>3}  {detail}")
+
+    print(f"\n{len(rows)} item(s) in {config.env.name}")
     return 0
 
 
@@ -933,6 +1342,41 @@ def register(subparsers) -> None:
     )
     suggest.set_defaults(func=cmd_item_suggest_category)
 
+    observe = sub.add_parser("observe", help="run the vision stage over the item's photos")
+    observe.add_argument("sku")
+    observe.add_argument("--note", help="context for the model, e.g. where it came from")
+    observe.add_argument("--model", default=None)
+    observe.add_argument("--provider", default=None, help="model provider (default: anthropic)")
+    observe.add_argument("--max-output-tokens", type=int, default=None)
+    observe.add_argument("--max-cost-micros", type=int, default=None,
+                         help="budget for this stage on this item, in millionths")
+    observe.add_argument("--full", action="store_true", help="do not truncate claims")
+
+    identifier = sub.add_parser("identifier", help="record a product identifier by hand")
+    identifier.add_argument("sku")
+    identifier.add_argument("--scheme", required=True)
+    identifier.add_argument("--value", required=True)
+    identifier.add_argument("--photo", type=int, default=0)
+    identifier.add_argument("--surface")
+    identifier.set_defaults(func=cmd_item_identifier)
+    observe.set_defaults(func=cmd_item_observe)
+
+    evidence = sub.add_parser("evidence", help="show recorded evidence with provenance")
+    evidence.add_argument("sku")
+    evidence.add_argument("--full", action="store_true", help="do not truncate claims")
+    evidence.set_defaults(func=cmd_item_evidence)
+
+    mapping = sub.add_parser(
+        "map-aspects", help="map recorded observations onto the aspect form"
+    )
+    mapping.add_argument("sku")
+    mapping.add_argument("--category", help="defaults to the identification's category")
+    mapping.add_argument("--provider", default=None)
+    mapping.add_argument("--model", default=None)
+    mapping.add_argument("--apply", action="store_true",
+                         help="record candidates, update identification, open gap questions")
+    mapping.set_defaults(func=cmd_item_map_aspects)
+
     aspects = sub.add_parser("aspects", help="show a category's aspect form and allowed values")
     aspects.add_argument("sku", nargs="?")
     aspects.add_argument("--category", help="defaults to the identification's category")
@@ -956,6 +1400,12 @@ def register(subparsers) -> None:
         help="check everything without uploading or writing to eBay",
     )
     publish.set_defaults(func=cmd_item_publish)
+
+    listing = sub.add_parser("list", help="all items, in SKU order")
+    listing.add_argument("--state", action="append", help="filter by state (repeatable)")
+    listing.add_argument("--active", action="store_true",
+                         help="exclude abandoned and listed items")
+    listing.set_defaults(func=cmd_item_list)
 
     show = sub.add_parser("show", help="full item state")
     show.add_argument("sku")

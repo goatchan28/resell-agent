@@ -335,6 +335,120 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
            AND state_changed_at >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', '-5 seconds')
         """,
     ),
+    # 7 -- the reasoning plane's storage.
+    (
+        # Explicit, not derived from purchase cost. Cost is a poor proxy for how much
+        # identification matters: inherited, gifted, decluttered and free items all
+        # have a cost basis that says nothing about whether identity is discoverable
+        # or worth discovering. Scoped to identity resolution by name, so it does not
+        # quietly become the global research budget -- pricing and comps get their
+        # own policy later.
+        "ALTER TABLE item ADD COLUMN identification_effort TEXT NOT NULL DEFAULT 'standard'",
+
+        # Basis and subject are columns rather than payload keys so they can be
+        # queried and constrained. subject is what lets external research join the
+        # loop without contaminating it: a catalogue page describes a candidate
+        # product, not the object on the table.
+        "ALTER TABLE evidence ADD COLUMN basis TEXT",
+        "ALTER TABLE evidence ADD COLUMN subject TEXT NOT NULL DEFAULT 'this_item'",
+        "CREATE INDEX idx_evidence_basis ON evidence (sku, basis)",
+
+        # Mode is a conclusion, versioned with the identification rather than fixed
+        # on the item: an object can begin described_object and become exact_product
+        # when a model number turns up on its base.
+        "ALTER TABLE identification ADD COLUMN mode TEXT NOT NULL DEFAULT 'unresolved'",
+        "ALTER TABLE identification ADD COLUMN mode_rationale TEXT",
+        "ALTER TABLE identification ADD COLUMN negative_finding TEXT",
+        # For described objects, characterisation replaces naming: dimensions,
+        # materials, style, distinguishing features, condition detail, search terms.
+        "ALTER TABLE identification ADD COLUMN descriptors TEXT",
+
+        # Candidate sets, not single values. A candidate exists only because evidence
+        # supports it, and the foreign key to evidence means a citation to a
+        # nonexistent record fails in the database rather than in application code.
+        """
+        CREATE TABLE aspect_candidate (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            identification_id INTEGER NOT NULL REFERENCES identification(id),
+            aspect_name       TEXT NOT NULL,
+            value             TEXT NOT NULL,
+            created_at        TEXT NOT NULL,
+            UNIQUE (identification_id, aspect_name, value)
+        )
+        """,
+        """
+        CREATE TABLE aspect_candidate_evidence (
+            candidate_id INTEGER NOT NULL REFERENCES aspect_candidate(id),
+            evidence_id  INTEGER NOT NULL REFERENCES evidence(id),
+            PRIMARY KEY (candidate_id, evidence_id)
+        )
+        """,
+        "CREATE INDEX idx_candidate_aspect ON aspect_candidate (identification_id, aspect_name)",
+
+        # The model may request more identification budget; it may not grant itself
+        # any. scope exists so a later pricing budget is additive rather than a
+        # reinterpretation of this one.
+        """
+        CREATE TABLE effort_escalation (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku           TEXT NOT NULL REFERENCES item(sku),
+            scope         TEXT NOT NULL DEFAULT 'identity'
+                              CHECK (scope IN ('identity')),
+            from_effort   TEXT NOT NULL,
+            to_effort     TEXT NOT NULL,
+            rationale     TEXT NOT NULL,
+            evidence_ids  TEXT NOT NULL,
+            requested_at  TEXT NOT NULL,
+            decision      TEXT CHECK (decision IN ('granted', 'denied')),
+            decided_by    TEXT,
+            decided_at    TEXT
+        )
+        """,
+        "CREATE INDEX idx_escalation_pending ON effort_escalation (sku) WHERE decision IS NULL",
+
+        # Full traces retained per item rather than aggregated away.
+        "ALTER TABLE model_call ADD COLUMN request TEXT",
+        "ALTER TABLE model_call ADD COLUMN response TEXT",
+    ),
+    # 8 -- provider is recorded alongside model so the same eval set can be run
+    # across providers and compared. raw_usage keeps whatever token fields a
+    # provider reports beyond the normalised input/output pair.
+    (
+        "ALTER TABLE model_call ADD COLUMN provider TEXT",
+        "ALTER TABLE model_call ADD COLUMN raw_usage TEXT",
+        "CREATE INDEX idx_model_call_provider ON model_call (provider, purpose)",
+    ),
+    # 9 -- inference budget accounting. cost_micros is now populated, but derived
+    # from a configured rate table rather than reported by the provider, so
+    # rate_basis records whether the figure rests on verified prices or on
+    # placeholders. estimated_cost_micros is the pre-call worst case that was
+    # checked against the budget, kept so estimates can be compared to outcomes.
+    (
+        "ALTER TABLE model_call ADD COLUMN estimated_cost_micros INTEGER",
+        "ALTER TABLE model_call ADD COLUMN rate_basis TEXT",
+    ),
+    # 10 -- a paid provider call must survive our own crashes.
+    #
+    # The row is written before the provider is contacted and finalised afterwards,
+    # so a call that fails during parsing -- or takes the process down with it --
+    # stays auditable and still counts against the budget. Existing rows predate
+    # this and were all successful, hence the default.
+    (
+        "ALTER TABLE model_call ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'",
+        "ALTER TABLE model_call ADD COLUMN error TEXT",
+        "CREATE INDEX idx_model_call_status ON model_call (sku, purpose, status)",
+    ),
+    # 11 -- link evidence to the call that produced it.
+    #
+    # Mapping is scoped to the latest observation run, because two runs produce
+    # near-duplicate observations and citing one of two near-identical rows is
+    # arbitrary. Everything is retained: earlier runs stay as append-only evidence
+    # for audit and for cross-provider evaluation. Operator evidence has no call and
+    # is always in scope.
+    (
+        "ALTER TABLE evidence ADD COLUMN model_call_id INTEGER REFERENCES model_call(id)",
+        "CREATE INDEX idx_evidence_call ON evidence (sku, model_call_id)",
+    ),
 )
 
 

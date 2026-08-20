@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from resell.db import log_event, now_iso, transaction
+from resell.reasoning.gaps import EscalationDecision, escalation_policy
+from resell.reasoning.schema import Basis, IdentificationEffort, Subject
 from resell.domain import (
     DEFAULT_MINIMUM_NET_PROCEEDS_CENTS,
     TERMINAL_STATES,
@@ -91,6 +93,32 @@ def unresolved_blocking_questions(conn: sqlite3.Connection, sku: str) -> list[sq
     )
 
 
+def observations_in_scope(conn: sqlite3.Connection, sku: str) -> list[sqlite3.Row]:
+    """Evidence eligible for citation during mapping.
+
+    Model observations are scoped to the most recent completed run: two runs of the
+    same photos produce near-duplicate claims, and citing one of two near-identical
+    rows is arbitrary. Earlier runs stay in the database as append-only evidence for
+    audit and cross-provider evaluation -- they are simply not citable.
+
+    Operator evidence belongs to no run and is always in scope. It is also the
+    strongest source available, so excluding it would be perverse.
+    """
+    latest = conn.execute(
+        "SELECT MAX(id) FROM model_call WHERE sku = ? AND purpose = 'observe' "
+        "AND status = 'completed'",
+        (sku,),
+    ).fetchone()[0]
+
+    return list(
+        conn.execute(
+            "SELECT * FROM evidence WHERE sku = ? AND send_to_model = 1 "
+            "AND (model_call_id IS NULL OR model_call_id = ?) ORDER BY id",
+            (sku, latest),
+        ).fetchall()
+    )
+
+
 def current_identification(conn: sqlite3.Connection, sku: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM identification WHERE sku = ? AND superseded_at IS NULL "
@@ -127,8 +155,13 @@ class Gateway:
         environment: str = "sandbox",
         minimum_net_proceeds_cents: int = DEFAULT_MINIMUM_NET_PROCEEDS_CENTS,
         fees: FeeModel | None = None,
+        # Provenance for model-produced evidence. Overridable per call, because a
+        # cross-provider comparison needs each observation attributable to the
+        # provider and model that actually made it.
+        model_source: str = "model",
     ):
         self.conn = conn
+        self.model_source = model_source
         self.marketplace = marketplace
         self.environment = environment
         self.minimum_net_proceeds_cents = minimum_net_proceeds_cents
@@ -278,12 +311,19 @@ class Gateway:
         acquisition_intent: str = "unknown",
         acquired_on: str | None = None,
         notes: str | None = None,
+        identification_effort: str = str(IdentificationEffort.STANDARD),
     ) -> Accepted:
         """Allocate a SKU and create the item. The only command without one."""
         if acquisition_intent not in ("resale", "declutter", "unknown"):
             raise Rejected("IngestItem", [f"unknown acquisition_intent {acquisition_intent!r}"])
         if purchase_cost_cents is not None and purchase_cost_cents < 0:
             raise Rejected("IngestItem", ["purchase cost cannot be negative"])
+        try:
+            IdentificationEffort(identification_effort)
+        except ValueError as exc:
+            raise Rejected(
+                "IngestItem", [f"unknown identification_effort {identification_effort!r}"]
+            ) from exc
 
         with transaction(self.conn):
             cursor = self.conn.execute(
@@ -295,10 +335,12 @@ class Gateway:
             self.conn.execute(
                 "INSERT INTO item (sku, seq, state, purchase_cost_cents, "
                 "acquisition_intent, acquired_on, notes, created_at, updated_at, "
-                "state_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "state_changed_at, identification_effort) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sku, seq, str(ItemState.INTAKE), purchase_cost_cents,
                     acquisition_intent, acquired_on, notes, stamp, stamp, stamp,
+                    identification_effort,
                 ),
             )
             log_event(
@@ -425,6 +467,229 @@ class Gateway:
             f"removed {identifier}; {len(remaining)} photo(s) remain",
         )
 
+    def record_observation(
+        self, sku: str, observation, *, source: str | None = None,
+        model_call_id: int | None = None,
+    ) -> Accepted:
+        """Record one model observation as evidence.
+
+        The observation validates itself first: a text_read without a photo
+        citation, or a measurement without a method, is refused. Those are the
+        properties that let an operator check the claim later, so an observation
+        lacking them is not evidence, it is an assertion.
+        """
+        problems = observation.problems()
+        if problems:
+            raise Rejected("RecordObservation", problems)
+        get_item(self.conn, sku)
+
+        cursor = self.conn.execute(
+            "INSERT INTO evidence (sku, kind, source, payload, confidence, "
+            "send_to_model, recorded_at, basis, subject, model_call_id) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+            (
+                sku,
+                "vision_observation",
+                source or self.model_source,
+                json.dumps(
+                    {
+                        "claim": observation.claim,
+                        "photo_positions": list(observation.photo_positions),
+                        "surface": observation.surface,
+                        "measurement_method": (
+                            str(observation.measurement_method)
+                            if observation.measurement_method else None
+                        ),
+                    }
+                ),
+                observation.confidence,
+                now_iso(),
+                str(observation.basis),
+                str(observation.subject),
+                model_call_id,
+            ),
+        )
+        return Accepted(
+            "RecordObservation", sku, None, None,
+            f"{observation.basis}: {observation.claim[:70]}",
+            {"evidence_id": cursor.lastrowid},
+        )
+
+    def record_identifier(
+        self, sku: str, identifier, *, source: str | None = None,
+        model_call_id: int | None = None, basis: str | None = None,
+    ) -> Accepted:
+        """Record a product identifier read off the object.
+
+        A failed check digit refuses the record rather than storing it. The attempt
+        is logged to events so the audit trail keeps what was read, but evidence
+        stays clean -- a transcription that is arithmetically impossible should not
+        be citable, and a suggested correction is more useful than a stored wrong
+        number.
+        """
+        get_item(self.conn, sku)
+        if not identifier.usable:
+            log_event(
+                self.conn,
+                "identifier.rejected",
+                {
+                    "scheme": str(identifier.scheme),
+                    "raw": identifier.raw_transcription,
+                    "why": identifier.check_explanation,
+                },
+                item_id=sku,
+            )
+            raise Rejected("RecordIdentifier", [identifier.check_explanation])
+
+        cursor = self.conn.execute(
+            "INSERT INTO evidence (sku, kind, source, payload, send_to_model, "
+            "recorded_at, basis, subject, model_call_id) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
+            (
+                sku,
+                "identifier_observation",
+                source or self.model_source,
+                json.dumps(
+                    {
+                        "scheme": str(identifier.scheme),
+                        "raw_transcription": identifier.raw_transcription,
+                        "normalized": identifier.normalized,
+                        "photo_position": identifier.photo_position,
+                        "surface": identifier.surface,
+                        "check_digit_valid": identifier.check_digit_valid,
+                        "check_explanation": identifier.check_explanation,
+                    }
+                ),
+                now_iso(),
+                basis or str(Basis.TEXT_READ),
+                str(Subject.THIS_ITEM),
+                model_call_id,
+            ),
+        )
+        return Accepted(
+            "RecordIdentifier", sku, None, None,
+            f"{identifier.scheme}={identifier.normalized} ({identifier.check_explanation})",
+            {"evidence_id": cursor.lastrowid},
+        )
+
+    def request_effort_escalation(
+        self, sku: str, *, to_effort: str, rationale: str, evidence_ids: tuple[int, ...]
+    ) -> Accepted:
+        """The model asks for more identification budget. It cannot grant its own.
+
+        A one-step rise from minimal is auto-granted when cited, because routing
+        that through a human would waste the human. Anything reaching `thorough`
+        costs the operator time and photographs, so it waits for them.
+        """
+        item = get_item(self.conn, sku)
+        current = IdentificationEffort(item["identification_effort"])
+        try:
+            requested = IdentificationEffort(to_effort)
+        except ValueError as exc:
+            raise Rejected("RequestEffortEscalation", [f"unknown effort {to_effort!r}"]) from exc
+        if not rationale.strip():
+            raise Rejected("RequestEffortEscalation", ["a rationale is required"])
+
+        for evidence_id in evidence_ids:
+            row = self.conn.execute(
+                "SELECT 1 FROM evidence WHERE id = ? AND sku = ?", (evidence_id, sku)
+            ).fetchone()
+            if row is None:
+                raise Rejected(
+                    "RequestEffortEscalation",
+                    [f"cited evidence {evidence_id} does not belong to {sku}"],
+                )
+
+        decision, why = escalation_policy(current, requested, cited_evidence=tuple(evidence_ids))
+        if decision is EscalationDecision.REFUSE:
+            raise Rejected("RequestEffortEscalation", [why])
+
+        cursor = self.conn.execute(
+            "INSERT INTO effort_escalation (sku, scope, from_effort, to_effort, "
+            "rationale, evidence_ids, requested_at) VALUES (?, 'identity', ?, ?, ?, ?, ?)",
+            (sku, str(current), str(requested), rationale,
+             json.dumps(sorted(evidence_ids)), now_iso()),
+        )
+        request_id = cursor.lastrowid
+
+        if decision is EscalationDecision.AUTO_GRANT:
+            self._apply_escalation(sku, request_id, requested, decided_by="policy")
+            return Accepted(
+                "RequestEffortEscalation", sku, None, None,
+                f"granted by policy: {current} -> {requested}. {why}",
+                {"request_id": request_id, "granted": True},
+            )
+
+        log_event(
+            self.conn,
+            "effort.escalation_requested",
+            {"request_id": request_id, "from": str(current), "to": str(requested),
+             "rationale": rationale[:200]},
+            item_id=sku,
+        )
+        return Accepted(
+            "RequestEffortEscalation", sku, None, None,
+            f"awaiting operator: {current} -> {requested}. {why}",
+            {"request_id": request_id, "granted": False},
+        )
+
+    def decide_effort_escalation(
+        self, request_id: int, *, granted: bool, operator: bool = False
+    ) -> Accepted:
+        """Operator-only. The budget holder decides."""
+        if not operator:
+            raise Rejected(
+                "DecideEffortEscalation",
+                ["only the operator may grant additional identification budget"],
+            )
+        row = self.conn.execute(
+            "SELECT * FROM effort_escalation WHERE id = ?", (request_id,)
+        ).fetchone()
+        if row is None:
+            raise Rejected("DecideEffortEscalation", [f"no request {request_id}"])
+        if row["decision"]:
+            raise Rejected(
+                "DecideEffortEscalation",
+                [f"request {request_id} was already {row['decision']}"],
+            )
+
+        if not granted:
+            self.conn.execute(
+                "UPDATE effort_escalation SET decision = 'denied', decided_by = 'operator', "
+                "decided_at = ? WHERE id = ?",
+                (now_iso(), request_id),
+            )
+            return Accepted(
+                "DecideEffortEscalation", row["sku"], None, None,
+                f"denied; effort stays at {row['from_effort']}",
+            )
+
+        self._apply_escalation(
+            row["sku"], request_id, IdentificationEffort(row["to_effort"]), decided_by="operator"
+        )
+        return Accepted(
+            "DecideEffortEscalation", row["sku"], None, None,
+            f"granted; effort is now {row['to_effort']}",
+        )
+
+    def _apply_escalation(
+        self, sku: str, request_id: int, to_effort, *, decided_by: str
+    ) -> None:
+        self.conn.execute(
+            "UPDATE effort_escalation SET decision = 'granted', decided_by = ?, "
+            "decided_at = ? WHERE id = ?",
+            (decided_by, now_iso(), request_id),
+        )
+        self.conn.execute(
+            "UPDATE item SET identification_effort = ?, updated_at = ? WHERE sku = ?",
+            (str(to_effort), now_iso(), sku),
+        )
+        log_event(
+            self.conn,
+            "effort.escalated",
+            {"request_id": request_id, "to": str(to_effort), "decided_by": decided_by},
+            item_id=sku,
+        )
+
     def record_evidence(
         self,
         sku: str,
@@ -434,18 +699,29 @@ class Gateway:
         payload: dict,
         confidence: float | None = None,
         send_to_model: bool = True,
+        basis: str | None = None,
+        subject: str = str(Subject.THIS_ITEM),
     ) -> Accepted:
-        """Append-only. Provenance is mandatory; the database enforces immutability."""
+        """Append-only. Provenance is mandatory; the database enforces immutability.
+
+        `basis` matters more than it looks: resolution treats an operator statement
+        as adjudicating a contradiction, and it reads the basis back from storage
+        rather than trusting whatever a model asserted. Evidence written without one
+        falls back to `inference` and silently loses that authority.
+        """
         get_item(self.conn, sku)
         if not source:
             raise Rejected("RecordEvidence", ["source (provenance) is required"])
-        self.conn.execute(
+        cursor = self.conn.execute(
             "INSERT INTO evidence (sku, kind, source, payload, confidence, "
-            "send_to_model, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "send_to_model, recorded_at, basis, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (sku, kind, source, json.dumps(payload), confidence,
-             1 if send_to_model else 0, now_iso()),
+             1 if send_to_model else 0, now_iso(), basis, subject),
         )
-        return Accepted("RecordEvidence", sku, None, None, f"{kind} from {source}")
+        return Accepted(
+            "RecordEvidence", sku, None, None, f"{kind} from {source}",
+            {"evidence_id": cursor.lastrowid},
+        )
 
     def begin_identification(self, sku: str) -> Accepted:
         """intake -> identifying. Requires at least one locally valid photo."""
@@ -503,6 +779,40 @@ class Gateway:
             )
         self._void_approvals(sku, "identification revised")
         return Accepted("ProposeIdentification", sku, None, None, f"version {version}")
+
+    def record_aspect_candidates(self, sku: str, identification_id: int, outcomes) -> int:
+        """Store candidate sets with their citations.
+
+        The foreign key to evidence is the point: a citation to a record that does
+        not exist fails in the database rather than in application code, so "this
+        value is supported" is checkable rather than asserted.
+        """
+        get_item(self.conn, sku)
+        stored = 0
+        with transaction(self.conn):
+            for outcome in outcomes:
+                for candidate in outcome.candidates:
+                    if not candidate.support:
+                        continue
+                    cursor = self.conn.execute(
+                        "INSERT OR IGNORE INTO aspect_candidate "
+                        "(identification_id, aspect_name, value, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (identification_id, outcome.aspect_name, candidate.value, now_iso()),
+                    )
+                    candidate_id = cursor.lastrowid or self.conn.execute(
+                        "SELECT id FROM aspect_candidate WHERE identification_id = ? "
+                        "AND aspect_name = ? AND value = ?",
+                        (identification_id, outcome.aspect_name, candidate.value),
+                    ).fetchone()[0]
+                    for ref in candidate.support:
+                        self.conn.execute(
+                            "INSERT OR IGNORE INTO aspect_candidate_evidence "
+                            "(candidate_id, evidence_id) VALUES (?, ?)",
+                            (candidate_id, ref.evidence_id),
+                        )
+                    stored += 1
+        return stored
 
     def ask_operator(self, sku: str, *, question: str, why_it_matters: str = "", blocking: bool = True) -> Accepted:
         """The operator-as-tool call. A blocking question moves the item to needs_info."""
@@ -652,10 +962,13 @@ class Gateway:
             "UPDATE open_question SET answer = ?, answered_at = ? WHERE id = ?",
             (answer, now_iso(), question_id),
         )
+        # basis='operator' is what lets this answer adjudicate a contradiction later.
         self.conn.execute(
-            "INSERT INTO evidence (sku, kind, source, payload, send_to_model, recorded_at) "
-            "VALUES (?, 'operator_answer', 'operator', ?, 1, ?)",
-            (sku, json.dumps({"question": row["question"], "answer": answer}), now_iso()),
+            "INSERT INTO evidence (sku, kind, source, payload, send_to_model, "
+            "recorded_at, basis, subject) "
+            "VALUES (?, 'operator_answer', 'operator', ?, 1, ?, ?, ?)",
+            (sku, json.dumps({"question": row["question"], "answer": answer}), now_iso(),
+             str(Basis.OPERATOR), str(Subject.THIS_ITEM)),
         )
 
         state = current_state(self.conn, sku)

@@ -160,3 +160,71 @@ def ensure_uploadable(
         f"{last_size / 1024 / 1024:.1f} MB, over eBay's 12 MB limit. "
         "The source may need downscaling."
     )
+
+
+# --- derivatives for model input ---------------------------------------------
+
+# The Anthropic API accepts jpeg, png, gif and webp -- not HEIC -- so a phone photo
+# needs converting for the model exactly as it does for eBay. It is also billed by
+# image area, and resolution beyond roughly 1568px on the long edge buys nothing,
+# so the model derivative is downscaled as well as converted. That is the only
+# difference from the upload derivative, and the reason it is cached separately.
+MODEL_MAX_EDGE = 1568
+MODEL_JPEG_QUALITY = 85
+
+
+def _downscale_with_sips(source: Path, destination: Path) -> None:
+    result = subprocess.run(
+        [
+            "sips",
+            "-Z", str(MODEL_MAX_EDGE),
+            "-s", "format", "jpeg",
+            "-s", "formatOptions", str(MODEL_JPEG_QUALITY),
+            str(source),
+            "--out", str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0 or not destination.exists():
+        raise ConversionError(
+            f"sips failed preparing {source.name} for the model "
+            f"(exit {result.returncode}): {(result.stderr or result.stdout or '').strip()[:300]}"
+        )
+
+
+def _downscale_with_pillow(source: Path, destination: Path) -> None:
+    try:
+        from PIL import Image  # noqa: PLC0415
+    except ImportError as exc:
+        raise ConversionError(
+            f"Cannot prepare {source.name} for the model: neither `sips` (macOS) nor "
+            "Pillow is available."
+        ) from exc
+
+    with Image.open(source) as image:
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        image.thumbnail((MODEL_MAX_EDGE, MODEL_MAX_EDGE))
+        image.save(destination, format="JPEG", quality=MODEL_JPEG_QUALITY, optimize=True)
+
+
+def for_model(source: str | Path, cache_dir: str | Path, *, digest: str | None = None) -> Path:
+    """A JPEG suitable for sending to a vision model, cached by source content."""
+    source = Path(source)
+    if not source.exists():
+        raise ConversionError(f"{source} does not exist")
+
+    digest = digest or source_digest(source)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    destination = cache_dir / f"{digest[:16]}-model.jpg"
+    if destination.exists() and destination.stat().st_size > 0:
+        return destination
+
+    if shutil.which("sips"):
+        _downscale_with_sips(source, destination)
+    else:
+        _downscale_with_pillow(source, destination)
+    return destination

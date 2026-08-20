@@ -472,7 +472,53 @@ necessary but not sufficient. It must select from that list *by reference to
 observations about the item*, and the evidence trail is what makes a wrong choice
 auditable afterwards.
 
+## Reasoning plane
+
+```bash
+uv run resell item observe MP-000002 --note "from a house clearance"
+uv run resell item evidence MP-000002
+```
+
+The model reasons freely; its output is a structured proposal that faces the same
+validation operator input would. **A tool call is not a database write.**
+`vision.observe` returns typed proposals and persists nothing; the CLI offers each
+to the gateway, which accepts or refuses it individually.
+
+### Provider neutrality
+
+Everything vendor-specific lives behind `reasoning/adapters/` — image encoding,
+request assembly, tool-call extraction, token accounting, error mapping. Stages,
+proposals, evidence, the gateway and the database name no provider.
+
+| Layer | Knows about vendors |
+|---|---|
+| `reasoning/stages.py` | no — prompt, images, tool schema, usage |
+| `reasoning/tools.py` | no — JSON Schema and typed proposals |
+| `reasoning/vision.py` | no — orchestration only |
+| `reasoning/adapters/anthropic.py` | yes, and only here |
+
+Differences that will bite the next adapter, documented where they belong: tool
+arguments arrive as a dict from Anthropic but as a JSON *string* from OpenAI and
+nested under `functionCall.args` from Gemini; images are base64-plus-media-type
+here, a data URL there, `inlineData` elsewhere; token fields are
+`input_tokens`/`output_tokens` versus `prompt_tokens`/`completion_tokens` versus
+`promptTokenCount`. `Usage` normalises the pair and keeps the raw fields.
+
+Every trace records `provider`, `model`, tokens, latency, and a **neutral replay
+key** — prompt and schema digests plus image content hashes, not wire format — so
+the same input can be run against another provider and the outputs *compared*
+rather than reconstructed. Evidence records the producing `provider/model` as its
+source, so accuracy can be grouped per provider. `cost_micros` stays null: prices
+change and differ by provider, and a wrong number in a cost column is worse than
+an absent one.
+
+### The observation stage does not see the aspect form
+
+A model told a `Size` aspect is required is under pressure to produce one whether
+or not it can see a size. Observation describes; a later stage maps observations
+onto eBay's form. Targeted follow-up passes handle the case where gap analysis
+finds something specific worth a closer look. There is a test pinning the absence.
+
 ## Next
 
-The reasoning plane: vision identification, comps research, and the
-operator-as-tool loop.
+Aspect mapping with citations, then comps and pricing.

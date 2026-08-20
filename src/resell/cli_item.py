@@ -136,6 +136,12 @@ def cmd_item_start(args: argparse.Namespace) -> int:
         return _rejected(exc)
 
 
+def _wrap(text: str, width: int) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(text, width) or [""]
+
+
 def merged_identification(conn, sku: str, **overrides) -> tuple[dict, list[str]]:
     """Carry forward the current identification, applying only what was supplied.
 
@@ -161,9 +167,20 @@ def merged_identification(conn, sku: str, **overrides) -> tuple[dict, list[str]]
             if fields[field] is None and previous[field]:
                 fields[field] = previous[field]
                 carried.append(field)
-        if fields["aspects"] is None and previous["aspects"]:
-            fields["aspects"] = json.loads(previous["aspects"])
-            carried.append("aspects")
+        if previous["aspects"]:
+            # Merge per aspect, not per field. Carrying the dict forward only when
+            # no aspects were supplied meant `--aspect "Material=Wool"` replaced all
+            # eighteen resolved aspects with one -- the same all-or-nothing mistake
+            # as the earlier field-level bug, one level further in.
+            existing = json.loads(previous["aspects"])
+            supplied_aspects = fields["aspects"] or {}
+            merged = {**existing, **supplied_aspects}
+            kept = sorted(set(existing) - set(supplied_aspects))
+            fields["aspects"] = merged
+            if kept:
+                carried.append(f"{len(kept)} aspect(s)")
+            elif not supplied_aspects:
+                carried.append("aspects")
     return fields, carried
 
 
@@ -619,6 +636,325 @@ def cmd_item_evidence(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_item_draft(args: argparse.Namespace) -> int:
+    """Write the listing copy, then check it against the record."""
+    config, conn, gateway = _open(require_credentials=True)
+    from resell.ebay.client import EbayApiError, EbayClient
+    from resell.ebay.publisher import Publisher
+    from resell.reasoning.budget import BudgetExceeded, StageBudget
+    from resell.reasoning.drafting import DraftingError, draft_listing, store_draft
+    from resell.reasoning.vision import spend_so_far
+
+    identification = current_identification(conn, args.sku)
+    if identification is None:
+        print(f"{args.sku} has no identification yet", file=sys.stderr)
+        return 2
+    aspects = json.loads(identification["aspects"]) if identification["aspects"] else {}
+
+    unresolved: tuple[str, ...] = ()
+    category_id = args.category or identification["category_id"]
+    if category_id:
+        with EbayClient(config, conn) as client:
+            try:
+                specs = Publisher(gateway, client, conn).aspect_schema(
+                    config.marketplace_id, category_id
+                )
+                unresolved = tuple(
+                    spec.name for spec in specs if spec.required and not aspects.get(spec.name)
+                )
+            except EbayApiError as exc:
+                print(f"  (aspect form unavailable: HTTP {exc.status_code})")
+
+    if not args.ignore_questions and blocking_question_gate(conn, args.sku, "drafting"):
+        return 1
+
+    budget = StageBudget.from_env("draft")
+    spent = spend_so_far(conn, args.sku, "draft")
+    print(f"\n{args.sku}: drafting from {len(aspects)} resolved aspect(s)")
+    if unresolved:
+        print(f"  withheld as unresolved: {', '.join(unresolved)}")
+    print(f"  budget: {spent.calls}/{budget.max_calls} calls")
+
+    try:
+        outcome = draft_listing(
+            conn, args.sku, aspects=aspects,
+            condition_id=identification["condition_id"], unresolved=unresolved,
+            provider=args.provider, model=args.model, budget=budget, spent=spent,
+        )
+    except BudgetExceeded as exc:
+        print(f"\nREFUSED before calling the model: {exc}", file=sys.stderr)
+        return 1
+    except DraftingError as exc:
+        print(f"\ndrafting failed: {exc}", file=sys.stderr)
+        return 1
+
+    usage = outcome.result.usage
+    print(f"  {outcome.result.provider}/{outcome.result.model}  in={usage.input_tokens} "
+          f"out={usage.output_tokens} tok  {outcome.result.latency_ms}ms  "
+          f"trace={outcome.call_id}")
+
+    draft = outcome.draft
+    print(f"\n{'─' * 76}")
+    print(f"{draft.title}")
+    print(f"{'─' * 76}")
+    for line in draft.description.splitlines():
+        print(line)
+    print(f"{'─' * 76}")
+    print(f"  title: {len(draft.title)}/80 characters")
+
+    if not args.no_citations:
+        print("\n  claims and their support (not shown to buyers):")
+        for claim in draft.claims:
+            print(f"    {str(list(claim.evidence_ids)):<16} {claim.text[:70]}")
+        if draft.marketing_copy:
+            print("\n  marketing copy (no citations by design):")
+            for line in _wrap(draft.marketing_copy, 88):
+                print(f"    {line}")
+
+    review = outcome.review
+    for note in draft.malformed:
+        print(f"\n  MALFORMED {note[:100]}")
+    for problem in review.problems:
+        print(f"\n  PROBLEM  {problem[:110]}")
+    for warning in review.warnings:
+        print(f"  note     {warning[:110]}")
+
+    if not review.ok:
+        print(f"\n  Draft generated but NOT SAVED: {len(review.problems)} validation "
+              f"problem(s) above.")
+        print(f"  The call is still recorded and counted (trace {outcome.call_id}).")
+        print("  Fix the underlying evidence, or re-run to draft again.")
+        return 1
+    if args.apply:
+        version = store_draft(conn, gateway, args.sku, outcome)
+        print(f"\n  stored as identification v{version}")
+    else:
+        print("\n  Nothing stored. Re-run with --apply to keep this draft.")
+    return 0
+
+
+def cmd_item_declare_mode(args: argparse.Namespace) -> int:
+    """Declare the identification mode yourself, through the same evidence gate.
+
+    The bypass is of the model call, not of the rules. Where you have knowledge the
+    model lacks, the way to use it is to record it as evidence -- read the tag, or
+    do the lookup and enter it through the research adapter -- not to assert a
+    conclusion the record does not support.
+    """
+    _, conn, gateway = _open()
+    from resell.reasoning.gaps import supported_modes
+    from resell.reasoning.research_loop import (
+        declare_mode, identity_resolution, mode_evidence,
+    )
+
+    if not current_identification(conn, args.sku):
+        print(f"{args.sku} has no identification yet", file=sys.stderr)
+        return 2
+
+    evidence = mode_evidence(conn, args.sku)
+    available = supported_modes(**evidence)
+    resolution = identity_resolution(conn, args.sku)
+
+    if not args.mode:
+        print(f"\n{args.sku}: identity_resolution = {resolution}")
+        print(f"  supported modes: "
+              f"{', '.join(str(m) for m in available) or 'none beyond unresolved'}")
+        print(f"  evidence: brand={len(evidence['brand_support'])} citation(s), "
+              f"line/code={len(evidence['line_support'])}, "
+              f"qualifying match={evidence['qualifying_match']}, "
+              f"negative finding={'yes' if evidence['negative_finding'] else 'no'}")
+        return 0
+
+    decision = declare_mode(
+        conn, gateway, args.sku, args.mode,
+        args.rationale or "declared by the operator",
+    )
+    if decision.supported:
+        print(f"ok  mode = {decision.accepted}   identity_resolution = {resolution}")
+        print(f"    {decision.reason}")
+        return 0
+
+    print(f"REFUSED  {decision.proposed} is not supported by the evidence",
+          file=sys.stderr)
+    for line in _wrap(decision.reason, 92):
+        print(f"    {line}", file=sys.stderr)
+    return 1
+
+
+def cmd_item_research(args: argparse.Namespace) -> int:
+    """Run one identification research round: plan, retrieve, judge, select.
+
+    Planning happens before anything is fetched, and `--dry-run` stops there. What a
+    lookup returns is recorded as candidate-product evidence; whether any of it may
+    describe this item is decided afterwards by the donation gate, not here.
+    """
+    config, conn, gateway = _open(require_credentials=True)
+    from resell.ebay.client import EbayApiError, EbayClient
+    from resell.ebay.publisher import Publisher
+    from resell.reasoning.adapters.research import get_research_adapter
+    from resell.reasoning.budget import (
+        BudgetExceeded, LookupBudget, LookupRates, StageBudget,
+    )
+    from resell.reasoning.research_loop import ResearchLoopError, rejudge, run_round
+    from resell.reasoning.vision import spend_so_far
+
+    identification = current_identification(conn, args.sku)
+    unresolved = ""
+    category_id = args.category or (identification["category_id"] if identification else None)
+    if category_id:
+        with EbayClient(config, conn) as client:
+            try:
+                specs = Publisher(gateway, client, conn).aspect_schema(
+                    config.marketplace_id, category_id
+                )
+                have = json.loads(identification["aspects"]) if (
+                    identification and identification["aspects"]
+                ) else {}
+                missing = [s.name for s in specs if s.required and not have.get(s.name)]
+                unresolved = ", ".join(missing)
+            except EbayApiError as exc:
+                print(f"  (could not read the aspect form: HTTP {exc.status_code})")
+
+    stage_budget = StageBudget.from_env("research")
+    lookup_budget = LookupBudget.from_env("identity")
+    adapter = get_research_adapter(args.research_provider)
+    rates = LookupRates.from_env(adapter.provider)
+    performed = conn.execute(
+        "SELECT COUNT(*) FROM research_lookup WHERE sku = ? AND scope = 'identity'",
+        (args.sku,),
+    ).fetchone()[0]
+
+    print(f"\n{args.sku}: identification research"
+          f"{'  [DRY RUN]' if args.dry_run else ''}")
+    print(f"  mode: {identification['mode'] if identification else 'unresolved'}   "
+          f"effort: {conn.execute('SELECT identification_effort FROM item WHERE sku = ?', (args.sku,)).fetchone()[0]}")
+    if unresolved:
+        print(f"  unresolved required aspects: {unresolved}")
+    plan_spend = spend_so_far(conn, args.sku, "research_plan")
+    print(f"  budgets: {plan_spend.calls}/{stage_budget.max_calls} planning calls, "
+          f"{performed}/{lookup_budget.max_lookups} lookups via {adapter.provider}")
+    if adapter.provider == "manual":
+        print("  retrieval is operator-mediated: anything you paste is recorded as your "
+              "account of a page,\n  not as something the system fetched or verified.")
+
+    try:
+        if args.rejudge:
+            outcome = rejudge(
+                conn, gateway, args.sku, provider=args.provider,
+                stage_budget=stage_budget,
+            )
+        else:
+            outcome = run_round(
+            conn, gateway, args.sku, unresolved=unresolved,
+            provider=args.provider, research_adapter=adapter,
+            stage_budget=stage_budget, lookup_budget=lookup_budget,
+            lookup_rates=rates, dry_run=args.dry_run,
+            )
+    except BudgetExceeded as exc:
+        print(f"\nREFUSED before calling the model: {exc}", file=sys.stderr)
+        return 1
+    except ResearchLoopError as exc:
+        print(f"\nresearch failed: {exc}", file=sys.stderr)
+        return 1
+
+    if outcome.stopped and not outcome.plan:
+        print(f"\n  STOPPED [{outcome.stopped}] {outcome.stop_reason}")
+        _print_mode(outcome)
+        return 0
+
+    plan = outcome.plan
+    if plan:
+        print(f"\n  plan: proposed mode {plan.proposed_mode}, "
+              f"{len(plan.lookups)} lookup(s)")
+        for line in _wrap(plan.rationale, 92):
+            print(f"    {line}")
+        for lookup in plan.lookups:
+            print(f"    [{lookup.source_kind}] {lookup.query}")
+            print(f"        cites {list(lookup.evidence_ids)} — {lookup.motivation[:72]}")
+
+    for note in outcome.notes:
+        print(f"  NOTE {note[:110]}")
+
+    if outcome.deferred:
+        print(f"\n  DEFERRED {len(outcome.deferred)} lookup(s): {outcome.deferral_reason[:70]}")
+        for query in outcome.deferred:
+            print(f"    {query}")
+        print("    (recorded in the event log; re-plannable when budget allows)")
+
+    if outcome.stopped:
+        print(f"\n  STOPPED [{outcome.stopped}] {outcome.stop_reason[:150]}")
+        _print_mode(outcome)
+        return 0
+
+    if args.dry_run:
+        print(f"\n  WOULD perform {len(outcome.performed)} lookup(s). Nothing was "
+              f"fetched and nothing was recorded.")
+        return 0
+
+    print(f"\n  performed {len(outcome.performed)} lookup(s), "
+          f"{outcome.candidates_found} candidate document(s)")
+
+    # Show what was captured before showing what was made of it, so a retrieval
+    # problem is not mistaken for a judging problem.
+    for row in conn.execute(
+        "SELECT candidate_ref, source_url, source_authority, retrieval_method, "
+        "COUNT(*) n, SUM(fact_domain = 'identity') identity_facts "
+        "FROM evidence WHERE sku = ? AND subject = 'candidate_product' "
+        "GROUP BY candidate_ref", (args.sku,),
+    ):
+        via = " · operator-transcribed" if row["retrieval_method"] == "operator_transcribed" else ""
+        print(f"    {row['candidate_ref']}  [{row['source_authority']}{via}]  "
+              f"{row['identity_facts']} identity + {row['n'] - row['identity_facts']} retail")
+        print(f"      {row['source_url'][:88]}")
+
+    selection = outcome.selection
+    if selection is None:
+        return 0
+    print(f"\n  judged {selection.considered} candidate(s), {selection.ruled_out} ruled out")
+    for line in _wrap(selection.reason, 92):
+        print(f"    {line}")
+
+    for row in conn.execute(
+        "SELECT candidate_ref, is_match, strength, source_authority, donation_scope, "
+        "rationale FROM product_match WHERE sku = ? ORDER BY id DESC LIMIT 10",
+        (args.sku,),
+    ):
+        verdict = "MATCH  " if row["is_match"] else "no     "
+        print(f"    {verdict} {row['candidate_ref']:<16} {row['strength']:<22} "
+              f"{row['source_authority']:<14} donates: {row['donation_scope']}")
+        for line in _wrap(row["rationale"], 88):
+            print(f"             {line}")
+
+    citable = gateway.conn and __import__(
+        "resell.gateway", fromlist=["citable_candidate_evidence"]
+    ).citable_candidate_evidence(conn, args.sku)
+    if citable:
+        print(f"\n  {len(citable)} external fact(s) are now citable by an aspect. "
+              f"Re-run map-aspects to use them:")
+        print(f"    resell item map-aspects {args.sku}")
+    else:
+        print("\n  No external fact is citable by an aspect. Identification is "
+              "unchanged by this round.")
+        if outcome.candidates_found and outcome.selection and not outcome.selection.selected:
+            print("  The retrieved documents are kept. To judge them again without "
+                  f"spending a lookup:\n    resell item research {args.sku} --rejudge")
+    _print_mode(outcome)
+    return 0
+
+
+def _print_mode(outcome) -> None:
+    decision = getattr(outcome, "mode", None)
+    if decision is None:
+        return
+    if decision.supported:
+        print(f"\n  mode: {decision.accepted}  ({decision.reason[:80]})")
+        return
+    print(f"\n  mode: {decision.accepted} — {decision.proposed} was proposed but is "
+          f"not supported")
+    for line in _wrap(decision.reason, 92):
+        print(f"    {line}")
+
+
 def cmd_item_map_aspects(args: argparse.Namespace) -> int:
     """Map recorded observations onto the category's aspect form, with citations."""
     config, conn, gateway = _open(require_credentials=True)
@@ -696,11 +1032,28 @@ def cmd_item_map_aspects(args: argparse.Namespace) -> int:
         print(f"  {marks[item.resolution]} [{flag}] {item.aspect_name:<26} "
               f"{shown:<28} {item.resolution}")
         for candidate in item.candidates:
-            if candidate.support:
-                print(f"           cites {sorted(candidate.evidence_ids)} for "
-                      f"{candidate.value!r}")
+            if not candidate.support:
+                continue
+            donated = outcome.proposal.donated_by_value.get(
+                (item.aspect_name, candidate.value), ()
+            )
+            mark = f"  [EXTERNAL evidence {list(donated)}]" if donated else ""
+            print(f"           cites {sorted(candidate.evidence_ids)} for "
+                  f"{candidate.value!r}{mark}")
         if item.resolution is not Resolution.RESOLVED:
-            print(f"           {item.explanation[:120]}")
+            reason = f"[{item.unsupported_reason}] " if item.unsupported_reason else ""
+            print(f"           {reason}{item.explanation[:110]}")
+
+    from resell.reasoning.gaps import category_fit_signals, category_review_advice
+
+    signals = category_fit_signals(category_id, outcome.outcomes, required)
+    print(f"\n  category {category_id}: {signals.summary()}")
+    advice = category_review_advice(signals)
+    if signals.has_untruthful_requirement or "narrower" in advice:
+        print(f"\n  CATEGORY REVIEW")
+        for line in _wrap(advice, 96):
+            print(f"    {line}")
+        print(f"    Alternatives: resell item suggest-category {args.sku}")
 
     blocking = [gap for gap in outcome.gaps if gap.blocking]
     if blocking:
@@ -739,8 +1092,16 @@ def _apply_mapping(conn, gateway, sku: str, outcome, required: set[str],
 
     identification = current_identification(conn, sku)
     stored = gateway.record_aspect_candidates(sku, identification["id"], outcome.outcomes)
+    donated_values = {
+        name for (name, _), ids in outcome.proposal.donated_by_value.items() if ids
+    }
     print(f"\n  identification v{identification['version']} for category {category_id} "
           f"with {len(resolved)} resolved aspect(s); {stored} candidate(s) cited")
+    if donated_values:
+        print(f"    {len(donated_values)} value(s) rest partly on external evidence: "
+              f"{', '.join(sorted(donated_values))}")
+        print("    Check these against the item before approving; they describe a "
+              "matched product, not the object.")
     if carried:
         print(f"    carried forward from the previous version: {', '.join(carried)}")
 
@@ -752,6 +1113,7 @@ def _apply_mapping(conn, gateway, sku: str, outcome, required: set[str],
             gateway.ask_operator(
                 sku, question=gap.question,
                 why_it_matters=f"required aspect {gap.aspect_name} is {gap.resolution}",
+                aspect_name=gap.aspect_name,
             )
             opened += 1
         except Rejected as exc:
@@ -792,10 +1154,17 @@ def cmd_item_aspects(args: argparse.Namespace) -> int:
     if identification and identification["aspects"]:
         current = json.loads(identification["aspects"])
 
-    specs = [s for s in schema if s.required or args.all]
+    # Naming an aspect is a request for that aspect, whether or not it is required.
+    # Filtering to required-only first meant `--name "Material"` on an optional
+    # aspect reported "no matching aspects", which reads as "eBay has no such field".
     if args.name:
         wanted = {n.casefold() for n in args.name}
-        specs = [s for s in specs if s.name.casefold() in wanted]
+        specs = [s for s in schema if s.name.casefold() in wanted]
+        missing = wanted - {s.name.casefold() for s in schema}
+        if missing:
+            print(f"  not in this category's form: {', '.join(sorted(missing))}")
+    else:
+        specs = [s for s in schema if s.required or args.all]
     if not specs:
         print(f"category {category_id}: no matching aspects")
         return 0
@@ -971,6 +1340,192 @@ def cmd_item_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def blocking_question_gate(conn, sku: str, stage: str) -> list:
+    """Show blocking questions before a stage that depends on them.
+
+    The state machine already refuses `begin_pricing` while any are open, but the
+    reasoning stages sit outside it, so an operator could draft and price around
+    questions they never knew had been asked. Requiring them to think to query the
+    database is not a gate; it is a trap that happens to have an exit.
+
+    Where a question named an aspect that has since resolved, that is shown -- a
+    later mapping run can settle what an earlier one asked about, and being asked
+    again about something already decided teaches people to skip the prompt.
+    """
+    rows = conn.execute(
+        "SELECT id, question, why_it_matters, aspect_name FROM open_question "
+        "WHERE sku = ? AND answered_at IS NULL AND blocking = 1 ORDER BY id",
+        (sku,),
+    ).fetchall()
+    if not rows:
+        return []
+
+    identification = current_identification(conn, sku)
+    aspects = json.loads(identification["aspects"]) if (
+        identification and identification["aspects"]
+    ) else {}
+
+    print(f"\n  {len(rows)} blocking question(s) must be settled before {stage}:")
+    for row in rows:
+        print(f"\n    [{row['id']}] {row['question'][:96]}")
+        resolved = aspects.get(row["aspect_name"]) if row["aspect_name"] else None
+        if resolved:
+            print(f"         since resolved: {row['aspect_name']} = "
+                  f"{' + '.join(map(str, resolved))}")
+            print(f"         resell item answer {row['id']} \"confirmed: "
+                  f"{' + '.join(map(str, resolved))}\"")
+        else:
+            print(f"         resell item answer {row['id']} \"YOUR ANSWER\"")
+    print(f"\n  Or proceed anyway with --ignore-questions.")
+    return list(rows)
+
+
+# Transitions the workflow may make on its own: no arguments, no judgment, only
+# preconditions the gateway already checks. Everything else needs a decision or a
+# figure from the operator, and is named rather than performed.
+_AUTOMATIC_STEPS = {
+    "intake": ("begin_identification", "identifying"),
+    "needs_info": ("resume_identification", "identifying"),
+    "identifying": ("begin_pricing", "pricing"),
+    "publish_failed": ("begin_publishing", "publishing"),
+}
+
+_MANUAL_NEXT = {
+    "pricing": ("propose a price",
+                "resell item propose {sku} --price-cents N --seller-shipping-cents N"),
+    "proposed": ("approve the proposal",
+                 "resell item approve {sku} --hash <from item show>"),
+    "approved": ("publish", "resell item publish {sku} --dry-run"),
+    "publishing": ("resume the publish", "resell item publish {sku}"),
+    "listed": (None, None),
+    "abandoned": (None, None),
+}
+
+
+def cmd_item_advance(args: argparse.Namespace) -> int:
+    """Move the item through the lifecycle, as far as its preconditions allow.
+
+    The reasoning stages produce artifacts; this decides when the item moves. Keeping
+    that separate is the point: `observe`, `map-aspects`, `research` and `draft` can
+    all be re-run, in any order, without changing what the item *is* -- and a state
+    machine whose transitions happen as a side effect of other commands is one nobody
+    can reason about.
+
+    Only argument-free transitions are automatic. Pricing, approval and publishing
+    need a figure or a decision, so they are named and left to the operator.
+    """
+    _, conn, gateway = _open()
+    from resell.domain import ItemState
+
+    get_item(conn, args.sku)
+    steps: list[str] = []
+
+    for _ in range(len(_AUTOMATIC_STEPS) + 1):
+        state = str(current_state(conn, args.sku))
+        step = _AUTOMATIC_STEPS.get(state)
+        if step is None:
+            break
+
+        # The same gate as drafting: a question asked and never seen is not a gate.
+        if state in ("identifying", "needs_info") and not args.ignore_questions:
+            if blocking_question_gate(conn, args.sku, f"leaving {state}"):
+                if steps:
+                    print(f"  (advanced {' , '.join(steps)} before stopping)")
+                return 1
+
+        command, target = step
+        method = getattr(gateway, command, None)
+        if method is None:
+            method = getattr(gateway, "begin_identification")
+        try:
+            accepted = method(args.sku)
+        except Rejected as exc:
+            # Report what did happen before what did not. An advance that moved the
+            # item two states and then stopped used to print only the stop, leaving
+            # the operator unsure whether anything had changed.
+            if steps:
+                print(f"\n{args.sku}: {' , '.join(steps)}")
+            print(f"\n{args.sku}: stopped at {state}" if not steps
+                  else f"  stopped at {state}")
+            for reason in exc.reasons:
+                for line in _wrap(reason, 88):
+                    print(f"    {line}")
+            print(f"\n  Fix the above, then: resell item advance {args.sku}")
+            return 1
+        steps.append(f"{accepted.from_state} -> {accepted.to_state}")
+        if args.one:
+            break
+
+    state = str(current_state(conn, args.sku))
+    if steps:
+        print(f"\n{args.sku}: {' , '.join(steps)}")
+    else:
+        print(f"\n{args.sku}: already at {state}")
+
+    label, command = _MANUAL_NEXT.get(state, (None, None))
+    if label:
+        print(f"\n  next, and this one is yours: {label}")
+        print(f"    {command.format(sku=args.sku)}")
+    elif state == "listed":
+        listing = active_listing(conn, args.sku, "EBAY_US", "sandbox")
+        detail = f" as {listing['listing_id']}" if listing and listing["listing_id"] else ""
+        print(f"  listed{detail}; nothing further")
+    elif state == "abandoned":
+        print("  abandoned; nothing further")
+    return 0
+
+
+def cmd_item_questions(args: argparse.Namespace) -> int:
+    """The operator's queue: what the agent has asked and nobody has answered.
+
+    Both kinds are shown. Non-blocking questions were being recorded and displayed
+    nowhere, which meant the agent could ask something useful and have it silently
+    disappear -- the operator-as-tool loop has to have a visible inbox or the tool
+    never gets called.
+    """
+    _, conn, _ = _open()
+    clauses = ["q.answered_at IS NULL"]
+    params: list = []
+    if args.sku:
+        clauses.append("q.sku = ?")
+        params.append(args.sku)
+    if args.blocking:
+        clauses.append("q.blocking = 1")
+
+    rows = conn.execute(
+        f"""
+        SELECT q.id, q.sku, q.question, q.why_it_matters, q.blocking, q.asked_at,
+               i.state
+          FROM open_question q JOIN item i ON i.sku = q.sku
+         WHERE {' AND '.join(clauses)}
+         ORDER BY q.sku, q.blocking DESC, q.id
+        """,
+        params,
+    ).fetchall()
+
+    if not rows:
+        print("no open questions" + (f" for {args.sku}" if args.sku else ""))
+        return 0
+
+    current = None
+    for row in rows:
+        if row["sku"] != current:
+            current = row["sku"]
+            print(f"\n{row['sku']}  ({row['state']})")
+        mark = "BLOCKING" if row["blocking"] else "optional"
+        print(f"  [{row['id']:>3}] {mark}")
+        for line in _wrap(row["question"], 88):
+            print(f"        {line}")
+        if row["why_it_matters"]:
+            for line in _wrap(f"why: {row['why_it_matters']}", 88):
+                print(f"        {line}")
+        print(f'        resell item answer {row["id"]} "YOUR ANSWER"')
+
+    blocking = sum(1 for row in rows if row["blocking"])
+    print(f"\n{len(rows)} open ({blocking} blocking)")
+    return 0
+
+
 def cmd_item_show(args: argparse.Namespace) -> int:
     config, conn, gateway = _open()
     try:
@@ -1017,7 +1572,13 @@ def cmd_item_show(args: argparse.Namespace) -> int:
     if questions:
         print(f"\n  unresolved blocking questions: {len(questions)}")
         for question in questions:
-            print(f"    [{question['id']}] {question['question']}")
+            print(f"    [{question['id']}] {question['question'][:88]}")
+    optional = conn.execute(
+        "SELECT COUNT(*) FROM open_question WHERE sku = ? AND answered_at IS NULL "
+        "AND blocking = 0", (args.sku,),
+    ).fetchone()[0]
+    if optional:
+        print(f"  {optional} non-blocking question(s); see: resell item questions {args.sku}")
 
     listing = active_listing(conn, args.sku, config.marketplace_id, config.env.name)
     if listing:
@@ -1366,6 +1927,40 @@ def register(subparsers) -> None:
     evidence.add_argument("--full", action="store_true", help="do not truncate claims")
     evidence.set_defaults(func=cmd_item_evidence)
 
+    draft = sub.add_parser("draft", help="write the listing title and description")
+    draft.add_argument("sku")
+    draft.add_argument("--category", help="defaults to the identification's category")
+    draft.add_argument("--provider", default=None)
+    draft.add_argument("--model", default=None)
+    draft.add_argument("--apply", action="store_true", help="store the draft")
+    draft.add_argument("--no-citations", action="store_true",
+                       help="buyer-facing preview only")
+    draft.add_argument("--ignore-questions", action="store_true",
+                       help="proceed with blocking questions unanswered")
+    draft.set_defaults(func=cmd_item_draft)
+
+    declare = sub.add_parser(
+        "declare-mode", help="set the identification mode (same evidence gate)"
+    )
+    declare.add_argument("sku")
+    declare.add_argument("--mode", help="omit to see what the evidence supports")
+    declare.add_argument("--rationale")
+    declare.set_defaults(func=cmd_item_declare_mode)
+
+    research = sub.add_parser(
+        "research", help="one identification research round: plan, retrieve, judge"
+    )
+    research.add_argument("sku")
+    research.add_argument("--category", help="defaults to the identification's category")
+    research.add_argument("--provider", default=None, help="model provider")
+    research.add_argument("--research-provider", default=None,
+                          help="retrieval provider (default: manual)")
+    research.add_argument("--dry-run", action="store_true",
+                          help="plan only; fetch nothing")
+    research.add_argument("--rejudge", action="store_true",
+                          help="re-judge candidates already retrieved; no new lookups")
+    research.set_defaults(func=cmd_item_research)
+
     mapping = sub.add_parser(
         "map-aspects", help="map recorded observations onto the aspect form"
     )
@@ -1406,6 +2001,19 @@ def register(subparsers) -> None:
     listing.add_argument("--active", action="store_true",
                          help="exclude abandoned and listed items")
     listing.set_defaults(func=cmd_item_list)
+
+    advance = sub.add_parser(
+        "advance", help="move the item forward if its preconditions are met"
+    )
+    advance.add_argument("sku")
+    advance.add_argument("--one", action="store_true", help="a single transition only")
+    advance.add_argument("--ignore-questions", action="store_true")
+    advance.set_defaults(func=cmd_item_advance)
+
+    questions = sub.add_parser("questions", help="open questions awaiting an answer")
+    questions.add_argument("sku", nargs="?", help="omit for every item")
+    questions.add_argument("--blocking", action="store_true", help="blocking only")
+    questions.set_defaults(func=cmd_item_questions)
 
     show = sub.add_parser("show", help="full item state")
     show.add_argument("sku")

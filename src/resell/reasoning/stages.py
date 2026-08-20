@@ -181,14 +181,30 @@ Rules:
 - Propose a value only when a recorded observation supports it. Cite the observation \
 ids. A value you cannot cite is a guess, and a guess that reaches a listing is worse \
 than a blank.
-- If nothing supports an aspect, return an empty candidates array for it. That is a \
-correct and useful answer, not a failure.
+- If nothing supports an aspect, return an empty candidates array AND an \
+`unsupported_reason`. That is a correct and useful answer, not a failure. The reason \
+matters as much as the emptiness:
+  `not_observed` -- the photographs say nothing about it.
+  `not_applicable` -- it does not apply to this kind of object at all, such as an \
+inseam on a jacket.
+  `none_apply` -- the evidence describes the property, but none of the allowed values \
+is truthful. A standalone jacket in a form whose Style offers only "2 Piece", \
+"3 Piece" and "Tuxedo" is this case.
+  `insufficient_evidence` -- partly observed, not enough to name a value.
+- Never pick a least-wrong value because a field is required. `none_apply` is the \
+correct answer when no allowed option is true, and it tells us the category may be \
+wrong rather than the item unknowable.
 - If the observations support more than one reading, return each as a separate \
 candidate with its own citations. Do not choose between them. Two labels giving \
 different sizes, or one observation that cannot distinguish navy from black, are \
 both cases where returning both readings is the right answer.
 - Do not cite an observation that merely mentions the topic. "The label reads MADE IN \
 EGYPT" supports a Country/Region of Manufacture value; it does not support a Size.
+- External facts, where supplied, come from a product matched to this item. They can \
+settle things a photograph cannot -- which of two transcribed codes is the product \
+number, what a manufacturer calls a colourway. They cannot tell you the condition or \
+the size of the object in front of the operator. Where an observation and an external \
+fact both bear on an aspect, cite the observation.
 - Where the form lists allowed values, prefer one of them exactly as written. If the \
 observations support something not in the list, propose it anyway and cite it -- the \
 list is not always exhaustive.
@@ -198,7 +214,10 @@ Call the map_aspects tool exactly once."""
 
 
 def mapping_stage(
-    aspect_form: str, observations: str, max_output_tokens: int = 4000
+    aspect_form: str,
+    observations: str,
+    max_output_tokens: int = 4000,
+    donated: str = "",
 ) -> StageRequest:
     """Build the aspect mapping request.
 
@@ -211,10 +230,18 @@ def mapping_stage(
     instruction = (
         "Aspect form:\n\n"
         f"{aspect_form}\n\n"
-        "Recorded observations:\n\n"
+        "Recorded observations of the item:\n\n"
         f"{observations}\n\n"
-        "Map the observations onto the form."
     )
+    if donated:
+        instruction += (
+            "External facts about a product matched to this item:\n\n"
+            f"{donated}\n\n"
+            "These describe a product believed to be this one, not the object itself. "
+            "Cite them where they genuinely settle an aspect, and prefer a direct "
+            "observation when both are available.\n\n"
+        )
+    instruction += "Map the observations onto the form."
     return StageRequest(
         system_prompt=MAP_SYSTEM_PROMPT,
         images=(),
@@ -267,3 +294,251 @@ def render_observations(rows) -> str:
         suffix = f"  ({'; '.join(detail)})" if detail else ""
         lines.append(f"[{row['id']}] {row['basis'] or row['kind']}: {claim}{suffix}")
     return "\n".join(lines)
+
+
+PLAN_SYSTEM_PROMPT = """You are deciding whether external research would improve the \
+identification of a second-hand item, and if so, exactly what to look up. You are \
+planning, not searching. Nothing is fetched until this plan is agreed.
+
+Rules:
+
+- Every lookup must cite the observations that motivate it. "Search the \
+manufacturer's site for style code SUJT EXP 2BSV SLIM, because observation 41 \
+transcribed it from the swing tag" is a plan. "Search for Brooks Brothers jackets" \
+is browsing.
+- Order lookups by value. The list may be trimmed to fit a budget, so what you put \
+first is what will run.
+- Prefer the manufacturer's own source. The same code on a reseller page is worth \
+much less, because they may have transcribed it from a photograph or be describing a \
+different variant.
+- Say when searching is not warranted. If the evidence already supports the best \
+identification available, set `sufficient` to true, propose the mode, and return no \
+lookups. An item with no discoverable brand and a thorough examination behind it is \
+a `described_object`, and that is a successful outcome, not a failure to identify. \
+Spending lookups to confirm an absence is waste.
+- A known brand with no discoverable model is `branded_generic`. If the brand is \
+already established from a label, searching for a model number that the item does \
+not carry will not find one.
+- Do not propose a search you have already been told was performed.
+- Remember what a lookup can and cannot do. It can confirm which of two transcribed \
+codes is the product number; it cannot tell you the size of the garment in front of \
+the operator.
+
+Call the plan_research tool exactly once."""
+
+
+def planning_stage(
+    observations: str,
+    identifiers: str,
+    unresolved: str,
+    prior_lookups: str,
+    current_mode: str,
+    effort: str,
+    max_output_tokens: int = 2000,
+) -> StageRequest:
+    """Build the research planning request. No images: this reasons over the record."""
+    from resell.reasoning.tools import PLAN_TOOL_NAME, PLAN_TOOL_SCHEMA
+
+    instruction = (
+        f"Current identification mode: {current_mode}\n"
+        f"Identification effort allowed: {effort}\n\n"
+        f"Recorded observations:\n\n{observations}\n\n"
+        f"Identifiers read from the item:\n\n{identifiers or '(none)'}\n\n"
+        f"Aspects still unresolved:\n\n{unresolved or '(none)'}\n\n"
+        f"Lookups already performed for this item:\n\n{prior_lookups or '(none)'}\n\n"
+        "Decide whether external research would improve this identification, and "
+        "what specifically to look up."
+    )
+    return StageRequest(
+        system_prompt=PLAN_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=PLAN_TOOL_NAME,
+            description=PLAN_TOOL_SCHEMA["description"],
+            json_schema=PLAN_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
+MATCH_SYSTEM_PROMPT = """You are judging whether retrieved candidate products are the \
+second-hand item described by a set of observations. You are not looking at the item \
+or at the pages; you are comparing two records.
+
+Rules:
+
+- Concluding that nothing matches is a correct answer. A research loop that always \
+selects a product will always find one, and what it finds will increasingly be \
+whatever it was hoping for. If none of these candidates is the item, say so.
+- Record the non-matches too, with what ruled them out. "Candidate is a three-button \
+jacket; observation 29 shows a two-button front" is worth keeping: it stops the same \
+candidate being reconsidered, and a specific conflict is more informative than \
+silence.
+- Every claim cites both sides. Which observation of the physical object corresponds \
+to which fact about the candidate. A claim citing only the candidate is a description \
+of a web page.
+- Choose the strength honestly. `identifier_verified` needs an identifier that passes \
+its own check digit. `identifier_asserted` is a code that matches but cannot be \
+checked -- garment style codes, model numbers. `attribute_convergence` is several \
+independent attributes agreeing with no identifier. `similarity` is resemblance, and \
+donates nothing.
+- Resemblance is not identity. A page showing a very similar navy two-button jacket \
+from the same brand is `similarity` unless something ties it specifically to this \
+object. Mass-produced goods have many near-twins, and the differences that matter -- \
+year, variant, colourway -- are often invisible in a photograph.
+- Do not infer that a candidate matches because it would be convenient. The item is \
+allowed to be unidentifiable.
+
+Call the judge_candidates tool exactly once."""
+
+
+def matching_stage(
+    observations: str, candidates: str, max_output_tokens: int = 3000
+) -> StageRequest:
+    """Build the candidate matching request."""
+    from resell.reasoning.tools import MATCH_TOOL_NAME, MATCH_TOOL_SCHEMA
+
+    instruction = (
+        f"Observations of the physical item:\n\n{observations}\n\n"
+        f"Retrieved candidate products:\n\n{candidates}\n\n"
+        "Judge each candidate. Recording that none of them is this item is a valid "
+        "and useful conclusion."
+    )
+    return StageRequest(
+        system_prompt=MATCH_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=MATCH_TOOL_NAME,
+            description=MATCH_TOOL_SCHEMA["description"],
+            json_schema=MATCH_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
+def render_donated_facts(conn, citable: dict[int, str]) -> str:
+    """External facts an aspect is permitted to cite, with their provenance.
+
+    Provenance travels with them into the prompt for the same reason it travels into
+    the record: a fact someone typed off a page the system never loaded should not
+    read identically to one it fetched.
+    """
+    import json as _json
+
+    if not citable:
+        return ""
+    placeholders = ",".join("?" * len(citable))
+    rows = conn.execute(
+        f"SELECT id, payload, source_url, source_authority, retrieval_method, "
+        f"candidate_ref FROM evidence WHERE id IN ({placeholders}) ORDER BY id",
+        list(citable),
+    ).fetchall()
+
+    lines = []
+    for row in rows:
+        claim = _json.loads(row["payload"]).get("claim", "")
+        via = (
+            " · operator-transcribed"
+            if row["retrieval_method"] == "operator_transcribed" else ""
+        )
+        lines.append(
+            f"[{row['id']}] {claim}\n"
+            f"      from {row['source_url']} [{row['source_authority']}{via}] "
+            f"· permits: {citable[row['id']]}"
+        )
+    return "\n".join(lines)
+
+
+DRAFT_SYSTEM_PROMPT = """You are writing a marketplace listing for a second-hand item, \
+from observations someone else recorded. You are not looking at the item.
+
+Write copy that sells. A listing competes with dozens of near-identical ones, and a \
+flat recitation of attributes loses to a listing that tells someone why they want \
+this. Persuasion is the job. What you may not do is assert things the record cannot \
+support.
+
+The distinction is between opinion and fact, not between plain and persuasive:
+
+- "Timeless", "sophisticated", "boardroom-ready", "a wardrobe staple", "perfect for \
+an interview" — all fine. These position the item and appeal to a buyer. Nobody can \
+be misled by them, because they claim nothing checkable.
+- "Rare", "hard to find", "limited edition", "discontinued", "sought after" — these \
+sound like enthusiasm and function as claims about supply. A buyer can be misled by \
+them. Use them only when the evidence establishes them.
+- "Mint", "deadstock", "unworn", "authentic", "vintage" — the same. They describe \
+verifiable properties, so they need the evidence that verifies them.
+- "An investment", "a bargain", "worth double" — never. These assert future value or \
+a relationship to market price, and nothing establishes either.
+
+Structure your answer in two parts:
+
+`claims` — every factual assertion, each citing the observation ids behind it. Brand, \
+material, measurements, construction, condition, flaws, provenance. A factual \
+sentence you cannot cite is invention, however reasonable it sounds.
+
+`marketing_copy` — positioning, tone, who this is for, why it appeals. No citations \
+needed, because there is nothing here to be wrong about. Write it well; this is where \
+the listing earns its price.
+
+`description` is what the buyer reads, and it is not everything you know. Select.
+
+Include: what the item is and who made it, the differentiators, material and
+construction, condition, sizing or measurements, and every flaw. Then two or three
+sentences of positioning.
+
+Leave out: factory codes, barcodes, production months, internal SKUs, worksheet
+paperwork, what the item is photographed on. These are all true and none of them
+help anyone decide. A description that recites the whole tag reads as a data dump
+exactly where attention is highest, and buries the two facts that would have sold
+it. The claims list is where the record goes; the description is where the argument
+goes.
+
+Two further rules:
+
+- On condition, describe the indicators rather than asserting the history. "Tags
+still attached and the factory basting is intact at the vents" is observed, checkable
+by the buyer against the photographs, and more convincing than "never worn" -- which
+is a claim about the item's past that no photograph can establish. Where a condition
+has been recorded you may state it, but prefer the evidence to the narrative.
+- Say what is wrong with the item as plainly as what is right. A recorded flaw \
+omitted from the description is the most expensive kind of omission: it becomes a \
+return, and a buyer who feels misled. It is also, handled openly, a mark of a seller \
+worth buying from.
+- Where a required aspect had no value, do not paper over it in prose. An absent \
+size stays absent; do not imply one.
+
+The title has 80 characters and is mostly a search-matching device: brand, what the \
+thing is, then the attributes a buyer would type. One evocative word is worth it if \
+the searchable terms still fit.
+
+Call the draft_listing tool exactly once."""
+
+
+def drafting_stage(
+    observations: str,
+    aspects: str,
+    condition: str,
+    max_output_tokens: int = 2000,
+) -> StageRequest:
+    """Build the listing drafting request. No images: it writes from the record."""
+    from resell.reasoning.tools import DRAFT_TOOL_NAME, DRAFT_TOOL_SCHEMA
+
+    instruction = (
+        f"Resolved aspects:\n\n{aspects or '(none)'}\n\n"
+        f"Item condition: {condition or '(not set)'}\n\n"
+        f"Recorded observations:\n\n{observations}\n\n"
+        "Write the listing."
+    )
+    return StageRequest(
+        system_prompt=DRAFT_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=DRAFT_TOOL_NAME,
+            description=DRAFT_TOOL_SCHEMA["description"],
+            json_schema=DRAFT_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )

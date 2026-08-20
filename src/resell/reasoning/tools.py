@@ -418,6 +418,21 @@ MAP_TOOL_SCHEMA: dict[str, Any] = {
                             "type": "string",
                             "description": "Exactly as given in the form.",
                         },
+                        "unsupported_reason": {
+                            "type": "string",
+                            "enum": [
+                                "not_observed", "not_applicable", "none_apply",
+                                "insufficient_evidence",
+                            ],
+                            "description": (
+                                "Required when candidates is empty. not_observed: the "
+                                "photos say nothing about it. not_applicable: it does "
+                                "not apply to this kind of object. none_apply: the "
+                                "evidence describes it but no allowed value is "
+                                "truthful. insufficient_evidence: partly observed, not "
+                                "enough to name a value."
+                            ),
+                        },
                         "candidates": {
                             "type": "array",
                             "description": (
@@ -457,18 +472,35 @@ class MappingProposal:
     """Candidate sets per aspect. Persisted only after the gateway accepts them."""
 
     candidates_by_aspect: dict[str, list] = field(default_factory=dict)
+    reasons_by_aspect: dict[str, object] = field(default_factory=dict)
     reasoning_by_value: dict[tuple[str, str], str] = field(default_factory=dict)
+    # Values resting on external evidence, so they can be marked at approval rather
+    # than blending in with what was observed on the item itself.
+    donated_by_value: dict[tuple[str, str], tuple[int, ...]] = field(default_factory=dict)
     malformed: list[str] = field(default_factory=list)
 
 
-def parse_map_tool_input(payload: object, *, valid_evidence_ids: set[int]) -> MappingProposal:
+def parse_map_tool_input(
+    payload: object,
+    *,
+    valid_evidence_ids: set[int],
+    citable_candidates: dict[int, str] | None = None,
+) -> MappingProposal:
     """Turn a mapping tool call into candidate sets. Never raises.
 
     Citations are checked against the evidence actually in scope. A value citing an
     id that does not exist, or that belongs to another item or an earlier run, is
     dropped rather than trusted -- an invented citation is worse than an absent one
     because it looks like support.
+
+    `citable_candidates` maps candidate-product evidence ids to the donation scope a
+    match permits. Candidate evidence absent from it is refused exactly as an
+    invented citation is: the donation gate is the same mechanism as every other
+    citation rule, not a parallel one that could disagree with it.
     """
+    from resell.reasoning.research import DonationScope, aspect_is_specific, may_cite_candidate
+
+    citable_candidates = citable_candidates or {}
     from resell.reasoning.gaps import Candidate
     from resell.reasoning.schema import Basis, EvidenceRef
 
@@ -522,13 +554,35 @@ def parse_map_tool_input(payload: object, *, valid_evidence_ids: set[int]) -> Ma
                 except (TypeError, ValueError):
                     continue
 
-            unknown = [i for i in ids if i not in valid_evidence_ids]
+            unknown = [
+                i for i in ids
+                if i not in valid_evidence_ids and i not in citable_candidates
+            ]
             if unknown:
                 proposal.malformed.append(
                     f"{name} candidate {value!r}: cites evidence {unknown} which is not "
                     f"in scope for this item"
                 )
-            ids = [i for i in ids if i in valid_evidence_ids]
+
+            # Candidate-product evidence is admissible only as far as a match permits.
+            refused = []
+            for evidence_id in list(ids):
+                if evidence_id not in citable_candidates:
+                    continue
+                scope = DonationScope(citable_candidates[evidence_id])
+                allowed, why = may_cite_candidate(
+                    scope, aspect_is_specific=aspect_is_specific(name)
+                )
+                if not allowed:
+                    refused.append((evidence_id, why))
+            if refused:
+                proposal.malformed.append(
+                    f"{name} candidate {value!r}: candidate evidence "
+                    f"{[i for i, _ in refused]} may not be cited here -- {refused[0][1]}"
+                )
+                ids = [i for i in ids if i not in {i for i, _ in refused}]
+
+            ids = [i for i in ids if i in valid_evidence_ids or i in citable_candidates]
             if not ids:
                 proposal.malformed.append(
                     f"{name} candidate {value!r}: no usable citation, discarded"
@@ -543,9 +597,499 @@ def parse_map_tool_input(payload: object, *, valid_evidence_ids: set[int]) -> Ma
                     support=tuple(EvidenceRef(i, Basis.INFERENCE) for i in ids),
                 )
             )
+            donated = [i for i in ids if i in citable_candidates]
+            if donated:
+                proposal.donated_by_value[(name, value.strip())] = tuple(donated)
             if isinstance(entry.get("reasoning"), str):
                 proposal.reasoning_by_value[(name, value.strip())] = entry["reasoning"]
 
         proposal.candidates_by_aspect[name] = candidates
 
+        if not candidates:
+            from resell.reasoning.gaps import UnsupportedReason
+
+            raw_reason = raw.get("unsupported_reason")
+            try:
+                proposal.reasons_by_aspect[name] = UnsupportedReason(raw_reason)
+            except (ValueError, TypeError):
+                # Not fatal -- the aspect is still correctly unsupported. But without
+                # the reason we cannot tell "not photographed" from "no truthful value
+                # exists in this category", and those need opposite responses.
+                proposal.malformed.append(
+                    f"{name}: no candidates and no usable unsupported_reason "
+                    f"({raw_reason!r}); the gap cannot be classified"
+                )
+
     return proposal
+
+
+# --- stage 3: research planning ----------------------------------------------
+
+PLAN_TOOL_NAME = "plan_research"
+
+# The planner's most valuable answer is often an empty plan. `sufficient` exists so
+# "I have enough to call this branded_generic, and more searching will not change
+# that" is a first-class output rather than something inferred from silence.
+PLAN_TOOL_SCHEMA: dict[str, Any] = {
+    "name": PLAN_TOOL_NAME,
+    "description": "Decide what external lookups, if any, would improve identification.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "assessment": {
+                "type": "object",
+                "properties": {
+                    "sufficient": {
+                        "type": "boolean",
+                        "description": (
+                            "True when existing evidence already supports the best "
+                            "identification available and further searching is "
+                            "unlikely to improve it. Say so plainly; an empty plan "
+                            "with a reason is a good answer."
+                        ),
+                    },
+                    "proposed_mode": {
+                        "type": "string",
+                        "enum": ["exact_product", "product_family", "branded_generic",
+                                 "described_object", "unresolved"],
+                    },
+                    "rationale": {"type": "string"},
+                },
+                "required": ["sufficient", "proposed_mode", "rationale"],
+            },
+            "lookups": {
+                "type": "array",
+                "description": (
+                    "Targeted lookups, most valuable first -- the list may be trimmed "
+                    "to fit the budget, so order matters. Empty when sufficient."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "source_kind": {
+                            "type": "string",
+                            "enum": ["manufacturer", "reference", "general_web"],
+                            "description": "Where this should be looked up.",
+                        },
+                        "motivation": {
+                            "type": "string",
+                            "description": "What this would settle, and why it is worth a lookup.",
+                        },
+                        "evidence_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": (
+                                "Observations that motivate this lookup. Required: a "
+                                "search with nothing behind it is browsing."
+                            ),
+                        },
+                        "expected_to_resolve": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Aspect names or questions this may settle.",
+                        },
+                    },
+                    "required": ["query", "source_kind", "motivation", "evidence_ids"],
+                },
+            },
+        },
+        "required": ["assessment", "lookups"],
+    },
+}
+
+
+@dataclass
+class PlannedLookup:
+    query: str
+    source_kind: str
+    motivation: str
+    evidence_ids: tuple[int, ...]
+    expected_to_resolve: tuple[str, ...] = ()
+
+
+@dataclass
+class ResearchPlan:
+    sufficient: bool = False
+    proposed_mode: str = "unresolved"
+    rationale: str = ""
+    lookups: list[PlannedLookup] = field(default_factory=list)
+    malformed: list[str] = field(default_factory=list)
+
+
+def parse_plan_tool_input(
+    payload: object, *, valid_evidence_ids: set[int], already_searched: set[str] | None = None
+) -> ResearchPlan:
+    """Turn a planning tool call into a validated plan. Never raises.
+
+    Two rules enforced here rather than hoped for: a lookup must cite the
+    observations that motivate it, and a query already performed for this item is
+    dropped. The first is what makes this planning rather than browsing; the second
+    stops a loop paying twice for the same answer.
+    """
+    already_searched = {q.casefold() for q in (already_searched or set())}
+    plan = ResearchPlan()
+
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            plan.malformed.append("tool input was an unparseable string")
+            return plan
+    if not isinstance(payload, dict):
+        plan.malformed.append(f"tool input was {type(payload).__name__}, expected an object")
+        return plan
+
+    assessment = payload.get("assessment")
+    if isinstance(assessment, dict):
+        plan.sufficient = bool(assessment.get("sufficient"))
+        plan.proposed_mode = str(assessment.get("proposed_mode", "unresolved"))
+        plan.rationale = str(assessment.get("rationale", ""))
+        if not plan.rationale.strip():
+            plan.malformed.append("assessment: no rationale given")
+    else:
+        plan.malformed.append("assessment missing; cannot tell whether searching is warranted")
+
+    for index, raw in enumerate(_as_list(payload.get("lookups"), "lookups", plan.malformed)):
+        if not isinstance(raw, dict):
+            plan.malformed.append(f"lookup {index}: expected an object")
+            continue
+        query = str(raw.get("query", "")).strip()
+        if not query:
+            plan.malformed.append(f"lookup {index}: empty query")
+            continue
+        if query.casefold() in already_searched:
+            plan.malformed.append(
+                f"lookup {index}: {query!r} was already performed for this item; skipped"
+            )
+            continue
+
+        cited = raw.get("evidence_ids")
+        ids = []
+        for item in cited if isinstance(cited, list) else []:
+            try:
+                ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        unknown = [i for i in ids if i not in valid_evidence_ids]
+        if unknown:
+            plan.malformed.append(
+                f"lookup {index} ({query!r}): cites evidence {unknown} not in scope"
+            )
+        ids = [i for i in ids if i in valid_evidence_ids]
+        if not ids:
+            plan.malformed.append(
+                f"lookup {index} ({query!r}): no observation motivates this search; "
+                f"a lookup with nothing behind it is browsing, not planning"
+            )
+            continue
+
+        expected = raw.get("expected_to_resolve")
+        plan.lookups.append(
+            PlannedLookup(
+                query=query,
+                source_kind=str(raw.get("source_kind", "general_web")),
+                motivation=str(raw.get("motivation", "")),
+                evidence_ids=tuple(ids),
+                expected_to_resolve=tuple(
+                    str(x) for x in (expected if isinstance(expected, list) else ())
+                ),
+            )
+        )
+
+    if plan.sufficient and plan.lookups:
+        plan.malformed.append(
+            "assessment says the evidence is sufficient but lookups were still "
+            "proposed; treating the lookups as the intent"
+        )
+        plan.sufficient = False
+
+    return plan
+
+
+# --- stage 4: candidate matching ---------------------------------------------
+
+MATCH_TOOL_NAME = "judge_candidates"
+
+# `any_match: false` is a result, not a failure. A loop that always selects
+# something will always find something, and the thing it finds will increasingly be
+# whatever it was hoping for.
+MATCH_TOOL_SCHEMA: dict[str, Any] = {
+    "name": MATCH_TOOL_NAME,
+    "description": "Judge whether retrieved candidate products are this item.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "assessment": {
+                "type": "object",
+                "properties": {
+                    "any_match": {
+                        "type": "boolean",
+                        "description": (
+                            "False when no candidate is this item. That is a correct "
+                            "and useful answer."
+                        ),
+                    },
+                    "rationale": {"type": "string"},
+                },
+                "required": ["any_match", "rationale"],
+            },
+            "claims": {
+                "type": "array",
+                "description": (
+                    "One entry per candidate examined, whether or not it matches. "
+                    "Record the non-matches: knowing a candidate was considered and "
+                    "ruled out is worth keeping."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "candidate_ref": {"type": "string"},
+                        "is_match": {"type": "boolean"},
+                        "strength": {
+                            "type": "string",
+                            "enum": ["identifier_verified", "identifier_asserted",
+                                     "attribute_convergence", "similarity"],
+                            "description": "Required when is_match is true.",
+                        },
+                        "rationale": {"type": "string"},
+                        "item_evidence": {
+                            "type": "array", "items": {"type": "integer"},
+                            "description": "Observations of the physical item. Required.",
+                        },
+                        "candidate_evidence": {
+                            "type": "array", "items": {"type": "integer"},
+                            "description": "Facts about the candidate product. Required.",
+                        },
+                        "ruled_out_by": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": (
+                                "For a non-match: the specific conflicts. "
+                                "'candidate is a 3-button, the item is 2-button'."
+                            ),
+                        },
+                    },
+                    "required": ["candidate_ref", "is_match", "rationale",
+                                 "item_evidence", "candidate_evidence"],
+                },
+            },
+        },
+        "required": ["assessment", "claims"],
+    },
+}
+
+
+@dataclass
+class MatchProposal:
+    any_match: bool = False
+    rationale: str = ""
+    claims: list = field(default_factory=list)      # list[MatchClaim]
+    malformed: list[str] = field(default_factory=list)
+
+    @property
+    def matches(self) -> list:
+        return [claim for claim in self.claims if claim.is_match]
+
+    @property
+    def non_matches(self) -> list:
+        return [claim for claim in self.claims if not claim.is_match]
+
+
+def parse_match_tool_input(
+    payload: object,
+    *,
+    valid_item_evidence: set[int],
+    valid_candidate_evidence: set[int],
+) -> MatchProposal:
+    """Turn a matching tool call into validated claims. Never raises.
+
+    Both sides of every claim are checked against the evidence that actually exists,
+    matches and non-matches alike. A non-match citing nothing is as empty as a match
+    citing nothing -- "this isn't it" is only useful if it says what conflicts.
+    """
+    from resell.reasoning.research import MatchClaim, MatchStrength, SourceAuthority
+
+    proposal = MatchProposal()
+
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            proposal.malformed.append("tool input was an unparseable string")
+            return proposal
+    if not isinstance(payload, dict):
+        proposal.malformed.append(f"tool input was {type(payload).__name__}, expected an object")
+        return proposal
+
+    assessment = payload.get("assessment")
+    if isinstance(assessment, dict):
+        proposal.any_match = bool(assessment.get("any_match"))
+        proposal.rationale = str(assessment.get("rationale", ""))
+        if not proposal.rationale.strip():
+            proposal.malformed.append("assessment: no rationale given")
+    else:
+        proposal.malformed.append("assessment missing")
+
+    for index, raw in enumerate(_as_list(payload.get("claims"), "claims", proposal.malformed)):
+        if not isinstance(raw, dict):
+            proposal.malformed.append(f"claim {index}: expected an object")
+            continue
+        candidate_ref = str(raw.get("candidate_ref", "")).strip()
+        if not candidate_ref:
+            proposal.malformed.append(f"claim {index}: no candidate_ref")
+            continue
+
+        is_match = bool(raw.get("is_match"))
+        strength = MatchStrength.SIMILARITY
+        if is_match:
+            try:
+                strength = MatchStrength(raw.get("strength"))
+            except (ValueError, TypeError):
+                proposal.malformed.append(
+                    f"claim {index} ({candidate_ref}): a match needs a strength, got "
+                    f"{raw.get('strength')!r}"
+                )
+                continue
+
+        def cited(key: str, valid: set[int]) -> tuple[list[int], list[int]]:
+            raw_ids = raw.get(key)
+            ids = []
+            for item in raw_ids if isinstance(raw_ids, list) else []:
+                try:
+                    ids.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            return [i for i in ids if i in valid], [i for i in ids if i not in valid]
+
+        item_ids, bad_item = cited("item_evidence", valid_item_evidence)
+        candidate_ids, bad_candidate = cited("candidate_evidence", valid_candidate_evidence)
+        if bad_item or bad_candidate:
+            proposal.malformed.append(
+                f"claim {index} ({candidate_ref}): cites evidence not in scope "
+                f"(item {bad_item}, candidate {bad_candidate})"
+            )
+
+        claim = MatchClaim(
+            candidate_ref=candidate_ref,
+            strength=strength,
+            # Authority comes from the retrieved document, never from the model:
+            # it is a property of where the page came from, not a judgment.
+            authority=SourceAuthority.UNKNOWN,
+            rationale=str(raw.get("rationale", "")),
+            item_evidence=tuple(item_ids),
+            candidate_evidence=tuple(candidate_ids),
+            is_match=is_match,
+        )
+        problems = claim.problems()
+        if problems:
+            proposal.malformed.append(
+                f"claim {index} ({candidate_ref}): " + "; ".join(problems)
+            )
+            continue
+        proposal.claims.append(claim)
+
+    if proposal.any_match and not proposal.matches:
+        proposal.malformed.append(
+            "assessment says a candidate matches but no usable match claim survived "
+            "validation; treating as no match"
+        )
+        proposal.any_match = False
+    if not proposal.any_match and proposal.matches:
+        proposal.malformed.append(
+            "assessment says nothing matches but match claims were made; "
+            "treating the claims as the intent"
+        )
+        proposal.any_match = True
+
+    return proposal
+
+
+# --- stage 5: listing draft --------------------------------------------------
+
+DRAFT_TOOL_NAME = "draft_listing"
+
+DRAFT_TOOL_SCHEMA: dict[str, Any] = {
+    "name": DRAFT_TOOL_NAME,
+    "description": "Write a marketplace title and description from recorded evidence.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "80 characters maximum. Front-load what a buyer searches for.",
+            },
+            "description": {
+                "type": "string",
+                "description": (
+                    "The listing as a buyer reads it: the factual claims and the "
+                    "marketing copy woven together."
+                ),
+            },
+            "marketing_copy": {
+                "type": "string",
+                "description": (
+                    "Positioning, tone, who this suits and why. No citations needed "
+                    "-- opinion asserts nothing checkable. Write it well."
+                ),
+            },
+            "claims": {
+                "type": "array",
+                "description": (
+                    "Every factual assertion, each citing the evidence behind it. "
+                    "Marketing language does not belong here."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "evidence_ids": {
+                            "type": "array", "items": {"type": "integer"},
+                            "description": "Required and non-empty.",
+                        },
+                    },
+                    "required": ["text", "evidence_ids"],
+                },
+            },
+        },
+        "required": ["title", "description", "marketing_copy", "claims"],
+    },
+}
+
+
+def parse_draft_tool_input(payload: object, *, valid_evidence_ids: set[int]):
+    """Turn a drafting tool call into a draft. Never raises."""
+    from resell.reasoning.listing import DraftClaim, ListingDraft
+
+    draft = ListingDraft()
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            draft.malformed.append("tool input was an unparseable string")
+            return draft
+    if not isinstance(payload, dict):
+        draft.malformed.append(f"tool input was {type(payload).__name__}")
+        return draft
+
+    draft.title = str(payload.get("title", "")).strip()
+    draft.description = str(payload.get("description", "")).strip()
+    draft.marketing_copy = str(payload.get("marketing_copy", "")).strip()
+
+    claims = []
+    for index, raw in enumerate(_as_list(payload.get("claims"), "claims", draft.malformed)):
+        if not isinstance(raw, dict):
+            draft.malformed.append(f"claim {index}: expected an object")
+            continue
+        text = str(raw.get("text", "")).strip()
+        if not text:
+            draft.malformed.append(f"claim {index}: empty text")
+            continue
+        ids = []
+        for item in raw.get("evidence_ids") if isinstance(raw.get("evidence_ids"), list) else []:
+            try:
+                ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        claims.append(DraftClaim(text=text, evidence_ids=tuple(ids)))
+    draft.claims = tuple(claims)
+    return draft

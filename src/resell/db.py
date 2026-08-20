@@ -449,6 +449,102 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "ALTER TABLE evidence ADD COLUMN model_call_id INTEGER REFERENCES model_call(id)",
         "CREATE INDEX idx_evidence_call ON evidence (sku, model_call_id)",
     ),
+    # 12 -- external identification research.
+    #
+    # External facts describe a *candidate product*, never the object on the table.
+    # Connecting the two is a separate, cited claim with a strength, and only a
+    # strong enough claim lets a candidate's attributes be used for this item.
+    (
+        # Groups facts belonging to one candidate product.
+        "ALTER TABLE evidence ADD COLUMN candidate_ref TEXT",
+        # Identity facts and retail/price facts are kept apart even when they come
+        # off the same page: eBay's Restricted API terms and the pricing stage treat
+        # them differently, and conflating them now would be painful to unpick.
+        "ALTER TABLE evidence ADD COLUMN fact_domain TEXT",
+        "ALTER TABLE evidence ADD COLUMN source_authority TEXT",
+        "ALTER TABLE evidence ADD COLUMN source_url TEXT",
+        "ALTER TABLE evidence ADD COLUMN retrieved_at TEXT",
+        # Set when a source's licence restricts sending its content to a third-party
+        # model. eBay's updated API agreement prohibits ingesting Restricted API data
+        # into an AI not licensed from eBay without written consent, so such records
+        # are retained for deterministic use while send_to_model stays 0.
+        "ALTER TABLE evidence ADD COLUMN source_restriction TEXT",
+        "CREATE INDEX idx_evidence_candidate ON evidence (sku, candidate_ref)",
+
+        # A claim linking a candidate product to this item. Both sides are cited.
+        """
+        CREATE TABLE product_match (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku                TEXT NOT NULL REFERENCES item(sku),
+            candidate_ref      TEXT NOT NULL,
+            strength           TEXT NOT NULL,
+            source_authority   TEXT NOT NULL,
+            rationale          TEXT NOT NULL,
+            item_evidence      TEXT NOT NULL,
+            candidate_evidence TEXT NOT NULL,
+            is_match           INTEGER NOT NULL DEFAULT 1,
+            created_at         TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX idx_match_sku ON product_match (sku, candidate_ref)",
+        """
+        CREATE TRIGGER product_match_no_update BEFORE UPDATE ON product_match
+        BEGIN SELECT RAISE(ABORT, 'product matches are append-only'); END
+        """,
+
+        # What was searched, where, and what came back -- so the same query is not
+        # paid for twice, and so "searched and found nothing" is recordable.
+        """
+        CREATE TABLE research_lookup (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku           TEXT NOT NULL REFERENCES item(sku),
+            scope         TEXT NOT NULL DEFAULT 'identity'
+                              CHECK (scope IN ('identity', 'pricing')),
+            provider      TEXT NOT NULL,
+            query         TEXT NOT NULL,
+            motivation    TEXT NOT NULL,
+            evidence_ids  TEXT NOT NULL,
+            result_count  INTEGER NOT NULL DEFAULT 0,
+            performed_at  TEXT NOT NULL
+        )
+        """,
+        "CREATE UNIQUE INDEX idx_lookup_query ON research_lookup (sku, scope, provider, query)",
+    ),
+    # 13 -- what a match permits, decided deterministically and stored with it.
+    #
+    # Kept on the row rather than recomputed, so the permission that was in force
+    # when an aspect cited a candidate stays inspectable afterwards.
+    ("ALTER TABLE product_match ADD COLUMN donation_scope TEXT",),
+    # 14 -- how a candidate fact reached us, as distinct from where it came from.
+    #
+    # An operator reading a page and typing what it says is a different act from the
+    # system fetching that page. Both may be right; only one was verified by
+    # anything other than a person's word. source_url and source_authority record
+    # what is claimed; retrieval_method records who is doing the claiming.
+    (
+        "ALTER TABLE evidence ADD COLUMN retrieval_method TEXT",
+        "CREATE INDEX idx_evidence_retrieval ON evidence (sku, retrieval_method)",
+    ),
+    # 15 -- whether the identifiers were ever resolved to a real product.
+    #
+    # Mode says how precisely the item is known; this says whether anyone tried.
+    # An item nobody researched and one whose nearest candidate was found and
+    # rejected share a mode and differ in what should happen next.
+    ("ALTER TABLE identification ADD COLUMN identity_resolution TEXT "
+     "NOT NULL DEFAULT 'unattempted'",),
+    # 16 -- the citations behind the description.
+    #
+    # The buyer reads prose; the operator needs to know why a sentence exists. Kept
+    # off the listing itself so the two never get confused.
+    ("ALTER TABLE identification ADD COLUMN draft_claims TEXT",),
+    # 17 -- which aspect a question was opened about.
+    #
+    # Mapping opens a question per unresolved required aspect and a later run may
+    # resolve it, leaving a question that is answered in fact but open in the
+    # record. Recording the aspect makes that checkable, so the operator is shown
+    # "asked about Type, which has since resolved to Suit Jacket" rather than being
+    # asked again about something already settled.
+    ("ALTER TABLE open_question ADD COLUMN aspect_name TEXT",),
 )
 
 

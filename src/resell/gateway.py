@@ -110,13 +110,53 @@ def observations_in_scope(conn: sqlite3.Connection, sku: str) -> list[sqlite3.Ro
         (sku,),
     ).fetchone()[0]
 
+    # subject='this_item' only. Candidate-product facts reach an aspect through the
+    # donation gate or not at all; letting them in here would route around it.
     return list(
         conn.execute(
             "SELECT * FROM evidence WHERE sku = ? AND send_to_model = 1 "
+            "AND subject = 'this_item' "
             "AND (model_call_id IS NULL OR model_call_id = ?) ORDER BY id",
             (sku, latest),
         ).fetchall()
     )
+
+
+def candidate_evidence(
+    conn: sqlite3.Connection, sku: str, candidate_ref: str | None = None
+) -> list[sqlite3.Row]:
+    """Facts about candidate products. Never about the item."""
+    if candidate_ref:
+        return list(conn.execute(
+            "SELECT * FROM evidence WHERE sku = ? AND subject = 'candidate_product' "
+            "AND candidate_ref = ? ORDER BY id", (sku, candidate_ref),
+        ).fetchall())
+    return list(conn.execute(
+        "SELECT * FROM evidence WHERE sku = ? AND subject = 'candidate_product' "
+        "ORDER BY id", (sku,),
+    ).fetchall())
+
+
+def citable_candidate_evidence(conn: sqlite3.Connection, sku: str) -> dict[int, str]:
+    """Candidate evidence ids an aspect may cite, mapped to what they permit.
+
+    The donation gate as a query. An aspect value citing candidate evidence absent
+    from this mapping is dropped exactly as an invented citation is -- the rule is
+    enforced the same way, not by a different mechanism that could disagree.
+    """
+    permitted: dict[int, str] = {}
+    for match in conn.execute(
+        "SELECT candidate_ref, donation_scope FROM product_match "
+        "WHERE sku = ? AND is_match = 1 AND donation_scope IS NOT NULL "
+        "AND donation_scope != 'none'",
+        (sku,),
+    ):
+        for row in candidate_evidence(conn, sku, match["candidate_ref"]):
+            # Identity facts only. Retail facts belong to pricing, under different
+            # rules and possibly a different licence.
+            if row["fact_domain"] in (None, "identity"):
+                permitted[row["id"]] = match["donation_scope"]
+    return permitted
 
 
 def current_identification(conn: sqlite3.Connection, sku: str) -> sqlite3.Row | None:
@@ -780,6 +820,94 @@ class Gateway:
         self._void_approvals(sku, "identification revised")
         return Accepted("ProposeIdentification", sku, None, None, f"version {version}")
 
+    def record_candidate_facts(
+        self, sku: str, *, candidate_ref: str, source_url: str, authority: str,
+        facts: list[tuple[str, str]], restriction: str | None = None,
+        title: str = "", retrieval_method: str = "automated_fetch",
+    ) -> list[int]:
+        """Record facts about a candidate product. Never about this item.
+
+        subject is fixed to candidate_product here rather than passed in, because a
+        retrieval path that could write this_item evidence would bypass the entire
+        donation gate.
+        """
+        get_item(self.conn, sku)
+        ids = []
+        for claim, domain in facts:
+            cursor = self.conn.execute(
+                "INSERT INTO evidence (sku, kind, source, payload, send_to_model, "
+                "recorded_at, basis, subject, candidate_ref, fact_domain, "
+                "source_authority, source_url, retrieved_at, source_restriction, "
+                "retrieval_method) "
+                "VALUES (?, 'candidate_product_fact', ?, ?, ?, ?, ?, "
+                "'candidate_product', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sku,
+                    # The provenance the system can vouch for: who supplied it.
+                    "operator" if retrieval_method == "operator_transcribed" else (source_url or "research"),
+                    json.dumps({"claim": claim, "title": title}),
+                    0 if restriction else 1,
+                    now_iso(), str(Basis.EXTERNAL_SOURCE), candidate_ref, domain,
+                    authority, source_url, now_iso(), restriction, retrieval_method,
+                ),
+            )
+            ids.append(cursor.lastrowid)
+        log_event(
+            self.conn, "research.candidate_recorded",
+            {"candidate_ref": candidate_ref, "url": source_url, "authority": authority,
+             "facts": len(ids), "restricted": bool(restriction),
+             "retrieval_method": retrieval_method},
+            item_id=sku,
+        )
+        return ids
+
+    def record_product_match(self, sku: str, claim, *, authority: str, donation_scope: str) -> int:
+        """Store a match or non-match claim with the permission it carries.
+
+        donation_scope is computed from identifier strength, source authority and the
+        cited evidence -- never from how confident the claim sounded. A model that
+        writes a persuasive rationale has not thereby earned the right to attach a
+        web page's attributes to a physical object.
+        """
+        get_item(self.conn, sku)
+        cursor = self.conn.execute(
+            "INSERT INTO product_match (sku, candidate_ref, strength, source_authority, "
+            "rationale, item_evidence, candidate_evidence, is_match, donation_scope, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sku, claim.candidate_ref, str(claim.strength), authority, claim.rationale,
+                json.dumps(sorted(claim.item_evidence)),
+                json.dumps(sorted(claim.candidate_evidence)),
+                1 if claim.is_match else 0, donation_scope, now_iso(),
+            ),
+        )
+        return cursor.lastrowid
+
+    def record_lookup(
+        self, sku: str, *, provider: str, query: str, motivation: str,
+        evidence_ids: list[int], result_count: int, scope: str = "identity",
+    ) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO research_lookup (sku, scope, provider, query, "
+            "motivation, evidence_ids, result_count, performed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sku, scope, provider, query, motivation, json.dumps(evidence_ids),
+             result_count, now_iso()),
+        )
+
+    def record_research_negative(self, sku: str, *, summary: str, detail: dict) -> Accepted:
+        """A recorded absence: searched, found nothing.
+
+        The mirror of a negative observation. An item whose identifiers were looked
+        up and matched nothing is in a different position from one nobody
+        researched, and only a record tells them apart.
+        """
+        return self.record_evidence(
+            sku, kind="research_negative", source="research",
+            payload={"summary": summary, **detail},
+            basis=str(Basis.EXTERNAL_SOURCE), subject=str(Subject.THIS_ITEM),
+        )
+
     def record_aspect_candidates(self, sku: str, identification_id: int, outcomes) -> int:
         """Store candidate sets with their citations.
 
@@ -814,15 +942,18 @@ class Gateway:
                     stored += 1
         return stored
 
-    def ask_operator(self, sku: str, *, question: str, why_it_matters: str = "", blocking: bool = True) -> Accepted:
+    def ask_operator(
+        self, sku: str, *, question: str, why_it_matters: str = "",
+        blocking: bool = True, aspect_name: str | None = None,
+    ) -> Accepted:
         """The operator-as-tool call. A blocking question moves the item to needs_info."""
         if not question.strip():
             raise Rejected("AskOperator", ["question is empty"])
         get_item(self.conn, sku)
         self.conn.execute(
-            "INSERT INTO open_question (sku, question, why_it_matters, blocking, asked_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (sku, question, why_it_matters, 1 if blocking else 0, now_iso()),
+            "INSERT INTO open_question (sku, question, why_it_matters, blocking, "
+            "asked_at, aspect_name) VALUES (?, ?, ?, ?, ?, ?)",
+            (sku, question, why_it_matters, 1 if blocking else 0, now_iso(), aspect_name),
         )
         state = current_state(self.conn, sku)
         if blocking and state == ItemState.IDENTIFYING:
@@ -830,6 +961,26 @@ class Gateway:
                 sku, ItemState.NEEDS_INFO, command="AskOperator", detail=question[:120]
             )
         return Accepted("AskOperator", sku, state, state, question[:120])
+
+    def resume_identification(self, sku: str) -> Accepted:
+        """needs_info -> identifying, once nothing blocking is outstanding.
+
+        `answer_question` returns the item on its own when the last blocker is
+        cleared, but an item can also reach needs_info and have its questions
+        answered out of band. This is the way back that does not depend on which
+        command happened to clear the final one.
+        """
+        outstanding = unresolved_blocking_questions(self.conn, sku)
+        if outstanding:
+            raise Rejected(
+                "ResumeIdentification",
+                [f"blocking question unanswered: {q['question'][:80]}"
+                 for q in outstanding],
+            )
+        return self._transition(
+            sku, ItemState.IDENTIFYING, command="ResumeIdentification",
+            detail="all blocking questions answered",
+        )
 
     def begin_pricing(self, sku: str) -> Accepted:
         """identifying -> pricing.

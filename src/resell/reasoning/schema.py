@@ -85,6 +85,21 @@ MODES_REQUIRING_NEGATIVE_FINDING = frozenset(
 )
 
 
+class IdentityResolution(StrEnum):
+    """Whether anyone has tried to resolve the identifiers to a real product.
+
+    Separate from mode because two items can share a mode and be in materially
+    different positions: brand and line known with nobody having looked, versus
+    brand and line known after three lookups whose nearest candidate was examined
+    and rejected on a pattern mismatch. Downstream that matters -- comps for a
+    searched_not_found item should not retry the lookups that already failed.
+    """
+
+    UNATTEMPTED = "unattempted"
+    SEARCHED_NOT_FOUND = "searched_not_found"
+    RESOLVED = "resolved"
+
+
 class IdentifierScheme(StrEnum):
     UPC = "upc"
     EAN = "ean"

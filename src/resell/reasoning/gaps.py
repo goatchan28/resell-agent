@@ -66,6 +66,7 @@ class AspectOutcome:
     candidates: tuple[Candidate, ...]
     explanation: str
     values: tuple[str, ...] = ()
+    unsupported_reason: UnsupportedReason | None = None
 
     def __post_init__(self) -> None:
         if not self.values and self.value:
@@ -77,7 +78,11 @@ class AspectOutcome:
 
 
 def resolve_aspect(
-    aspect_name: str, candidates: list[Candidate], *, cardinality: str = "SINGLE"
+    aspect_name: str,
+    candidates: list[Candidate],
+    *,
+    cardinality: str = "SINGLE",
+    unsupported_reason: UnsupportedReason | None = None,
 ) -> AspectOutcome:
     """Decide whether an aspect is settled, and if not, why not.
 
@@ -104,9 +109,22 @@ def resolve_aspect(
     dropped_note = f" ({dropped} uncited candidate(s) discarded)" if dropped else ""
 
     if not supported:
+        detail = {
+            UnsupportedReason.NOT_OBSERVED:
+                f"nothing observed speaks to {aspect_name!r}",
+            UnsupportedReason.NOT_APPLICABLE:
+                f"{aspect_name!r} does not apply to this kind of object",
+            UnsupportedReason.NONE_APPLY:
+                f"evidence describes {aspect_name!r} but no allowed value is truthful",
+            UnsupportedReason.INSUFFICIENT_EVIDENCE:
+                f"something was observed but it does not name a value for {aspect_name!r}",
+        }.get(
+            unsupported_reason,
+            f"no evidence supports any value for {aspect_name!r}",
+        )
         return AspectOutcome(
             aspect_name, Resolution.UNSUPPORTED, None, tuple(candidates),
-            f"no evidence supports any value for {aspect_name!r}{dropped_note}",
+            f"{detail}{dropped_note}", unsupported_reason=unsupported_reason,
         )
 
     if len(supported) == 1:
@@ -185,6 +203,33 @@ def resolve_aspect(
 # --- gaps --------------------------------------------------------------------
 
 
+class UnsupportedReason(StrEnum):
+    """Why an aspect has no value. Three situations that used to look identical.
+
+    The distinction exists because `none_apply` is not evidence about the item at
+    all -- it is evidence about the category. A standalone suit jacket in a category
+    whose Style offers only "2 Piece", "3 Piece" and "Tuxedo" has no truthful value
+    available, and the pressure of a required field produces a least-wrong answer.
+    Asking the operator to supply a Style there wastes their time; the category is
+    the thing to question.
+    """
+
+    # Nothing in the photographs speaks to it.
+    NOT_OBSERVED = "not_observed"
+    # The property does not apply to this kind of object at all -- an inseam on a
+    # jacket. Weak evidence that the category is aimed at something broader.
+    NOT_APPLICABLE = "not_applicable"
+    # Evidence describes the property, but no allowed value is truthful. Strong
+    # evidence that the category is wrong.
+    NONE_APPLY = "none_apply"
+    # Something was observed, but not enough to name a value.
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+# Reasons that say something about the category rather than about the item.
+CATEGORY_SIGNALS = frozenset({UnsupportedReason.NONE_APPLY, UnsupportedReason.NOT_APPLICABLE})
+
+
 class GapAction(StrEnum):
     """What would close the gap. Determines how the question is worded."""
 
@@ -192,6 +237,9 @@ class GapAction(StrEnum):
     REQUEST_PHOTO = "request_photo"
     REQUEST_MEASUREMENT = "request_measurement"
     RESEARCH = "research"
+    # The aspect cannot be answered truthfully in this category. Forcing a value
+    # would be the failure; the category is what needs looking at.
+    REVIEW_CATEGORY = "review_category"
 
 
 @dataclass(frozen=True)
@@ -229,6 +277,28 @@ def gap_for(outcome: AspectOutcome) -> Gap | None:
             f"A closer photo of the relevant detail would settle it.",
         )
 
+    if outcome.unsupported_reason is UnsupportedReason.NONE_APPLY:
+        return Gap(
+            outcome.aspect_name, outcome.resolution, GapAction.REVIEW_CATEGORY,
+            f"{outcome.aspect_name} has no truthful value among this category's allowed "
+            f"options. This is a question about the category, not the item: forcing a "
+            f"least-wrong value here is exactly the failure to avoid.",
+        )
+
+    if outcome.unsupported_reason is UnsupportedReason.NOT_APPLICABLE:
+        return Gap(
+            outcome.aspect_name, outcome.resolution, GapAction.REVIEW_CATEGORY,
+            f"{outcome.aspect_name} does not apply to this object. A category "
+            f"requiring it may be aimed at something broader than this item.",
+        )
+
+    if outcome.unsupported_reason is UnsupportedReason.INSUFFICIENT_EVIDENCE:
+        return Gap(
+            outcome.aspect_name, outcome.resolution, GapAction.REQUEST_PHOTO,
+            f"{outcome.aspect_name} was partly observed but not enough to name a value. "
+            f"A closer photo of the relevant detail may settle it.",
+        )
+
     return Gap(
         outcome.aspect_name, outcome.resolution, GapAction.ASK_OPERATOR,
         f"Nothing observed supports a value for {outcome.aspect_name}. "
@@ -240,13 +310,16 @@ def analyse(
     required_aspects: list[str],
     candidates_by_aspect: dict[str, list[Candidate]],
     cardinality_by_aspect: dict[str, str] | None = None,
+    reasons_by_aspect: dict[str, UnsupportedReason] | None = None,
 ) -> tuple[list[AspectOutcome], list[Gap]]:
     """Resolve every required aspect and collect the gaps."""
     cardinality_by_aspect = cardinality_by_aspect or {}
+    reasons_by_aspect = reasons_by_aspect or {}
     outcomes = [
         resolve_aspect(
             name, candidates_by_aspect.get(name, []),
             cardinality=cardinality_by_aspect.get(name, "SINGLE"),
+            unsupported_reason=reasons_by_aspect.get(name),
         )
         for name in sorted(required_aspects)
     ]
@@ -318,39 +391,86 @@ def negative_finding_sufficient(
     return True, f"sufficient for {effort} effort: {policy.description}"
 
 
+# Preference order used only to name the best available mode in a message. Not a
+# ranking the code acts on: branded_generic and described_object describe different
+# situations rather than different amounts of the same thing.
+_MODE_PREFERENCE = (
+    IdentificationMode.EXACT_PRODUCT,
+    IdentificationMode.PRODUCT_FAMILY,
+    IdentificationMode.BRANDED_GENERIC,
+    IdentificationMode.DESCRIBED_OBJECT,
+)
+
+
 def mode_is_supported(
     mode: IdentificationMode,
     *,
     effort: IdentificationEffort,
     negative_finding: NegativeFinding | None,
     brand_support: tuple[EvidenceRef, ...] = (),
-    identifier_support: tuple[EvidenceRef, ...] = (),
+    line_support: tuple[EvidenceRef, ...] = (),
+    qualifying_match: bool = False,
 ) -> tuple[bool, str]:
     """Check that a declared mode is backed by what it claims.
 
-    Modes are conclusions and must be earned in both directions: exact_product
-    needs a positive identifier, and described_object needs a negative finding.
+    `exact_product` requires a *selected* external match, not merely that the item
+    carries identifiers. A check digit proves a transcription is well-formed; it
+    says nothing about which product the number denotes. Resolution is a separate
+    step and only something external supplies it -- which is the same reasoning the
+    matcher used when it rejected a near-identical Explorer jacket because its item
+    number did not match the swing tag. Unmatched identifiers cannot be grounds to
+    reject a candidate and grounds to claim identity at the same time.
+
+    The cost is real: an item whose manufacturer page no longer exists stays
+    product_family however legible its part number. That is preferable to a wrong
+    exact_product, which propagates into comps as a search for a SKU this item does
+    not have.
     """
     if mode is IdentificationMode.UNRESOLVED:
         return True, "unresolved makes no claim"
 
-    if mode is IdentificationMode.EXACT_PRODUCT and not identifier_support:
-        return False, (
-            "exact_product asserts a specific manufacturer product; cite an "
-            "identifier or a catalogue match, or use product_family"
-        )
-    if mode is IdentificationMode.PRODUCT_FAMILY and not brand_support:
-        return False, "product_family needs a cited brand"
-    if mode is IdentificationMode.BRANDED_GENERIC and not brand_support:
-        return False, "branded_generic needs a cited brand"
+    if mode is IdentificationMode.EXACT_PRODUCT:
+        if not qualifying_match:
+            return False, (
+                "exact_product requires a match to a specific catalogue product, of "
+                "identifier strength and from a source good enough to donate. "
+                "Identifiers on the item establish a family; they do not say which "
+                "product they denote."
+            )
+        return True, "a qualifying product match resolves this to a specific product"
 
-    if mode in MODES_REQUIRING_NEGATIVE_FINDING:
+    if mode is IdentificationMode.PRODUCT_FAMILY:
+        if not brand_support:
+            return False, "product_family needs a cited brand"
+        if not line_support:
+            return False, (
+                "product_family needs a cited product line or manufacturer code; with "
+                "a brand alone this is branded_generic"
+            )
+        return True, "brand and product line are cited"
+
+    if mode is IdentificationMode.BRANDED_GENERIC:
+        if not brand_support:
+            return False, "branded_generic needs a cited brand"
         ok, why = negative_finding_sufficient(effort, negative_finding)
         if not ok:
-            return False, f"{mode}: {why}"
-        return True, f"{mode}: {why}"
+            return False, (
+                f"branded_generic asserts no line or model is discoverable: {why}"
+            )
+        return True, f"brand cited, and {why}"
 
-    return True, f"{mode} is supported"
+    ok, why = negative_finding_sufficient(effort, negative_finding)
+    if not ok:
+        return False, f"{mode}: {why}"
+    return True, f"{mode}: {why}"
+
+
+def supported_modes(**kwargs) -> list[IdentificationMode]:
+    """Every mode the evidence earns, in preference order."""
+    return [
+        mode for mode in _MODE_PREFERENCE
+        if mode_is_supported(mode, **kwargs)[0]
+    ]
 
 
 # --- effort escalation -------------------------------------------------------
@@ -416,3 +536,202 @@ def escalation_policy(
         f"{current} -> {requested} is one step and is justified by evidence "
         f"{sorted(cited_evidence)}"
     )
+
+
+# --- category fit ------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CategoryFitSignals:
+    """What the mapping outcome says about the category, as counts rather than a score.
+
+    Deliberately NOT a single number. "Most aspects filled" is easy to compute and
+    actively misleading: a broad, wrong category can have fewer missing required
+    fields than the correct narrow one, because it demands less. Completeness ranks
+    categories by how little they ask, which is the opposite of what matters.
+
+    These counts are inputs to a judgment, not a substitute for one.
+    """
+
+    category_id: str
+    required_total: int
+    required_resolved: int
+    required_none_apply: tuple[str, ...]
+    required_not_applicable: tuple[str, ...]
+    required_not_observed: tuple[str, ...]
+    optional_not_applicable: tuple[str, ...]
+
+    @property
+    def has_untruthful_requirement(self) -> bool:
+        """A required field with no truthful option. The strongest signal available."""
+        return bool(self.required_none_apply)
+
+    def summary(self) -> str:
+        parts = [f"{self.required_resolved}/{self.required_total} required aspects resolved"]
+        if self.required_none_apply:
+            parts.append(
+                f"{len(self.required_none_apply)} required with NO truthful option "
+                f"({', '.join(self.required_none_apply)})"
+            )
+        if self.required_not_applicable:
+            parts.append(
+                f"{len(self.required_not_applicable)} required but inapplicable "
+                f"({', '.join(self.required_not_applicable)})"
+            )
+        if self.optional_not_applicable:
+            parts.append(
+                f"{len(self.optional_not_applicable)} optional aspects belong to a "
+                "different kind of object"
+            )
+        return "; ".join(parts)
+
+
+def category_fit_signals(
+    category_id: str, outcomes: list[AspectOutcome], required_names: set[str]
+) -> CategoryFitSignals:
+    def named(reason: UnsupportedReason, required: bool) -> tuple[str, ...]:
+        return tuple(
+            o.aspect_name for o in outcomes
+            if o.unsupported_reason is reason
+            and ((o.aspect_name in required_names) is required)
+        )
+
+    return CategoryFitSignals(
+        category_id=category_id,
+        required_total=len(required_names),
+        required_resolved=sum(
+            1 for o in outcomes
+            if o.aspect_name in required_names and not o.blocking
+        ),
+        required_none_apply=named(UnsupportedReason.NONE_APPLY, True),
+        required_not_applicable=named(UnsupportedReason.NOT_APPLICABLE, True),
+        required_not_observed=named(UnsupportedReason.NOT_OBSERVED, True),
+        optional_not_applicable=named(UnsupportedReason.NOT_APPLICABLE, False),
+    )
+
+
+def category_review_advice(signals: CategoryFitSignals) -> str:
+    """What the signals warrant saying. Never "use category X instead"."""
+    if signals.has_untruthful_requirement:
+        return (
+            f"Category {signals.category_id} requires "
+            f"{', '.join(signals.required_none_apply)}, and the evidence supports no "
+            "truthful value among the allowed options. That is a category problem. "
+            "Review alternatives before supplying a value; the aspects mapped so far "
+            "belong to this category's form and will need re-mapping if it changes."
+        )
+    if len(signals.optional_not_applicable) >= 3:
+        return (
+            f"Category {signals.category_id} carries "
+            f"{len(signals.optional_not_applicable)} aspects that do not apply to this "
+            "object, which suggests it covers a broader class. A narrower category may "
+            "fit better, though a broader one is not necessarily wrong."
+        )
+    return f"Nothing in the mapping outcome argues against category {signals.category_id}."
+
+
+# --- value substitution ------------------------------------------------------
+
+
+# The same thing under another name. Marketplaces standardise on one term and tags
+# print another, so a value can be absent from the allowed list while the fibre is
+# very much present. Restricted to pairs that denote an identical material -- this
+# is a translation table, not a similarity one. Elastane and elastodiene are NOT
+# here: one is polyurethane-based and the other rubber-based.
+VALUE_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "spandex": ("elastane", "lycra"),
+    "viscose": ("rayon",),
+    "nylon": ("polyamide",),
+    "acrylic": ("polyacrylic",),
+    "lyocell": ("tencel",),
+    "faux leather": ("pu leather", "synthetic leather", "pleather"),
+    "flax": ("linen",),
+}
+
+
+def value_appears_in(value: str, text: str) -> str | None:
+    """Whether a value is present in some text, directly or under another name."""
+    folded = text.casefold()
+    if value.casefold() in folded:
+        return value
+    for alias in VALUE_SYNONYMS.get(value.casefold(), ()):
+        if alias in folded:
+            return alias
+    return None
+
+
+def synonym_for(read_term: str, allowed_values: tuple[str, ...]) -> str | None:
+    """The allowed value denoting the same thing as a term read off the item."""
+    folded = read_term.casefold()
+    for allowed in allowed_values:
+        if folded in VALUE_SYNONYMS.get(allowed.casefold(), ()):
+            return allowed
+    return None
+
+
+def detect_value_substitution(
+    aspect_name: str,
+    value: str,
+    cited_text: str,
+    allowed_values: tuple[str, ...],
+) -> str | None:
+    """Catch an allowed value quietly replacing the one actually read.
+
+    The case this exists for: an observation transcribed "4% Elastane" from a swing
+    tag, and the mapping returned Material = Elastodiene. Both are legal eBay
+    values, the citation was real, and elastodiene is a chemically different fibre --
+    rubber-based rather than polyurethane. Nothing else in the pipeline could catch
+    it: the value was permitted, the evidence existed, and only someone who knows
+    textiles would notice.
+
+    The rule is narrow on purpose. It fires only when the proposed value is absent
+    from the cited evidence AND a *different* allowed value is present in it, which
+    is the signature of a swap rather than of paraphrase or inference. "Navy" cited
+    from "navy blue" is fine; "Men" from "men's jacket" is fine; anything the
+    evidence does not name at all is left to the other checks.
+    """
+    if not allowed_values:
+        return None
+    haystack = cited_text.casefold()
+    # A value the evidence names under a different word is not a substitution. The
+    # tag reads "Elastane" and eBay calls it "Spandex"; the fibre is the same one.
+    if value_appears_in(value, cited_text):
+        return None
+
+    alternatives = [
+        allowed for allowed in allowed_values
+        if allowed.casefold() != value.casefold()
+        and len(allowed) > 3
+        and value_appears_in(allowed, cited_text)
+    ]
+    if not alternatives:
+        return None
+    # Name every allowed value the evidence does contain, rather than the first one
+    # found: on a multi-valued aspect the others are usually the sibling values, and
+    # picking one arbitrarily would point at the wrong thing.
+    named = ", ".join(repr(a) for a in alternatives)
+    return (
+        f"{aspect_name}: {value!r} does not appear in the cited evidence, which names "
+        f"{named}. All are allowed values, so nothing else would catch this -- where "
+        f"they mean different things, the evidence wins."
+    )
+
+
+def missing_synonyms(cited_text: str, allowed_values: tuple[str, ...],
+                     proposed: set[str]) -> list[str]:
+    """Allowed values the evidence names under another word but nobody proposed.
+
+    The gap this closes: the tag says Elastane, eBay offers Spandex, and the model
+    proposed neither -- so a fibre that is genuinely present and genuinely listable
+    simply vanished. Reported rather than added, because deciding an item is made of
+    something is not a thing to do silently.
+    """
+    folded = {p.casefold() for p in proposed}
+    found = []
+    for allowed in allowed_values:
+        if allowed.casefold() in folded:
+            continue
+        alias = value_appears_in(allowed, cited_text)
+        if alias and alias.casefold() != allowed.casefold():
+            found.append(f"{allowed} (the evidence says {alias!r})")
+    return found

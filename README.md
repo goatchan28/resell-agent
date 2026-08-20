@@ -519,6 +519,53 @@ or not it can see a size. Observation describes; a later stage maps observations
 onto eBay's form. Targeted follow-up passes handle the case where gap analysis
 finds something specific worth a closer look. There is a test pinning the absence.
 
+### Identification research
+
+```bash
+uv run resell item research MP-000003 --dry-run   # plan only; fetches nothing
+uv run resell item research MP-000003
+uv run resell item map-aspects MP-000003          # now able to cite what was found
+```
+
+Planning comes before browsing, structurally: nothing is fetched until a plan
+exists, every lookup must cite the observations that motivate it, and a query
+already performed for this item is dropped. `--dry-run` stops after planning.
+
+**The planner may conclude that searching is pointless.** "The brand is established
+from the pocket label and no model number appears on any examined surface, so
+searching for one will not find it" ends the round with a recorded reason. A
+well-supported `described_object` never spends a lookup.
+
+**Two budgets.** Planning and matching are inference (`StageBudget`); lookups are
+retrieval (`LookupBudget`), scoped separately for identity and pricing. A plan too
+large for the budget is trimmed to its most valuable prefix, and the deferred
+lookups are written to the event log with their motivations so they can be
+re-planned rather than forgotten.
+
+**Found is not selected.** The matcher can claim a match that is still not selected,
+because a `similarity` claim donates nothing even from the manufacturer's own site.
+Non-matches are recorded with what ruled them out — a loop that always selects will
+always find something, and what it finds will increasingly be whatever it hoped for.
+
+**What a candidate may contribute is computed, never claimed.** Donation depends on
+identifier strength and source authority together; the model's rationale is stored
+for a human and read by no code path. The same claim with the same wording donates
+attributes from a manufacturer page and nothing from a reseller's. Authority comes
+from the retrieved document, so the matcher cannot grade its own sources.
+
+**Retrieval provenance is separate from source.** `source_url` and `source_authority`
+record what is claimed; `retrieval_method` records who is claiming it. When an
+operator reads a page and types what it says, the system has verified nothing — that
+may still be the most reliable route available, but it must never be
+indistinguishable from a fetch. `ManualResearchAdapter` says so before you type, the
+record stores `operator_transcribed`, and the matcher sees it.
+
+No eBay adapter exists. Their agreement restricts ingesting Restricted API data into
+a third-party AI without written consent, and their user agreement prohibits
+LLM-driven scraping of the site. A Catalog adapter can be added once that is answered
+in writing; nothing depends on it.
+
 ## Next
 
-Aspect mapping with citations, then comps and pricing.
+Comps and pricing — under the same licence constraint, which may mean eBay data
+informs the floor deterministically without ever entering a prompt.

@@ -37,6 +37,7 @@ from resell.reasoning.stages import (
     StageResult,
     mapping_stage,
     render_aspect_form,
+    render_donated_facts,
     render_observations,
 )
 from resell.reasoning.tools import MappingProposal, parse_map_tool_input
@@ -114,10 +115,14 @@ def map_aspects(
     spent = spent or StageSpend()
     rates = adapter.rates()
 
+    from resell.gateway import citable_candidate_evidence
+
+    citable = citable_candidate_evidence(conn, sku)
     request = mapping_stage(
         render_aspect_form(specs),
         render_observations(observations),
         max_output_tokens=budget.max_output_tokens,
+        donated=render_donated_facts(conn, citable),
     )
     estimate = estimate_cost(adapter.estimate_input_tokens(request), budget, rates)
     check(budget, spent, estimate)
@@ -136,15 +141,59 @@ def map_aspects(
 
     cost = rates.cost_micros(result.usage.input_tokens, result.usage.output_tokens)
     in_scope = {row["id"] for row in observations}
-    proposal = parse_map_tool_input(result.tool_input, valid_evidence_ids=in_scope)
+    proposal = parse_map_tool_input(
+        result.tool_input, valid_evidence_ids=in_scope, citable_candidates=citable
+    )
+
+    # Before resolving, catch a permitted value standing in for the one that was
+    # actually read. This must happen here rather than at publish: by then the
+    # substitution has been approved and looks like a decision.
+    from resell.reasoning.gaps import detect_value_substitution
+
+    allowed_by_aspect = {spec.name: spec.allowed_values for spec in specs}
+    text_by_id = {
+        row["id"]: str(row["payload"]) for row in observations
+    }
+    filtered: dict[str, list] = {}
+    for name, candidates in proposal.candidates_by_aspect.items():
+        kept = []
+        for candidate in candidates:
+            cited_text = " ".join(
+                text_by_id.get(ref.evidence_id, "") for ref in candidate.support
+            )
+            swap = detect_value_substitution(
+                name, candidate.value, cited_text, allowed_by_aspect.get(name, ())
+            )
+            if swap:
+                proposal.malformed.append(swap)
+                continue
+            kept.append(candidate)
+        filtered[name] = kept
+
+        # A value the evidence names under another word, that nobody proposed, is a
+        # fibre or finish quietly dropped from the listing. Reported, not added.
+        from resell.reasoning.gaps import missing_synonyms
+
+        overlooked = missing_synonyms(
+            " ".join(text_by_id.values()),
+            allowed_by_aspect.get(name, ()),
+            {c.value for c in kept},
+        )
+        for entry in overlooked:
+            proposal.malformed.append(
+                f"{name}: {entry} is an allowed value the evidence supports but "
+                f"nothing proposed it"
+            )
 
     resolved = {
         name: _rehydrate_basis(conn, candidates)
-        for name, candidates in proposal.candidates_by_aspect.items()
+        for name, candidates in filtered.items()
     }
     required_names = [spec.name for spec in specs if spec.required]
     cardinality = {spec.name: spec.cardinality for spec in specs}
-    outcomes, gaps = analyse(required_names, resolved, cardinality)
+    outcomes, gaps = analyse(
+        required_names, resolved, cardinality, proposal.reasons_by_aspect
+    )
 
     # Optional aspects are resolved too, but a gap on one does not block.
     for spec in specs:
@@ -153,7 +202,8 @@ def map_aspects(
         from resell.reasoning.gaps import resolve_aspect
 
         outcome = resolve_aspect(
-            spec.name, resolved[spec.name], cardinality=spec.cardinality
+            spec.name, resolved[spec.name], cardinality=spec.cardinality,
+            unsupported_reason=proposal.reasons_by_aspect.get(spec.name),
         )
         outcomes.append(outcome)
         optional_gap = gap_for(outcome)

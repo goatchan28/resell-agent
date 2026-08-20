@@ -149,3 +149,120 @@ def check(budget: StageBudget, spent: StageSpend, estimate: CostEstimate) -> Non
 
 def _money(micros: int) -> str:
     return f"${micros / 1_000_000:.4f}"
+
+
+# --- retrieval budget --------------------------------------------------------
+#
+# Research has two cost dimensions, and conflating them hides one of them. The
+# planning and matching calls are inference and use StageBudget like any other
+# stage. The lookups themselves are retrieval: separate provider, separate price,
+# separate limit. An agent that plans cheaply and then fetches forty pages has
+# stayed inside its inference budget and spent real money.
+
+
+@dataclass(frozen=True)
+class LookupRates:
+    """Cost per retrieval, in micros. Same provenance discipline as token rates."""
+
+    micros_per_lookup: int = 5000
+    basis: RateBasis = RateBasis.PROVISIONAL_ESTIMATE
+    source: str = "placeholder; set RESELL_RATE_LOOKUP_MICROS from your provider"
+
+    @classmethod
+    def from_env(cls, provider: str) -> LookupRates:
+        raw = os.environ.get("RESELL_RATE_LOOKUP_MICROS")
+        if raw:
+            return cls(
+                micros_per_lookup=int(raw),
+                basis=RateBasis.CONFIGURED,
+                source=f"environment, for {provider}",
+            )
+        return cls()
+
+
+@dataclass(frozen=True)
+class LookupBudget:
+    """Retrieval limits for one research scope on one item.
+
+    Scoped like identification effort is: identity research and pricing research get
+    separate allowances, so a hard-to-identify item cannot quietly consume the comp
+    budget before pricing has started.
+    """
+
+    scope: str = "identity"
+    max_lookups: int = 6
+    max_cost_micros: int = 60_000
+
+    @classmethod
+    def from_env(cls, scope: str = "identity") -> LookupBudget:
+        prefix = f"RESELL_LOOKUP_{scope.upper()}"
+        return cls(
+            scope=scope,
+            max_lookups=int(os.environ.get(f"{prefix}_MAX", cls.max_lookups)),
+            max_cost_micros=int(
+                os.environ.get(f"{prefix}_MAX_COST_MICROS", cls.max_cost_micros)
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class LookupSpend:
+    lookups: int = 0
+    cost_micros: int = 0
+
+
+@dataclass(frozen=True)
+class LookupAllocation:
+    """What the budget permits of a plan, and what it withheld.
+
+    `deferred` exists because trimming a plan silently makes the plan a fiction. The
+    agent proposed six lookups and two ran; the other four were a judgment about
+    what would help, and discarding them without record loses both the judgment and
+    the reason it was overruled. They are re-plannable later when budget allows.
+    """
+
+    allowed: int
+    deferred: tuple[int, ...]          # indices into the original plan
+    reason: str
+    trimmed: bool = False
+
+
+def check_lookup_plan(
+    budget: LookupBudget, spent: LookupSpend, planned: int, rates: LookupRates
+) -> LookupAllocation:
+    """How many of the planned lookups may proceed, and which were withheld.
+
+    Trims rather than refuses. A plan of six lookups with room for two should run the
+    two most valuable, not be rejected wholesale -- the planner orders them, so the
+    prefix is the useful part. What is withheld is recorded, not dropped.
+    """
+    remaining_calls = budget.max_lookups - spent.lookups
+    if remaining_calls <= 0:
+        return LookupAllocation(
+            0, tuple(range(planned)),
+            f"lookup limit reached: {spent.lookups} of {budget.max_lookups} performed "
+            f"for {budget.scope} research on this item",
+            trimmed=planned > 0,
+        )
+
+    remaining_micros = budget.max_cost_micros - spent.cost_micros
+    affordable = remaining_micros // max(rates.micros_per_lookup, 1)
+    allowed = max(0, min(planned, remaining_calls, affordable))
+
+    if allowed == 0:
+        return LookupAllocation(
+            0, tuple(range(planned)),
+            f"{_money(remaining_micros)} remaining will not cover a lookup at "
+            f"{_money(rates.micros_per_lookup)} each (rate basis: {rates.basis})",
+            trimmed=planned > 0,
+        )
+    if allowed < planned:
+        return LookupAllocation(
+            allowed, tuple(range(allowed, planned)),
+            f"{planned} lookups planned, {allowed} affordable: "
+            f"{remaining_calls} call(s) and {_money(remaining_micros)} remaining",
+            trimmed=True,
+        )
+    return LookupAllocation(
+        allowed, (), f"all {planned} planned lookups are within budget"
+    )

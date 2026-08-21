@@ -33,6 +33,23 @@ def db() -> sqlite3.Connection:
     conn.execute("INSERT INTO item VALUES ('MP-000003', 'listed')")
     sp.apply_schema(conn)
     conn.execute("PRAGMA foreign_keys = ON")
+    # apply_price only runs against a published item, so the fixture carries a
+    # listing row. Without one the test exercised a state the system cannot be in.
+    conn.executescript(
+        """
+        CREATE TABLE listing (
+            sku TEXT, marketplace TEXT, environment TEXT, active INTEGER,
+            offer_id TEXT, listing_id TEXT, price_cents INTEGER,
+            buyer_shipping_charge_cents INTEGER DEFAULT 0,
+            fee_rate_used REAL, fee_fixed_cents_used INTEGER,
+            estimated_fees_cents INTEGER, updated_at TEXT
+        );
+        INSERT INTO listing VALUES
+            ('MP-000003','EBAY_US','sandbox',1,'offer-88231','110588123456',
+             11200, 0, 0.1335, 40, 1535, '2026-08-21');
+        """
+    )
+    conn.commit()
     return conn
 
 
@@ -350,11 +367,13 @@ def test_reading_the_state_of_a_missing_item_raises():
 
 
 def _listing_table(conn, rows):
-    conn.execute(
-        """CREATE TABLE listing (sku TEXT, active INTEGER, environment TEXT,
-               marketplace TEXT, offer_id TEXT, listing_id TEXT)"""
+    """Replace the fixture's listing rows; db() owns the table."""
+    conn.execute("DELETE FROM listing")
+    conn.executemany(
+        "INSERT INTO listing (sku, active, environment, marketplace, offer_id, "
+        "listing_id) VALUES (?,?,?,?,?,?)",
+        rows,
     )
-    conn.executemany("INSERT INTO listing VALUES (?,?,?,?,?,?)", rows)
     conn.commit()
 
 

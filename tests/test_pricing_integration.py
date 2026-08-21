@@ -316,19 +316,15 @@ def test_an_initial_price_cannot_be_applied_before_publish(item_with_comps: str,
 # --- the duplicate price authority ---------------------------------------------------------
 
 
-def test_the_item_layer_does_not_check_the_price_the_pricing_layer_approved(
+def test_the_item_layer_now_enforces_the_approved_price(
     item_with_comps: str, capsys
 ):
-    """Characterisation test for a known seam. Expected to fail once it is fixed.
+    """This replaces a characterisation test that asserted the opposite.
 
-    `item propose --price-cents` and `price propose` are two hash-bound approvals
-    over the same number, and nothing reconciles them. Whichever the publisher
-    reads is the one that reaches eBay; the other is decoration.
-
-    This asserts the seam rather than the desired behaviour: passing a price the
-    pricing layer never approved is rejected for provisioning reasons only, never
-    for disagreeing. When `item propose` learns to read the approved price, the
-    second half of this test starts failing, which is the point.
+    It used to document that `item propose --price-cents` and `price approve`
+    were independent authorities: a price the pricing layer never approved was
+    rejected only for missing seller policies, never for disagreeing. That test
+    was written to fail once the seam closed, and it did.
     """
     sku = item_with_comps
     proposal_id, approved_price = _propose_balanced(sku, capsys)
@@ -340,14 +336,26 @@ def test_the_item_layer_does_not_check_the_price_the_pricing_layer_approved(
               "--description", "Navy slim-fit blazer, new with tags.",
               "--category", CATEGORY, "--condition", CONDITION_NWT]
 
-    _, agreeing = run(capsys, *common, "--price-cents", str(approved_price))
     _, disagreeing = run(capsys, *common, "--price-cents", "1")
+    assert "does not match the approved price" in disagreeing
 
-    # Both are blocked, and by the same thing: seller provisioning, not price.
-    for text in (agreeing, disagreeing):
-        assert "policy_id is not resolved" in text
-    assert "price" not in disagreeing.lower().replace("--price-cents", "")
+    # The agreeing price gets past the price gate and is stopped only by the
+    # seller provisioning this environment lacks -- which is the point: price is
+    # no longer one of the reasons.
+    _, agreeing = run(capsys, *common, "--price-cents", str(approved_price))
+    assert "does not match the approved price" not in agreeing
+    assert "policy_id is not resolved" in agreeing
 
-    # Neither reached `proposed`, so the pricing approval is still the only
-    # authority that has actually been exercised.
     assert db_value("SELECT state FROM item WHERE sku = ?", sku) == "pricing"
+
+
+def test_listing_content_cannot_be_proposed_without_an_approved_price(
+    item_with_comps: str, capsys
+):
+    """Pricing is now a precondition of listing content, not a parallel record."""
+    sku = item_with_comps
+    _, text = run(capsys, "item", "propose", sku, "--price-cents", "11200",
+                  "--shipping-terms", "seller_paid", "--seller-shipping-cents", "900",
+                  "--title", "Explorer Slim blazer", "--description", "Navy.",
+                  "--category", CATEGORY, "--condition", CONDITION_NWT)
+    assert "no approved price for this item" in text

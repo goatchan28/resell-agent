@@ -451,7 +451,112 @@ def record_applied(
            proposal.price_cents, marketplace_ref=marketplace_ref)
     _set_state(conn, proposal.sku, PriceState.LIVE,
                proposal_id=proposal.proposal_id, price_cents=proposal.price_cents)
+    _sync_listing_price(conn, proposal.sku, proposal.price_cents)
     conn.commit()
+
+
+def approved_price_cents(conn: sqlite3.Connection, sku: str) -> int | None:
+    """The price this item currently has approval to charge, or None.
+
+    The most recent proposal carrying a live approval that still covers it. A
+    proposal whose content changed after approval does not count -- the approval
+    is bound to a hash, and a hash that no longer matches is not an approval.
+    """
+    rows = conn.execute(
+        "SELECT proposal_id FROM price_proposal WHERE sku = ? "
+        "ORDER BY created_at DESC, rowid DESC",
+        (sku,),
+    ).fetchall()
+    for row in rows:
+        proposal = load_proposal(conn, row["proposal_id"])
+        if proposal is None:
+            continue
+        approval = live_approval(conn, proposal.proposal_id)
+        if approval is not None and approval.covers(proposal):
+            return proposal.price_cents
+    return None
+
+
+def listing_price_drift(conn: sqlite3.Connection, sku: str) -> tuple[int, int] | None:
+    """(authoritative, cached) when the listing row disagrees, else None.
+
+    `item_price_state.live_price_cents` is what the pricing layer confirmed against
+    the marketplace. `listing.price_cents` is a cache of it. Read-only.
+    """
+    state = conn.execute(
+        "SELECT live_price_cents FROM item_price_state WHERE sku = ?", (sku,)
+    ).fetchone()
+    row = conn.execute(
+        "SELECT price_cents FROM listing WHERE sku = ? AND active = 1", (sku,)
+    ).fetchone()
+    if state is None or row is None or state["live_price_cents"] is None:
+        return None
+    if state["live_price_cents"] == row["price_cents"]:
+        return None
+    return state["live_price_cents"], row["price_cents"]
+
+
+def reconcile_listing_price(conn: sqlite3.Connection, sku: str) -> str:
+    """Bring the listing cache into line with the confirmed live price.
+
+    Needed because `record_applied` only gained the sync after prices had already
+    been applied, leaving rows written before that stale -- and `apply` correctly
+    refuses to do anything for a proposal already marked applied. Weakening that
+    idempotency to force a cache update would trade a real guarantee for a
+    migration convenience; a separate operation costs nothing and says what it is.
+
+    Purely local. The authoritative value was already confirmed against eBay when
+    it was applied; this does not call the marketplace and cannot invent a price.
+    """
+    drift = listing_price_drift(conn, sku)
+    if drift is None:
+        return f"{sku}: listing cache already agrees"
+    authoritative, cached = drift
+    _sync_listing_price(conn, sku, authoritative)
+    conn.commit()
+    return (
+        f"{sku}: listing cache {cached} -> {authoritative} "
+        f"(from the confirmed live price)"
+    )
+
+
+def skus_with_listing_price_drift(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT sku FROM item_price_state WHERE live_price_cents IS NOT NULL"
+    ).fetchall()
+    return [r["sku"] for r in rows if listing_price_drift(conn, r["sku"])]
+
+
+def _sync_listing_price(conn: sqlite3.Connection, sku: str, price_cents: int) -> None:
+    """Keep listing.price_cents meaning "the price currently on the marketplace".
+
+    That column is read by the publisher when building an offer, so leaving it at
+    whatever was proposed originally means a relist would send a price the item
+    has not carried for weeks. It is a derived cache of the pricing layer's
+    answer, and this is its only writer.
+
+    estimated_fees_cents is recomputed from fee_rate_used and fee_fixed_cents_used
+    -- the columns stored beside it at proposal time -- so the row stays internally
+    consistent rather than pairing a new price with fees for the old one.
+    """
+    row = conn.execute(
+        "SELECT buyer_shipping_charge_cents, fee_rate_used, fee_fixed_cents_used "
+        "FROM listing WHERE sku = ? AND active = 1",
+        (sku,),
+    ).fetchone()
+    if row is None:
+        return
+
+    fees = None
+    if row["fee_rate_used"] is not None:
+        base = price_cents + (row["buyer_shipping_charge_cents"] or 0)
+        fees = round(base * row["fee_rate_used"]) + (row["fee_fixed_cents_used"] or 0)
+
+    conn.execute(
+        "UPDATE listing SET price_cents = ?, estimated_fees_cents = ?, updated_at = ? "
+        "WHERE sku = ? AND active = 1",
+        (price_cents, fees, _now(), sku),
+    )
 
 
 def already_applied(conn: sqlite3.Connection, proposal_id: str) -> bool:

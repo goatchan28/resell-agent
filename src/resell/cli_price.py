@@ -411,6 +411,30 @@ def _print_diff(diff) -> None:
         print("  WARNING  this would change more than the price; do not send it")
 
 
+def cmd_reconcile(args, conn: sqlite3.Connection) -> int:
+    """Make derived caches agree with the confirmed live price. No eBay calls."""
+    skus = [args.sku] if args.sku else sp.skus_with_listing_price_drift(conn)
+    if not skus:
+        print("nothing to reconcile")
+        return 0
+
+    if args.check:
+        drifted = 0
+        for sku in skus:
+            drift = sp.listing_price_drift(conn, sku)
+            if drift:
+                print(f"{sku}: listing cache says {_money(drift[1])}, "
+                      f"confirmed live price is {_money(drift[0])}")
+                drifted += 1
+        if not drifted:
+            print("no drift")
+        return 1 if drifted else 0
+
+    for sku in skus:
+        print(sp.reconcile_listing_price(conn, sku))
+    return 0
+
+
 def cmd_history(args, conn: sqlite3.Connection) -> int:
     for e in sp.price_history(conn, args.sku):
         ref = f"  {e['marketplace_ref']}" if e["marketplace_ref"] else ""
@@ -614,6 +638,15 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--no-confirm", action="store_true",
                    help="skip the confirming read; a 200 is not evidence")
     c.set_defaults(fn=cmd_apply)
+
+    c = sub.add_parser(
+        "reconcile",
+        help="make the listing price cache agree with the confirmed live price",
+    )
+    c.add_argument("sku", nargs="?", help="omit to scan every item")
+    c.add_argument("--check", action="store_true",
+                   help="report drift and exit non-zero; change nothing")
+    c.set_defaults(fn=cmd_reconcile)
 
     c = sub.add_parser("history", help="the append-only price history")
     c.add_argument("sku")

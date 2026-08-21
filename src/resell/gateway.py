@@ -1016,6 +1016,29 @@ class Gateway:
         if proposal.sku != sku:
             reasons.append(f"proposal sku {proposal.sku} does not match {sku}")
 
+        # The pricing layer owns price. Before this check, `item propose
+        # --price-cents` and `price approve` were two independent authorities over
+        # the same number and nothing reconciled them -- whichever the publisher
+        # read is what reached eBay, and the other was decoration.
+        #
+        # Imported here rather than at module scope to keep the gateway's import
+        # graph shallow; the pricing layer is a peer, not a dependency of the
+        # state machine itself.
+        from resell.store_pricing import approved_price_cents
+
+        approved = approved_price_cents(self.conn, sku)
+        if approved is None:
+            reasons.append(
+                "no approved price for this item; price it first with "
+                "`resell price recommend`, `resell price propose --objective ...` "
+                "and `resell price approve`"
+            )
+        elif proposal.price_cents != approved:
+            reasons.append(
+                f"price {proposal.price_cents} does not match the approved price "
+                f"{approved}; approve a new price rather than typing a different one"
+            )
+
         photos = validated_photos(self.conn, sku)
         known = {photo["content_sha256"] for photo in photos}
         for digest in proposal.photo_hashes:

@@ -311,7 +311,20 @@ class Proposal:
     merchant_location_key: str
 
     def canonical(self) -> str:
-        """Stable serialisation. Key order and list order must not affect the hash."""
+        """Stable serialisation. Key order and list order must not affect the hash.
+
+        `price_cents` is deliberately absent. This hash is what a listing approval
+        binds, and a listing approval is an approval of *content*: the title, the
+        description, the category, the condition, the aspects, the photos and the
+        policies. Price has its own approval with its own hash in the pricing
+        layer, and it is expected to change after publication.
+
+        Hashing price here would mean every markdown voided the approval of a
+        title nobody had touched, which is the coupling the two-approval design
+        exists to remove. The field remains on the Proposal -- validate() still
+        checks it against the publication floor, and the listing row still stores
+        it -- it simply is not part of what the operator approved.
+        """
         return json.dumps(
             {
                 "sku": self.sku,
@@ -321,7 +334,6 @@ class Proposal:
                 "category_id": self.category_id,
                 "condition_id": self.condition_id,
                 "aspects": {k: sorted(v) for k, v in sorted(self.aspects.items())},
-                "price_cents": self.price_cents,
                 "currency": self.currency,
                 "shipping_terms": str(self.shipping_terms),
                 "seller_shipping_cost_cents": self.seller_shipping_cost_cents,

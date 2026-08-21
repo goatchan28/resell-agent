@@ -572,6 +572,10 @@ def connect(db_path: Path) -> sqlite3.Connection:
         db_path.chmod(0o600)
 
     _migrate(conn)
+
+    from resell.migrate import migrate as migrate_pricing
+
+    migrate_pricing(conn)
     return conn
 
 

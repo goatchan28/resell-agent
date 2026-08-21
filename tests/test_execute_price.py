@@ -94,6 +94,25 @@ def db() -> sqlite3.Connection:
     conn.execute("CREATE TABLE item (sku TEXT PRIMARY KEY, state TEXT)")
     conn.execute("INSERT INTO item VALUES ('MP-000003','listed')")
     sp.apply_schema(conn)
+    # apply_price only ever runs against a published item, so the fixture carries a
+    # listing row. Without one the test was exercising a state the system cannot
+    # actually be in -- which is why the missing table surfaced as an error rather
+    # than as a caught condition.
+    conn.executescript(
+        """
+        CREATE TABLE listing (
+            sku TEXT, marketplace TEXT, environment TEXT, active INTEGER,
+            offer_id TEXT, listing_id TEXT, price_cents INTEGER,
+            buyer_shipping_charge_cents INTEGER DEFAULT 0,
+            fee_rate_used REAL, fee_fixed_cents_used INTEGER,
+            estimated_fees_cents INTEGER, updated_at TEXT
+        );
+        INSERT INTO listing VALUES
+            ('MP-000003','EBAY_US','sandbox',1,'offer-88231','110588123456',
+             11200, 0, 0.1335, 40, 1535, '2026-08-21');
+        """
+    )
+    conn.commit()
     return conn
 
 

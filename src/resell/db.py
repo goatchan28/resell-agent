@@ -545,6 +545,9 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
     # "asked about Type, which has since resolved to Suit Jacket" rather than being
     # asked again about something already settled.
     ("ALTER TABLE open_question ADD COLUMN aspect_name TEXT",),
+    # Values eBay listed for the aspect when the question was asked,
+    # so an answer can be validated without a Taxonomy call.
+    ("ALTER TABLE open_question ADD COLUMN allowed_values_json TEXT",),
 )
 
 

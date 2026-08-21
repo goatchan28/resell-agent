@@ -945,15 +945,22 @@ class Gateway:
     def ask_operator(
         self, sku: str, *, question: str, why_it_matters: str = "",
         blocking: bool = True, aspect_name: str | None = None,
+        allowed_values: tuple[str, ...] | None = None,
     ) -> Accepted:
-        """The operator-as-tool call. A blocking question moves the item to needs_info."""
+        """The operator-as-tool call. A blocking question moves the item to needs_info.
+
+        `allowed_values` is eBay's list for the aspect, captured now so the answer
+        can be checked later without a Taxonomy call. Empty for FREE_TEXT aspects
+        and for anything that is not about an aspect at all.
+        """
         if not question.strip():
             raise Rejected("AskOperator", ["question is empty"])
         get_item(self.conn, sku)
         self.conn.execute(
             "INSERT INTO open_question (sku, question, why_it_matters, blocking, "
-            "asked_at, aspect_name) VALUES (?, ?, ?, ?, ?, ?)",
-            (sku, question, why_it_matters, 1 if blocking else 0, now_iso(), aspect_name),
+            "asked_at, aspect_name, allowed_values_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sku, question, why_it_matters, 1 if blocking else 0, now_iso(), aspect_name,
+             json.dumps(list(allowed_values)) if allowed_values else None),
         )
         state = current_state(self.conn, sku)
         if blocking and state == ItemState.IDENTIFYING:
@@ -1116,8 +1123,22 @@ class Gateway:
 
     # --- operator-only commands ---------------------------------------------
 
-    def answer_question(self, question_id: int, answer: str, *, operator: bool = False) -> Accepted:
-        """Operator-only. Answering own questions would defeat the whole loop."""
+    def answer_question(
+        self, question_id: int, answer: str, *, operator: bool = False,
+        value_not_listed: bool = False,
+    ) -> Accepted:
+        """Operator-only. Answering own questions would defeat the whole loop.
+
+        When the question carries eBay's allowed values, an answer outside them is
+        refused. `value_not_listed` overrides that -- eBay does not guarantee its
+        value list is exhaustive -- and the override is written into the evidence
+        payload along with the list as it stood, so a disagreement with eBay is an
+        operator decision on the record rather than an invisible exception.
+
+        An answer about an aspect also becomes an aspect_candidate citing this
+        evidence row, which is what lets resolution treat it as an adjudication
+        instead of filing it and carrying on.
+        """
         if not operator:
             raise Rejected("AnswerQuestion", ["only the operator may answer a question"])
         if not answer.strip():
@@ -1132,18 +1153,68 @@ class Gateway:
             raise Rejected("AnswerQuestion", [f"question {question_id} is already answered"])
 
         sku = row["sku"]
+        value = answer.strip()
+
+        keys = row.keys()
+        allowed = (
+            json.loads(row["allowed_values_json"])
+            if "allowed_values_json" in keys and row["allowed_values_json"]
+            else []
+        )
+        from resell.domain import values_not_in_allowed
+
+        unlisted = values_not_in_allowed(allowed, [value]) if allowed else []
+        if unlisted and not value_not_listed:
+            shown = ", ".join(allowed[:12])
+            more = "" if len(allowed) <= 12 else f", and {len(allowed) - 12} more"
+            raise Rejected("AnswerQuestion", [
+                f"{value!r} is not one of the values eBay lists for "
+                f"{row['aspect_name']}",
+                f"eBay accepts: {shown}{more}",
+                "if that list is incomplete, pass value_not_listed to record the "
+                "answer as an explicit operator override",
+            ])
+
         self.conn.execute(
             "UPDATE open_question SET answer = ?, answered_at = ? WHERE id = ?",
             (answer, now_iso(), question_id),
         )
+
+        payload = {"question": row["question"], "answer": answer}
+        if unlisted:
+            # The override is the record, not the permission.
+            payload["value_not_listed"] = True
+            payload["allowed_values_at_answer"] = allowed
         # basis='operator' is what lets this answer adjudicate a contradiction later.
-        self.conn.execute(
+        cursor = self.conn.execute(
             "INSERT INTO evidence (sku, kind, source, payload, send_to_model, "
             "recorded_at, basis, subject) "
             "VALUES (?, 'operator_answer', 'operator', ?, 1, ?, ?, ?)",
-            (sku, json.dumps({"question": row["question"], "answer": answer}), now_iso(),
+            (sku, json.dumps(payload), now_iso(),
              str(Basis.OPERATOR), str(Subject.THIS_ITEM)),
         )
+        evidence_id = cursor.lastrowid
+
+        aspect_name = row["aspect_name"] if "aspect_name" in keys else None
+        if aspect_name:
+            identification = current_identification(self.conn, sku)
+            if identification is not None:
+                cursor = self.conn.execute(
+                    "INSERT OR IGNORE INTO aspect_candidate "
+                    "(identification_id, aspect_name, value, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (identification["id"], aspect_name, value, now_iso()),
+                )
+                candidate_id = cursor.lastrowid or self.conn.execute(
+                    "SELECT id FROM aspect_candidate WHERE identification_id = ? "
+                    "AND aspect_name = ? AND value = ?",
+                    (identification["id"], aspect_name, value),
+                ).fetchone()[0]
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO aspect_candidate_evidence "
+                    "(candidate_id, evidence_id) VALUES (?, ?)",
+                    (candidate_id, evidence_id),
+                )
 
         state = current_state(self.conn, sku)
         if state == ItemState.NEEDS_INFO and not unresolved_blocking_questions(self.conn, sku):

@@ -426,3 +426,23 @@ class Proposal:
                 problems.append(reason)
 
         return problems
+
+
+def values_not_in_allowed(
+    allowed: tuple[str, ...] | list[str], supplied: list[str]
+) -> list[str]:
+    """Supplied values absent from an aspect's allowed list, compared casefolded.
+
+    Extracted from AspectSpec.unknown_values so the publisher's warning and the
+    gateway's refusal apply the same rule. Two implementations of "is this value
+    allowed" would eventually disagree, and the one that disagreed quietly would
+    be the one that let a bad value through.
+
+    An empty allowed list yields nothing: FREE_TEXT aspects and aspects eBay
+    publishes no values for are unconstrained, and validating against an empty
+    list would refuse every answer.
+    """
+    if not allowed:
+        return []
+    known = {value.casefold() for value in allowed}
+    return [value for value in supplied if value.casefold() not in known]

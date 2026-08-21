@@ -256,7 +256,10 @@ def cmd_item_ask(args: argparse.Namespace) -> int:
 def cmd_item_answer(args: argparse.Namespace) -> int:
     _, _, gateway = _open()
     try:
-        return _report(gateway.answer_question(args.question_id, args.answer, operator=True))
+        return _report(gateway.answer_question(
+            args.question_id, args.answer, operator=True,
+            value_not_listed=args.value_not_listed,
+        ))
     except Rejected as exc:
         return _rejected(exc)
 
@@ -1893,6 +1896,11 @@ def register(subparsers) -> None:
     answer = sub.add_parser("answer", help="answer a question (operator only)")
     answer.add_argument("question_id", type=int)
     answer.add_argument("answer")
+    answer.add_argument(
+        "--value-not-listed", action="store_true",
+        help="record an answer eBay's value list does not contain, as an "
+             "explicit operator override",
+    )
     answer.set_defaults(func=cmd_item_answer)
 
     price = sub.add_parser("price", help="identifying -> pricing")

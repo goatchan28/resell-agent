@@ -121,10 +121,11 @@ class AspectSpec:
         that aspectValues is exhaustive for every aspect, so treating an absent
         value as invalid could block a legitimate publish.
         """
-        if not self.selection_only or not self.allowed_values:
+        if not self.selection_only:
             return []
-        allowed = {value.casefold() for value in self.allowed_values}
-        return [value for value in supplied if value.casefold() not in allowed]
+        from resell.domain import values_not_in_allowed
+
+        return values_not_in_allowed(self.allowed_values, supplied)
 
 
 @dataclass
@@ -360,10 +361,21 @@ class Publisher:
             if name in existing:
                 opened.append(f"{name} (already asked)")
                 continue
+            spec = next(
+                (s for s in (self._last_schema or ()) if s.name == name), None
+            )
+            # Only SELECTION_ONLY aspects constrain the answer. Storing a list for
+            # a FREE_TEXT aspect would refuse every value the operator typed.
+            allowed = (
+                tuple(spec.allowed_values)
+                if spec is not None and spec.selection_only
+                else ()
+            )
             try:
                 self.gateway.ask_operator(
                     sku,
                     question=f"What is this item's {name}?",
+                    allowed_values=allowed,
                     why_it_matters=(
                         f"eBay requires {name} for this category and will not "
                         f"publish the listing without it"

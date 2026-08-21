@@ -28,7 +28,9 @@ from .pricing.comps import (
     validate_claim,
 )
 from .pricing.estimate import Distribution, PriceRecommendation, ScoredComp
+from .domain import ItemState
 from .pricing.lifecycle import (
+    coerce_item_state,
     PriceApproval,
     PriceEventType,
     PriceProposal,
@@ -443,16 +445,59 @@ def record_applied(
     conn.commit()
 
 
-def already_applied(conn: sqlite3.Connection, sku: str, content_hash: str) -> bool:
-    """Idempotency: rerunning apply for an unchanged proposal costs zero calls."""
+def already_applied(conn: sqlite3.Connection, proposal_id: str) -> bool:
+    """Idempotency: rerunning apply for the same proposal costs zero calls.
+
+    Keyed on the proposal, not on its content hash. Those are different questions
+    and conflating them was a bug: the hash excludes `reason`, so repricing back
+    to an earlier price produced the same hash as the original proposal, and the
+    executor concluded it was already live while the listing sat at the newer
+    price. The hash binds the approval; the proposal id bounds the action.
+    """
     row = conn.execute(
-        """SELECT 1 FROM price_event e
-           JOIN price_proposal p ON p.proposal_id = e.proposal_id
-           WHERE e.sku = ? AND e.event_type = 'applied' AND p.content_hash = ?
-           LIMIT 1""",
-        (sku, content_hash),
+        """SELECT 1 FROM price_event
+           WHERE proposal_id = ? AND event_type = 'applied' LIMIT 1""",
+        (proposal_id,),
     ).fetchone()
     return row is not None
+
+
+def item_state(conn: sqlite3.Connection, sku: str) -> ItemState:
+    """The item's current state, read from the item record.
+
+    Read-only, so it does not go through the gateway -- the gateway owns
+    transitions, not lookups. What matters is that the pricing layer stops
+    trusting a caller-supplied string: an operator asserting `listed` for an item
+    the system considers `pricing` was a gate that could be talked around.
+    """
+    row = conn.execute("SELECT state FROM item WHERE sku = ?", (sku,)).fetchone()
+    if row is None:
+        raise LookupError(f"no item {sku!r}")
+    return coerce_item_state(row["state"])
+
+
+def record_apply_failed(
+    conn: sqlite3.Connection, proposal: PriceProposal, *, detail: str, stage: str
+) -> None:
+    """A failed attempt is history too. The approval is untouched."""
+    _event(conn, proposal.sku, proposal.proposal_id, PriceEventType.APPLY_FAILED,
+           proposal.price_cents, detail={"stage": stage, "detail": detail})
+    conn.commit()
+
+
+def revisions_today(conn: sqlite3.Connection, sku: str, *, now: datetime) -> int:
+    """Applies counted against eBay's 250-revisions-per-listing-per-day ceiling.
+
+    Counted on UTC days while eBay counts on its own clock, so the budget is set
+    below the real limit rather than trying to align two calendars.
+    """
+    day = now.astimezone(timezone.utc).date().isoformat()
+    row = conn.execute(
+        """SELECT COUNT(*) n FROM price_event
+           WHERE sku = ? AND event_type = 'applied' AND occurred_at >= ?""",
+        (sku, day),
+    ).fetchone()
+    return int(row["n"])
 
 
 def current_price_state(conn: sqlite3.Connection, sku: str) -> dict:

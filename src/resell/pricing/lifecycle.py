@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 
+from ..domain import ItemState
 from .comps import CompBasis, ConditionAdjustment, PriceKind
 from .estimate import PriceQualifier
 from .proceeds import FeeBasis
@@ -167,22 +168,61 @@ class RepricePolicy:
 
 # --- gates -------------------------------------------------------------------
 
-_PRICEABLE_ITEM_STATES = frozenset(
-    {"identified", "drafted", "proposed", "approved", "listed"}
-)
-_TERMINAL_ITEM_STATES = frozenset({"sold", "abandoned", "archived"})
+# Pricing is legal once identification has settled, and stays legal on a live
+# listing. Deliberately **not** derived from `domain.TERMINAL_STATES`, which
+# contains LISTED: that set describes states from which no further *item*
+# transition is legal, and repricing is precisely the operation that changes a
+# live listing without moving the item at all. Reusing it here would make the
+# reprice path unreachable. The two lifecycles are separate on purpose, and this
+# is where that separation has to be stated rather than assumed.
+PRICEABLE_ITEM_STATES = frozenset({
+    ItemState.PRICING,
+    ItemState.PROPOSED,
+    ItemState.APPROVED,
+    ItemState.PUBLISH_FAILED,  # a failed publish is often a price problem
+    ItemState.LISTED,
+})
+
+# An initial price reaches eBay as part of publishing; a reprice needs something
+# already live to revise.
+INITIAL_APPLY_STATES = frozenset({
+    ItemState.APPROVED, ItemState.PUBLISHING, ItemState.LISTED,
+})
+REPRICE_APPLY_STATES = frozenset({ItemState.LISTED})
 
 
-def can_propose_price(item_state: str) -> tuple[bool, str]:
-    if item_state in _TERMINAL_ITEM_STATES:
-        return False, f"item is {item_state}; pricing a terminal item is meaningless"
-    if item_state not in _PRICEABLE_ITEM_STATES:
-        return False, f"item state {item_state!r} cannot carry a price yet"
-    return True, "priceable"
+def coerce_item_state(value: ItemState | str) -> ItemState:
+    """Unknown states raise rather than failing closed.
+
+    Failing closed on an unrecognised string is how `pricing` -- a real state the
+    item was actually in -- silently read as "not priceable" for as long as this
+    module kept its own copy of the vocabulary. A typo should be loud.
+    """
+    if isinstance(value, ItemState):
+        return value
+    try:
+        return ItemState(value)
+    except ValueError:
+        known = ", ".join(sorted(s.value for s in ItemState))
+        raise ValueError(
+            f"{value!r} is not a known ItemState; expected one of: {known}"
+        ) from None
+
+
+def can_propose_price(item_state: ItemState | str) -> tuple[bool, str]:
+    state = coerce_item_state(item_state)
+    if state is ItemState.ABANDONED:
+        return False, "item is abandoned; pricing it is meaningless"
+    if state not in PRICEABLE_ITEM_STATES:
+        return False, (
+            f"item is {state}; pricing needs identification settled "
+            f"(one of: {', '.join(sorted(s.value for s in PRICEABLE_ITEM_STATES))})"
+        )
+    return True, f"priceable in {state}"
 
 
 def can_approve_price(
-    proposal: PriceProposal, *, item_state: str, production: bool
+    proposal: PriceProposal, *, item_state: ItemState | str, production: bool
 ) -> tuple[bool, str]:
     ok, why = can_propose_price(item_state)
     if not ok:
@@ -237,7 +277,7 @@ def can_apply_price(
     proposal: PriceProposal,
     approval: PriceApproval | None,
     *,
-    item_state: str,
+    item_state: ItemState | str,
 ) -> tuple[bool, str]:
     """Applying means calling the marketplace. Both the approval and the item gate it."""
     if approval is None or not approval.covers(proposal):
@@ -245,12 +285,13 @@ def can_apply_price(
             "no live approval binds this proposal; the price or its evidence "
             "changed after approval"
         )
+    state = coerce_item_state(item_state)
     if proposal.reason is PriceReason.INITIAL:
-        if item_state not in ("approved", "listed"):
-            return False, f"initial price applies at publish; item is {item_state}"
-    elif item_state != "listed":
-        return False, f"a reprice requires a live listing; item is {item_state}"
-    return True, "applicable"
+        if state not in INITIAL_APPLY_STATES:
+            return False, f"initial price applies at publish; item is {state}"
+    elif state not in REPRICE_APPLY_STATES:
+        return False, f"a reprice requires a live listing; item is {state}"
+    return True, f"applicable in {state}"
 
 
 def publishable(
@@ -272,9 +313,14 @@ def publishable(
     return True, "listing and price both approved"
 
 
-def apply_idempotency_key(sku: str, content_hash: str) -> str:
-    """Re-running an apply for an unchanged proposal must cost zero calls."""
-    return f"price:{sku}:{content_hash[:16]}"
+def apply_idempotency_key(sku: str, proposal_id: str) -> str:
+    """Scopes one apply to one proposal.
+
+    Not the content hash: two proposals can legitimately share content -- reprice
+    to $59, then back to $112 on the same evidence -- and treating them as the
+    same action skips a write the listing needs.
+    """
+    return f"price:{sku}:{proposal_id}"
 
 
 def next_state(current: PriceState, event: PriceEventType) -> PriceState:

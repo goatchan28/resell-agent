@@ -235,8 +235,8 @@ def test_apply_is_idempotent_on_content_hash():
     sp.record_proposal(conn, p)
     sp.approve_proposal(conn, p)
     sp.record_applied(conn, p, marketplace_ref="offer-123")
-    assert sp.already_applied(conn, "MP-000003", p.content_hash())
-    assert not sp.already_applied(conn, "MP-000003", "some-other-hash")
+    assert sp.already_applied(conn, p.proposal_id)
+    assert not sp.already_applied(conn, "pp_never")
 
 
 def test_voiding_an_approval_leaves_no_live_approval():
@@ -329,3 +329,18 @@ def test_a_changed_proposal_gets_its_own_approval():
     sp.record_proposal(conn, a)
     sp.record_proposal(conn, b)
     assert sp.approve_proposal(conn, a).approval_id != sp.approve_proposal(conn, b).approval_id
+
+
+def test_item_state_is_read_from_the_item_record():
+    from resell.domain import ItemState
+
+    conn = db()
+    assert sp.item_state(conn, "MP-000003") is ItemState.LISTED
+    conn.execute("UPDATE item SET state='pricing' WHERE sku='MP-000003'")
+    assert sp.item_state(conn, "MP-000003") is ItemState.PRICING
+
+
+def test_reading_the_state_of_a_missing_item_raises():
+    conn = db()
+    with pytest.raises(LookupError):
+        sp.item_state(conn, "MP-999999")

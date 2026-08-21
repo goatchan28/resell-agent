@@ -14,6 +14,8 @@ import json
 import sqlite3
 import sys
 import uuid
+from collections.abc import Callable
+from typing import Any
 from datetime import datetime, timezone
 
 from .pricing.comps import (
@@ -214,8 +216,8 @@ def cmd_recommend(args, conn: sqlite3.Connection) -> int:
 
 
 def cmd_propose(args, conn: sqlite3.Connection) -> int:
-    item_state = args.item_state
-    ok, why = can_propose_price(item_state)
+    state = sp.item_state(conn, args.sku)
+    ok, why = can_propose_price(state)
     if not ok:
         print(why, file=sys.stderr)
         return 2
@@ -320,7 +322,8 @@ def cmd_approve(args, conn: sqlite3.Connection) -> int:
         print(f"no proposal {args.proposal_id}", file=sys.stderr)
         return 2
     ok, why = can_approve_price(
-        proposal, item_state=args.item_state, production=args.production
+        proposal, item_state=sp.item_state(conn, proposal.sku),
+        production=args.production,
     )
     if not ok:
         print(why, file=sys.stderr)
@@ -331,21 +334,50 @@ def cmd_approve(args, conn: sqlite3.Connection) -> int:
 
 
 def cmd_apply(args, conn: sqlite3.Connection) -> int:
+    """Push an approved price to the marketplace, or record one already there.
+
+    `--offer-id` drives the real executor. `--marketplace-ref` without it records
+    an application that happened elsewhere, which is how the initial publish path
+    reports the price it already set.
+    """
     proposal = sp.load_proposal(conn, args.proposal_id)
     if proposal is None:
         print(f"no proposal {args.proposal_id}", file=sys.stderr)
         return 2
-    if sp.already_applied(conn, proposal.sku, proposal.content_hash()):
+
+    if args.offer_id:
+        from .ebay_offer_client import EbayOfferClient
+        from .execute_price import apply_price
+
+        if args.client_factory is None:
+            print(
+                "no authenticated client available; --offer-id needs the top-level "
+                "CLI, which supplies one",
+                file=sys.stderr,
+            )
+            return 2
+        result = apply_price(
+            conn, proposal,
+            client=EbayOfferClient(args.client_factory()),
+            offer_id=args.offer_id,
+            production=args.production,
+            confirm=not args.no_confirm,
+        )
+        print(result.describe())
+        return 0 if result.ok else (1 if result.outcome.is_retryable else 2)
+
+    if sp.already_applied(conn, proposal.proposal_id):
         print("already applied; zero calls made")
         return 0
     approval = sp.live_approval(conn, proposal.proposal_id)
-    ok, why = can_apply_price(proposal, approval, item_state=args.item_state)
+    ok, why = can_apply_price(
+        proposal, approval, item_state=sp.item_state(conn, proposal.sku)
+    )
     if not ok:
         print(why, file=sys.stderr)
         return 2
-    # The executor calls updateOffer here and passes back the offer id.
     sp.record_applied(conn, proposal, marketplace_ref=args.marketplace_ref)
-    print(f"applied {_money(proposal.price_cents)} ({proposal.reason})")
+    print(f"recorded {_money(proposal.price_cents)} ({proposal.reason})")
     return 0
 
 
@@ -447,19 +479,21 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=[str(o) for o in SellerObjective])
     c.add_argument("--reason", default="initial", choices=[str(r) for r in PriceReason])
     c.add_argument("--rationale")
-    c.add_argument("--item-state", required=True)
     c.set_defaults(fn=cmd_propose)
 
     c = sub.add_parser("approve", help="approve a price proposal by hash")
     c.add_argument("proposal_id")
-    c.add_argument("--item-state", required=True)
     c.add_argument("--production", action="store_true")
     c.set_defaults(fn=cmd_approve)
 
     c = sub.add_parser("apply", help="record that a price reached the marketplace")
     c.add_argument("proposal_id")
-    c.add_argument("--item-state", required=True)
-    c.add_argument("--marketplace-ref")
+    c.add_argument("--marketplace-ref",
+                   help="record a price applied elsewhere, without calling eBay")
+    c.add_argument("--offer-id", help="drive updateOffer for this offer")
+    c.add_argument("--production", action="store_true")
+    c.add_argument("--no-confirm", action="store_true",
+                   help="skip the confirming read; a 200 is not evidence")
     c.set_defaults(fn=cmd_apply)
 
     c = sub.add_parser("history", help="the append-only price history")
@@ -475,6 +509,19 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv: list[str], conn: sqlite3.Connection) -> int:
+def main(
+    argv: list[str],
+    conn: sqlite3.Connection,
+    *,
+    client_factory: Callable[[], Any] | None = None,
+) -> int:
+    """Entry point.
+
+    `client_factory` is a callable rather than a client because building one
+    requires eBay credentials, and every pricing command except `apply --offer-id`
+    is purely local. Constructing it eagerly would make `recommend` fail on a
+    machine with no tokens, which is the opposite of useful.
+    """
     args = build_parser().parse_args(argv)
+    args.client_factory = client_factory
     return args.fn(args, conn)

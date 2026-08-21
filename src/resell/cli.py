@@ -386,6 +386,29 @@ def cmd_events(args: argparse.Namespace) -> int:
         print(f"{row['ts']}  {row['kind']:<32} {row['payload']}")
     return 0
 
+def cmd_db(args: argparse.Namespace) -> int:
+    """Schema migration and inspection. No eBay credentials needed."""
+    from resell import cli_db
+
+    config = load_config(require_credentials=False)
+    return cli_db.main(args.rest, config.db_path)
+
+
+def cmd_price(args: argparse.Namespace) -> int:
+    """Comps, pricing, strategies, and repricing."""
+    from resell import cli_price
+
+    config, conn = _open_db_and_config(require_credentials=False)
+
+    def make_client():
+        # Built only if a command actually reaches eBay, and it reloads the
+        # config demanding credentials at that point rather than up front.
+        from resell.ebay.client import EbayClient
+
+        return EbayClient(load_config(require_credentials=True), conn)
+
+    return cli_price.main(args.rest, conn, client_factory=make_client)
+
 
 # --- wiring ------------------------------------------------------------------
 
@@ -441,6 +464,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     cli_item.register(subparsers)
 
+    parser_db = subparsers.add_parser(
+        "db", help="schema migration and inspection", add_help=False
+    )
+    parser_db.add_argument("rest", nargs=argparse.REMAINDER)
+    parser_db.set_defaults(func=cmd_db)
+
+    parser_price = subparsers.add_parser(
+        "price", help="comps, pricing, and repricing", add_help=False
+    )
+    parser_price.add_argument("rest", nargs=argparse.REMAINDER)
+    parser_price.set_defaults(func=cmd_price)
+
     images = subparsers.add_parser("images", help="listing photo handling")
     images_sub = images.add_subparsers(dest="images_command", required=True)
     check = images_sub.add_parser("check", help="validate photos locally, offline")
@@ -464,6 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
     events.set_defaults(func=cmd_events)
 
     return parser
+
 
 
 def main(argv: list[str] | None = None) -> int:

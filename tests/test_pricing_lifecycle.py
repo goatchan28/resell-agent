@@ -86,9 +86,9 @@ def test_voided_approval_covers_nothing():
 # --- proposal and approval gates ------------------------------------------------
 
 
-def test_terminal_items_cannot_be_priced():
-    ok, why = can_propose_price("sold")
-    assert not ok and "terminal" in why
+def test_abandoned_items_cannot_be_priced():
+    ok, why = can_propose_price("abandoned")
+    assert not ok and "abandoned" in why
 
 
 def test_listed_items_can_be_repriced():
@@ -98,7 +98,7 @@ def test_listed_items_can_be_repriced():
 
 def test_approval_requires_clearing_the_floor():
     ok, why = can_approve_price(
-        proposal(floor_ok=False), item_state="drafted", production=False
+        proposal(floor_ok=False), item_state="pricing", production=False
     )
     assert not ok and "floor" in why
 
@@ -106,7 +106,7 @@ def test_approval_requires_clearing_the_floor():
 def test_production_approval_refuses_a_provisional_fee_basis():
     ok, why = can_approve_price(
         proposal(fee_basis=FeeBasis.PROVISIONAL_ESTIMATE),
-        item_state="drafted", production=True,
+        item_state="pricing", production=True,
     )
     assert not ok and "provisional" in why
 
@@ -114,7 +114,7 @@ def test_production_approval_refuses_a_provisional_fee_basis():
 def test_sandbox_approval_tolerates_a_provisional_fee_basis():
     ok, _ = can_approve_price(
         proposal(fee_basis=FeeBasis.PROVISIONAL_ESTIMATE),
-        item_state="drafted", production=False,
+        item_state="pricing", production=False,
     )
     assert ok
 
@@ -219,7 +219,7 @@ def test_v1_policy_defaults_are_permissive():
 
 def test_reprice_requires_a_live_listing():
     p = proposal(reason=PriceReason.REPRICE_OPERATOR, price_cents=3900)
-    ok, why = can_apply_price(p, approval_for(p), item_state="drafted")
+    ok, why = can_apply_price(p, approval_for(p), item_state="pricing")
     assert not ok and "live listing" in why
 
 
@@ -236,13 +236,21 @@ def test_apply_allowed_for_a_reprice_on_a_listed_item():
     assert ok
 
 
-def test_idempotency_key_tracks_content_not_time():
+def test_idempotency_key_scopes_one_apply_to_one_proposal():
     p = proposal()
-    k1 = apply_idempotency_key(p.sku, p.content_hash())
-    k2 = apply_idempotency_key(p.sku, replace(p, rationale="reworded").content_hash())
-    assert k1 == k2
-    k3 = apply_idempotency_key(p.sku, replace(p, price_cents=5000).content_hash())
-    assert k1 != k3
+    assert apply_idempotency_key(p.sku, p.proposal_id) == \
+        apply_idempotency_key(p.sku, replace(p, rationale="reworded").proposal_id)
+    assert apply_idempotency_key(p.sku, "pp2") != apply_idempotency_key(p.sku, "pp1")
+
+
+def test_two_proposals_may_share_content_and_are_still_separate_actions():
+    """Reprice to $59 and back to $112: same evidence, same hash, two writes."""
+    first = proposal(proposal_id="pp1", price_cents=11200)
+    back = proposal(proposal_id="pp3", price_cents=11200,
+                    reason=PriceReason.REPRICE_OPERATOR)
+    assert first.content_hash() == back.content_hash()
+    assert apply_idempotency_key(first.sku, first.proposal_id) != \
+        apply_idempotency_key(back.sku, back.proposal_id)
 
 
 # --- state machine ----------------------------------------------------------------
@@ -286,3 +294,27 @@ def test_changing_the_objective_voids_the_approval():
     assert app.covers(p)
     assert not app.covers(replace(p, objective=SellerObjective.MAX_PROCEEDS))
     assert not app.covers(replace(p, anchor_statistic="p75", anchor_value_cents=6000))
+
+
+def test_listed_is_terminal_for_the_item_but_not_for_its_price():
+    """domain.TERMINAL_STATES contains LISTED; repricing depends on it not applying.
+
+    Deriving the pricing gates from that set would have made every reprice
+    unreachable, which is the whole feature.
+    """
+    from resell.domain import TERMINAL_STATES, ItemState
+    from resell.pricing.lifecycle import PRICEABLE_ITEM_STATES, REPRICE_APPLY_STATES
+
+    assert ItemState.LISTED in TERMINAL_STATES
+    assert ItemState.LISTED in PRICEABLE_ITEM_STATES
+    assert REPRICE_APPLY_STATES == {ItemState.LISTED}
+
+
+def test_the_state_that_started_this_is_priceable():
+    ok, _ = can_propose_price("pricing")
+    assert ok
+
+
+def test_an_unknown_state_raises_instead_of_failing_closed():
+    with pytest.raises(ValueError, match="not a known ItemState"):
+        can_propose_price("drafted")

@@ -8,7 +8,9 @@ Call shape, in order, and it stops at the first refusal:
 
     0 calls   already applied for this content hash        -> NO_CHANGE
     0 calls   no live approval / wrong state / no budget   -> REFUSED
-    1 call    getOffer, validate, detect drift             -> REFUSED on drift
+    1 call    getOffer, check structure, then either
+              already at this price                        -> NO_CHANGE / RECONCILED
+              or drift against our records                 -> REFUSED
     2 calls   updateOffer with the whole offer resent
     3 calls   getOffer again, confirm the price is live    -> UNCONFIRMED on mismatch
 
@@ -31,13 +33,16 @@ from .pricing.offer import (
     DEFAULT_DAILY_REVISION_BUDGET,
     ResponseClass,
     RevisionBudget,
+    OfferDiff,
     build_update_payload,
     classify,
+    diff_payload,
     describe_errors,
+    detect_price_drift,
     listing_id,
     offer_price_cents,
     sold_quantity,
-    validate_offer,
+    validate_offer_structure,
     verify_echo,
 )
 from .pricing.proceeds import FeeBasis
@@ -59,6 +64,11 @@ class OfferClient(Protocol):
 class ApplyOutcome(StrEnum):
     APPLIED = "applied"
     NO_CHANGE = "no_change"
+    # A write that reached eBay but whose response was lost. The retry finds the
+    # listing already correct and brings the record into line without writing.
+    RECONCILED = "reconciled"
+    # Every gate passed and the payload is built; nothing was sent, nothing written.
+    WOULD_APPLY = "would_apply"
     REFUSED = "refused"
     FAILED_PERMANENT = "failed_permanent"
     FAILED_TRANSIENT = "failed_transient"
@@ -76,10 +86,14 @@ class ApplyResult:
     calls_made: int = 0
     marketplace_ref: str | None = None
     previous_price_cents: int | None = None
+    diff: OfferDiff | None = None
 
     @property
     def ok(self) -> bool:
-        return self.outcome in (ApplyOutcome.APPLIED, ApplyOutcome.NO_CHANGE)
+        return self.outcome in (
+            ApplyOutcome.APPLIED, ApplyOutcome.NO_CHANGE, ApplyOutcome.RECONCILED,
+            ApplyOutcome.WOULD_APPLY,
+        )
 
     def describe(self) -> str:
         return f"{self.outcome}: {self.detail} ({self.calls_made} call(s))"
@@ -96,7 +110,14 @@ def apply_price(
     now: datetime | None = None,
     daily_revision_budget: int = DEFAULT_DAILY_REVISION_BUDGET,
     confirm: bool = True,
+    dry_run: bool = False,
 ) -> ApplyResult:
+    """Set `dry_run` to run every gate, build the payload, and stop.
+
+    A flag rather than a separate function on purpose: a preview that evaluates a
+    different sequence than the real thing tells you about the preview. Here the
+    only difference is that nothing is sent and nothing is written.
+    """
     now = now or datetime.now(timezone.utc)
 
     # --- 0 calls: is there anything to do, and are we allowed to do it --------
@@ -142,25 +163,46 @@ def apply_price(
             conn, proposal, status, body, calls=1, stage="getOffer",
         )
 
-    valid, problem, reason = validate_offer(
-        body, sku=proposal.sku, expected_price_cents=expected, currency=currency,
+    valid, problem, reason = validate_offer_structure(
+        body, sku=proposal.sku, currency=currency,
     )
     if not valid:
-        _record_failure(conn, proposal, f"{problem}: {reason}", stage="precondition")
+        _record_failure(conn, proposal, f"{problem}: {reason}",
+                        stage="precondition", dry_run=dry_run)
         return ApplyResult(ApplyOutcome.REFUSED, reason, calls_made=1)
 
     current = offer_price_cents(body)
+
+    # Before drift, not after. If the listing already carries exactly the price
+    # this proposal wants, there is nothing to write and nothing to refuse -- and
+    # asking about drift first would refuse it, because a write that landed
+    # without being recorded looks identical to somebody editing the listing by
+    # hand. Structure is checked above, so this cannot record an applied price
+    # against the wrong offer.
     if current == proposal.price_cents:
-        # The listing already carries this price under a different proposal.
-        # Record it as applied so the database stops disagreeing with reality,
-        # but send nothing.
-        sp.record_applied(conn, proposal, marketplace_ref=listing_id(body))
+        landed_unrecorded = expected is not None and expected != current
+        if not dry_run:
+            sp.record_applied(conn, proposal, marketplace_ref=listing_id(body))
         return ApplyResult(
-            ApplyOutcome.NO_CHANGE,
-            "listing already carries this price; recorded without sending",
+            ApplyOutcome.RECONCILED if landed_unrecorded else ApplyOutcome.NO_CHANGE,
+            (
+                "an earlier write reached eBay without being recorded; "
+                "the listing was already at this price and the record now agrees"
+                if landed_unrecorded
+                else "listing already carries this price; recorded without sending"
+            ),
             calls_made=1,
             marketplace_ref=listing_id(body),
+            previous_price_cents=expected,
         )
+
+    no_drift, problem, reason = detect_price_drift(
+        body, expected_price_cents=expected
+    )
+    if not no_drift:
+        _record_failure(conn, proposal, f"{problem}: {reason}",
+                        stage="precondition", dry_run=dry_run)
+        return ApplyResult(ApplyOutcome.REFUSED, reason, calls_made=1)
 
     if proposal.reason.is_reprice and sold_quantity(body) > 0:
         return ApplyResult(
@@ -175,6 +217,20 @@ def apply_price(
     payload = build_update_payload(
         body, new_price_cents=proposal.price_cents, currency=currency
     )
+    if dry_run:
+        difference = diff_payload(body, payload)
+        return ApplyResult(
+            ApplyOutcome.WOULD_APPLY,
+            f"every gate passed; would send {_money(current)} -> "
+            f"{_money(proposal.price_cents)}"
+            + ("" if difference.is_safe
+               else "  -- REVIEW THE DIFF: more than the price would change"),
+            calls_made=1,
+            marketplace_ref=listing_id(body),
+            previous_price_cents=current,
+            diff=difference,
+        )
+
     status, resp = client.update_offer(offer_id, payload)
     kind = classify(status)
     if kind is not ResponseClass.OK:
@@ -237,6 +293,18 @@ def _fail(conn, proposal, status: int, body: Any, *, calls: int, stage: str) -> 
     return ApplyResult(outcome, detail, calls_made=calls)
 
 
-def _record_failure(conn, proposal: PriceProposal, detail: str, *, stage: str) -> None:
-    """A failed apply leaves the approval standing; only the attempt is recorded."""
+def _record_failure(
+    conn, proposal: PriceProposal, detail: str, *, stage: str, dry_run: bool = False
+) -> None:
+    """A failed apply leaves the approval standing; only the attempt is recorded.
+
+    A preview records nothing, including its refusals -- otherwise checking whether
+    a write would work leaves marks in the history claiming it was attempted.
+    """
+    if dry_run:
+        return
     sp.record_apply_failed(conn, proposal, detail=detail, stage=stage)
+
+
+def _money(cents: int | None) -> str:
+    return "n/a" if cents is None else f"${cents / 100:.2f}"

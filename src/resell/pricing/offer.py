@@ -25,9 +25,27 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from enum import StrEnum
 
-# Returned by getOffer, rejected or ignored by updateOffer. `sku`,
-# `marketplaceId` and `format` are named in the documentation as the exceptions
-# to "resend everything"; the rest are read-only response containers.
+# What eBay's documentation says may be absent from an updateOffer body: `sku`,
+# `marketplaceId` and `format` are named as the exceptions to "resend
+# everything", and the rest are response-only containers getOffer adds.
+#
+# Held separately from READ_ONLY_OFFER_FIELDS below, which is what the payload
+# builder actually strips, and the two are asserted equal by a test. The
+# duplication is deliberate: OfferDiff.is_safe judges removals against *this*
+# set, so checking it against the stripping set would be a tautology -- a wrong
+# strip list would silently vindicate itself. Adding a field to one and not the
+# other fails a test rather than quietly widening what a write may destroy.
+DOCUMENTED_NON_UPDATE_FIELDS = frozenset({
+    "offerId",
+    "sku",
+    "marketplaceId",
+    "format",
+    "status",
+    "statusDetails",
+    "listing",
+})
+
+# What build_update_payload strips.
 READ_ONLY_OFFER_FIELDS = frozenset({
     "offerId",
     "sku",
@@ -93,19 +111,15 @@ class OfferProblem(StrEnum):
     PRICE_DRIFT = "price_drift"
 
 
-def validate_offer(
-    offer: dict,
-    *,
-    sku: str,
-    expected_price_cents: int | None,
-    currency: str,
+def validate_offer_structure(
+    offer: dict, *, sku: str, currency: str
 ) -> tuple[bool, OfferProblem | None, str]:
-    """Everything checked before a write, so a bad write is never attempted.
+    """Is this the right offer, in a state that can be written to at all.
 
-    `expected_price_cents` is what our own records say is live. A mismatch means
-    the price moved outside this system -- somebody edited the listing in the eBay
-    UI, or an earlier apply half-succeeded. Overwriting it would erase a change
-    nobody here recorded, so it is refused rather than resolved.
+    Split from the drift check deliberately. These are facts about the offer that
+    make a write impossible or wrong; drift is a fact about the *relationship*
+    between the listing and our records, and the two have to be evaluated in that
+    order -- see `detect_price_drift` for why.
     """
     if offer.get("sku") != sku:
         return False, OfferProblem.WRONG_SKU, (
@@ -130,13 +144,51 @@ def validate_offer(
             f"offer is priced in {actual_currency}, not {currency}"
         )
 
-    if expected_price_cents is not None and current != expected_price_cents:
+    return True, None, f"offer is live at {cents_to_ebay(current)}"
+
+
+def detect_price_drift(
+    offer: dict, *, expected_price_cents: int | None
+) -> tuple[bool, OfferProblem | None, str]:
+    """Has the listing price moved outside this system.
+
+    `expected_price_cents` is what our own records say is live. A mismatch means
+    somebody edited the listing in the eBay UI, or an earlier apply half-succeeded.
+    Overwriting would erase a change nobody here recorded, so it is refused.
+
+    **This must be evaluated after checking whether the listing already carries
+    the price this proposal wants.** If a PUT succeeds and the response is lost,
+    the retry sees a listing at the new price and records showing the old one --
+    which is drift by this definition, and refusing it strands the item with no
+    route forward but manual repair. That case is not drift, it is a write that
+    landed unrecorded, and the caller resolves it before asking this question.
+    """
+    if expected_price_cents is None:
+        return True, None, "no recorded price to compare against"
+    current = offer_price_cents(offer)
+    if current is None:
+        return False, OfferProblem.NO_PRICE, "offer has no readable price"
+    if current != expected_price_cents:
         return False, OfferProblem.PRICE_DRIFT, (
             f"listing is at {cents_to_ebay(current)} but our records say "
             f"{cents_to_ebay(expected_price_cents)}; the price moved outside this "
             "system, so nothing here is safe to overwrite"
         )
-    return True, None, f"offer is live at {cents_to_ebay(current)}"
+    return True, None, f"listing matches our records at {cents_to_ebay(current)}"
+
+
+def validate_offer(
+    offer: dict,
+    *,
+    sku: str,
+    expected_price_cents: int | None,
+    currency: str,
+) -> tuple[bool, OfferProblem | None, str]:
+    """Structure then drift, in that order. Retained for callers wanting both."""
+    ok, problem, reason = validate_offer_structure(offer, sku=sku, currency=currency)
+    if not ok:
+        return ok, problem, reason
+    return detect_price_drift(offer, expected_price_cents=expected_price_cents)
 
 
 def build_update_payload(offer: dict, *, new_price_cents: int, currency: str) -> dict:
@@ -231,3 +283,68 @@ class RevisionBudget:
             f"{self.used_today}/{self.budget} revisions used today "
             f"(eBay's own limit is {EBAY_DAILY_REVISION_LIMIT})"
         )
+
+
+# --- previewing a write ---------------------------------------------------------
+
+
+def _flatten(value: object, prefix: str = "") -> dict[str, object]:
+    """Dotted paths to scalars, so a diff can point at pricingSummary.price.value."""
+    if isinstance(value, dict):
+        out: dict[str, object] = {}
+        for key, child in value.items():
+            out.update(_flatten(child, f"{prefix}.{key}" if prefix else str(key)))
+        return out
+    if isinstance(value, list):
+        out = {}
+        for index, child in enumerate(value):
+            out.update(_flatten(child, f"{prefix}[{index}]"))
+        return out
+    return {prefix: value}
+
+
+@dataclass(frozen=True)
+class OfferDiff:
+    """Exactly what a PUT would change, computed before sending it.
+
+    The reassuring output is a boring one: a single changed path under
+    pricingSummary, and a removed list containing nothing but fields eBay rejects
+    on update. Anything else in `removed` is a field the listing is about to lose.
+    """
+
+    changed: tuple[tuple[str, object, object], ...] = ()
+    removed: tuple[str, ...] = ()
+    added: tuple[str, ...] = ()
+
+    @property
+    def only_the_price_changed(self) -> bool:
+        return all(path.startswith("pricingSummary.price") for path, _, _ in self.changed)
+
+    @property
+    def removes_only_read_only_fields(self) -> bool:
+        """Judged against the documented set, never against what we stripped."""
+        return all(
+            path.split(".")[0].split("[")[0] in DOCUMENTED_NON_UPDATE_FIELDS
+            for path in self.removed
+        )
+
+    @property
+    def is_safe(self) -> bool:
+        return (
+            self.only_the_price_changed
+            and self.removes_only_read_only_fields
+            and not self.added
+        )
+
+
+def diff_payload(offer: dict, payload: dict) -> OfferDiff:
+    before, after = _flatten(offer), _flatten(payload)
+    return OfferDiff(
+        changed=tuple(
+            (path, before[path], after[path])
+            for path in sorted(before.keys() & after.keys())
+            if before[path] != after[path]
+        ),
+        removed=tuple(sorted(before.keys() - after.keys())),
+        added=tuple(sorted(after.keys() - before.keys())),
+    )

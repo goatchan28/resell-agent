@@ -485,6 +485,49 @@ def item_state(conn: sqlite3.Connection, sku: str) -> ItemState:
     return coerce_item_state(row["state"])
 
 
+def offer_id_for(conn: sqlite3.Connection, sku: str) -> str:
+    """The offerId `record_publish_progress` persisted at publish time.
+
+    Typing `--offer-id` by hand invites pasting the wrong one, and the system
+    already knows it. Raises rather than returning None: an item with no offer id
+    has not been published, and the caller should say so plainly.
+
+    Ambiguity is refused rather than resolved. The listing table carries
+    marketplace and environment, so one SKU can eventually hold more than one
+    active listing, and `fetchone()` would quietly pick whichever came first --
+    pointing a sandbox reprice at a production offer, or the reverse. There is
+    exactly one active listing today; the day there are two, this says so.
+    """
+    rows = conn.execute(
+        "SELECT * FROM listing WHERE sku = ? AND active = 1", (sku,)
+    ).fetchall()
+
+    if not rows:
+        raise LookupError(f"no active listing for {sku}; publish it before repricing")
+
+    with_offers = [r for r in rows if r["offer_id"]]
+    if not with_offers:
+        raise LookupError(
+            f"{sku} has an active listing but no offer id recorded; "
+            "publish it before repricing"
+        )
+    if len(with_offers) > 1:
+        detail = ", ".join(_describe_listing(r) for r in with_offers)
+        raise LookupError(
+            f"{sku} has {len(with_offers)} active listings ({detail}); "
+            "pass --offer-id to say which one"
+        )
+    return with_offers[0]["offer_id"]
+
+
+def _describe_listing(row: sqlite3.Row) -> str:
+    """Name the columns that distinguish listings, without assuming they exist."""
+    keys = row.keys()
+    parts = [str(row[k]) for k in ("environment", "marketplace") if k in keys]
+    parts.append(str(row["offer_id"]))
+    return "/".join(parts)
+
+
 def record_apply_failed(
     conn: sqlite3.Connection, proposal: PriceProposal, *, detail: str, stage: str
 ) -> None:

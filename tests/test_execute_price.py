@@ -520,3 +520,243 @@ def test_repricing_back_to_an_earlier_price_actually_writes():
     assert result.outcome is ApplyOutcome.APPLIED
     assert client.offer["pricingSummary"]["price"]["value"] == "112.00"
     assert sp.current_price_state(conn, "MP-000003")["live_price_cents"] == 11200
+
+
+# --- the lost-response recovery path ---------------------------------------------
+
+
+class LosesTheResponse(FakeOfferClient):
+    """The write reaches eBay and the answer never comes back.
+
+    A timeout on the far side of a successful PUT, which is the ordinary way a
+    network fails. The listing changes; the caller learns nothing.
+    """
+
+    def update_offer(self, offer_id, payload):
+        self.calls.append(f"put:{offer_id}")
+        self.payloads.append(copy.deepcopy(payload))
+        preserved = {k: self.offer[k] for k in
+                     ("offerId", "sku", "marketplaceId", "format", "status", "listing")
+                     if k in self.offer}
+        self.offer = {**payload, **preserved}   # it landed
+        return 503, None                        # we never found out
+
+
+def test_a_lost_response_is_recoverable_on_retry():
+    """Refusing this as drift stranded the item with no route but manual repair.
+
+    The retry sees a listing at the new price and records showing the old one,
+    which is indistinguishable from somebody editing the listing by hand -- unless
+    you first ask whether the listing already carries the price this very proposal
+    wants. It does, so this is a write that landed unrecorded, not drift.
+    """
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+
+    lost = LosesTheResponse()
+    first = apply_price(conn, p, client=lost, offer_id=OFFER_ID, now=NOW)
+    assert first.outcome is ApplyOutcome.FAILED_TRANSIENT
+    assert lost.offer["pricingSummary"]["price"]["value"] == "59.00"  # it did land
+    assert sp.current_price_state(conn, "MP-000003")["live_price_cents"] == 11200
+
+    retry = apply_price(conn, p, client=lost, offer_id=OFFER_ID, now=NOW)
+    assert retry.outcome is ApplyOutcome.RECONCILED
+    assert retry.ok
+    assert "without being recorded" in retry.detail
+    assert sp.current_price_state(conn, "MP-000003")["live_price_cents"] == 5900
+    assert sp.already_applied(conn, p.proposal_id)
+
+
+def test_recovery_sends_nothing():
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    lost = LosesTheResponse()
+    apply_price(conn, p, client=lost, offer_id=OFFER_ID, now=NOW)
+    writes_before = lost.calls.count(f"put:{OFFER_ID}")
+    apply_price(conn, p, client=lost, offer_id=OFFER_ID, now=NOW)
+    assert lost.calls.count(f"put:{OFFER_ID}") == writes_before
+
+
+def test_genuine_drift_is_still_refused():
+    """Someone edited the listing to a third price; that is not recoverable."""
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())          # wants 5900
+    edited = {**LIVE_OFFER,
+              "pricingSummary": {"price": {"value": "95.00", "currency": "USD"}}}
+    client = FakeOfferClient(edited)
+    r = apply_price(conn, p, client=client, offer_id=OFFER_ID, now=NOW)
+    assert r.outcome is ApplyOutcome.REFUSED
+    assert "moved outside this system" in r.detail
+    assert client.calls == [f"get:{OFFER_ID}"]
+
+
+def test_reconciliation_does_not_bypass_the_structural_checks():
+    """Right price, wrong offer. Recording that would be worse than refusing."""
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    wrong = {**LIVE_OFFER, "sku": "MP-000009",
+             "pricingSummary": {"price": {"value": "59.00", "currency": "USD"}}}
+    r = apply_price(conn, p, client=FakeOfferClient(wrong), offer_id=OFFER_ID, now=NOW)
+    assert r.outcome is ApplyOutcome.REFUSED
+    assert "belongs to sku" in r.detail
+    assert not sp.already_applied(conn, p.proposal_id)
+
+
+def test_an_unpublished_offer_at_the_target_price_is_still_refused():
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    unpublished = {**LIVE_OFFER, "status": "UNPUBLISHED",
+                   "pricingSummary": {"price": {"value": "59.00", "currency": "USD"}}}
+    r = apply_price(conn, p, client=FakeOfferClient(unpublished),
+                    offer_id=OFFER_ID, now=NOW)
+    assert r.outcome is ApplyOutcome.REFUSED
+    assert not sp.already_applied(conn, p.proposal_id)
+
+
+def test_no_recorded_price_yet_means_nothing_to_drift_from():
+    """The first apply after publish, before any price has been recorded."""
+    conn = db()
+    p = approved(conn, prop("pp_first", 5900, reason=PriceReason.INITIAL))
+    r = apply_price(conn, p, client=FakeOfferClient(), offer_id=OFFER_ID, now=NOW)
+    assert r.outcome is ApplyOutcome.APPLIED
+
+
+# --- dry run --------------------------------------------------------------------
+
+
+def test_dry_run_sends_nothing_and_writes_nothing():
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    client = FakeOfferClient()
+
+    r = apply_price(conn, p, client=client, offer_id=OFFER_ID, now=NOW, dry_run=True)
+
+    assert r.outcome is ApplyOutcome.WOULD_APPLY
+    assert r.ok
+    assert r.calls_made == 1
+    assert client.calls == [f"get:{OFFER_ID}"]          # read only
+    assert client.offer["pricingSummary"]["price"]["value"] == "112.00"
+    assert not sp.already_applied(conn, p.proposal_id)
+    assert sp.current_price_state(conn, "MP-000003")["live_price_cents"] == 11200
+
+
+def test_the_diff_shows_only_the_price_moving():
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    r = apply_price(conn, p, client=FakeOfferClient(), offer_id=OFFER_ID, now=NOW,
+                    dry_run=True)
+    assert r.diff.is_safe
+    assert r.diff.changed == (("pricingSummary.price.value", "112.00", "59.00"),)
+    assert r.diff.added == ()
+
+
+def test_the_diff_names_every_dropped_field():
+    """If the strip list is wrong, this is where a listing loses a policy."""
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    r = apply_price(conn, p, client=FakeOfferClient(), offer_id=OFFER_ID, now=NOW,
+                    dry_run=True)
+    assert set(r.diff.removed) == {
+        "offerId", "sku", "marketplaceId", "format", "status",
+        "listing.listingId", "listing.listingStatus", "listing.soldQuantity",
+    }
+    assert r.diff.removes_only_read_only_fields
+
+
+def test_a_dropped_business_field_is_reported_as_unsafe():
+    """The failure the preview exists to catch, forced by a bad strip list."""
+    from resell.pricing import offer as offer_mod
+
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    original = offer_mod.READ_ONLY_OFFER_FIELDS
+    try:
+        offer_mod.READ_ONLY_OFFER_FIELDS = original | {"listingPolicies"}
+        r = apply_price(conn, p, client=FakeOfferClient(), offer_id=OFFER_ID,
+                        now=NOW, dry_run=True)
+        assert not r.diff.is_safe
+        assert "REVIEW THE DIFF" in r.detail
+        assert any(path.startswith("listingPolicies") for path in r.diff.removed)
+    finally:
+        offer_mod.READ_ONLY_OFFER_FIELDS = original
+
+
+def test_dry_run_refuses_on_the_same_gates_as_a_real_apply():
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    drifted = {**LIVE_OFFER,
+               "pricingSummary": {"price": {"value": "95.00", "currency": "USD"}}}
+    r = apply_price(conn, p, client=FakeOfferClient(drifted), offer_id=OFFER_ID,
+                    now=NOW, dry_run=True)
+    assert r.outcome is ApplyOutcome.REFUSED
+    assert "moved outside this system" in r.detail
+
+
+def test_a_dry_run_refusal_leaves_no_trace_in_the_history():
+    """Checking whether a write would work must not claim it was attempted."""
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    drifted = {**LIVE_OFFER,
+               "pricingSummary": {"price": {"value": "95.00", "currency": "USD"}}}
+    apply_price(conn, p, client=FakeOfferClient(drifted), offer_id=OFFER_ID,
+                now=NOW, dry_run=True)
+    kinds = [e["event_type"] for e in sp.price_history(conn, "MP-000003")]
+    assert "apply_failed" not in kinds
+
+
+def test_dry_run_does_not_record_a_reconciliation():
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    lost = LosesTheResponse()
+    apply_price(conn, p, client=lost, offer_id=OFFER_ID, now=NOW)   # lands, unrecorded
+
+    preview = apply_price(conn, p, client=lost, offer_id=OFFER_ID, now=NOW,
+                          dry_run=True)
+    assert preview.outcome is ApplyOutcome.RECONCILED
+    assert not sp.already_applied(conn, p.proposal_id)   # still unrecorded
+
+    real = apply_price(conn, p, client=lost, offer_id=OFFER_ID, now=NOW)
+    assert real.outcome is ApplyOutcome.RECONCILED
+    assert sp.already_applied(conn, p.proposal_id)
+
+
+def test_a_dry_run_then_a_real_apply_agree():
+    """The preview is the same code path, so its verdict has to hold."""
+    conn = db()
+    live_at(conn, 11200)
+    p = approved(conn, prop())
+    client = FakeOfferClient()
+    preview = apply_price(conn, p, client=client, offer_id=OFFER_ID, now=NOW,
+                          dry_run=True)
+    assert preview.outcome is ApplyOutcome.WOULD_APPLY
+
+    real = apply_price(conn, p, client=client, offer_id=OFFER_ID, now=NOW)
+    assert real.outcome is ApplyOutcome.APPLIED
+    assert real.previous_price_cents == preview.previous_price_cents
+    assert client.offer["pricingSummary"]["price"]["value"] == "59.00"
+
+
+def test_the_strip_list_and_the_documented_list_agree():
+    """They are separate constants so the diff can police the stripper.
+
+    If they drift, either the payload builder is dropping a field eBay expects,
+    or the safety check has stopped noticing one that it does.
+    """
+    from resell.pricing.offer import (
+        DOCUMENTED_NON_UPDATE_FIELDS,
+        READ_ONLY_OFFER_FIELDS,
+    )
+
+    assert READ_ONLY_OFFER_FIELDS == DOCUMENTED_NON_UPDATE_FIELDS

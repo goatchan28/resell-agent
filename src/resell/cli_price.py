@@ -348,9 +348,18 @@ def cmd_apply(args, conn: sqlite3.Connection) -> int:
         print(f"no proposal {args.proposal_id}", file=sys.stderr)
         return 2
 
-    if args.offer_id:
+    if args.offer_id or args.dry_run or args.from_listing:
         from .ebay_offer_client import EbayOfferClient
         from .execute_price import apply_price
+
+        offer_id = args.offer_id
+        if not offer_id:
+            try:
+                offer_id = sp.offer_id_for(conn, proposal.sku)
+            except LookupError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            print(f"offer {offer_id} (from the listing record)")
 
         if args.client_factory is None:
             print(
@@ -362,11 +371,14 @@ def cmd_apply(args, conn: sqlite3.Connection) -> int:
         result = apply_price(
             conn, proposal,
             client=EbayOfferClient(args.client_factory()),
-            offer_id=args.offer_id,
+            offer_id=offer_id,
             production=args.production,
             confirm=not args.no_confirm,
+            dry_run=args.dry_run,
         )
         print(result.describe())
+        if result.diff is not None:
+            _print_diff(result.diff)
         return 0 if result.ok else (1 if result.outcome.is_retryable else 2)
 
     if sp.already_applied(conn, proposal.proposal_id):
@@ -382,6 +394,21 @@ def cmd_apply(args, conn: sqlite3.Connection) -> int:
     sp.record_applied(conn, proposal, marketplace_ref=args.marketplace_ref)
     print(f"recorded {_money(proposal.price_cents)} ({proposal.reason})")
     return 0
+
+
+def _print_diff(diff) -> None:
+    """The reassuring output is boring: one changed path, and read-only removals."""
+    for path, before, after in diff.changed:
+        print(f"  change   {path}: {before!r} -> {after!r}")
+    if diff.removed:
+        print(f"  drop     {len(diff.removed)} read-only field(s): "
+              f"{', '.join(diff.removed)}")
+    if diff.added:
+        print(f"  ADD      {', '.join(diff.added)}")
+    kept = "everything else is resent unchanged, as updateOffer requires"
+    print(f"  keep     {kept}")
+    if not diff.is_safe:
+        print("  WARNING  this would change more than the price; do not send it")
 
 
 def cmd_history(args, conn: sqlite3.Connection) -> int:
@@ -577,7 +604,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("proposal_id")
     c.add_argument("--marketplace-ref",
                    help="record a price applied elsewhere, without calling eBay")
-    c.add_argument("--offer-id", help="drive updateOffer for this offer")
+    c.add_argument("--offer-id",
+                   help="defaults to the offer id recorded at publish time")
+    c.add_argument("--from-listing", action="store_true",
+                   help="resolve the offer id from the listing record and call eBay")
+    c.add_argument("--dry-run", action="store_true",
+                   help="run every gate, show what would change, send nothing")
     c.add_argument("--production", action="store_true")
     c.add_argument("--no-confirm", action="store_true",
                    help="skip the confirming read; a 200 is not evidence")

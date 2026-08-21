@@ -344,3 +344,57 @@ def test_reading_the_state_of_a_missing_item_raises():
     conn = db()
     with pytest.raises(LookupError):
         sp.item_state(conn, "MP-999999")
+
+
+# --- resolving the offer id recorded at publish -------------------------------
+
+
+def _listing_table(conn, rows):
+    conn.execute(
+        """CREATE TABLE listing (sku TEXT, active INTEGER, environment TEXT,
+               marketplace TEXT, offer_id TEXT, listing_id TEXT)"""
+    )
+    conn.executemany("INSERT INTO listing VALUES (?,?,?,?,?,?)", rows)
+    conn.commit()
+
+
+def test_the_offer_id_comes_from_the_listing_record():
+    conn = db()
+    _listing_table(conn, [("MP-000003", 1, "sandbox", "EBAY_US", "offer-1", "110")])
+    assert sp.offer_id_for(conn, "MP-000003") == "offer-1"
+
+
+def test_an_unpublished_item_says_so_rather_than_returning_nothing():
+    conn = db()
+    _listing_table(conn, [("MP-000003", 1, "sandbox", "EBAY_US", None, None)])
+    with pytest.raises(LookupError, match="no offer id recorded"):
+        sp.offer_id_for(conn, "MP-000003")
+
+
+def test_no_listing_at_all_is_a_different_message():
+    conn = db()
+    _listing_table(conn, [])
+    with pytest.raises(LookupError, match="no active listing"):
+        sp.offer_id_for(conn, "MP-000003")
+
+
+def test_inactive_listings_are_ignored():
+    conn = db()
+    _listing_table(conn, [
+        ("MP-000003", 0, "sandbox", "EBAY_US", "offer-old", "109"),
+        ("MP-000003", 1, "sandbox", "EBAY_US", "offer-new", "110"),
+    ])
+    assert sp.offer_id_for(conn, "MP-000003") == "offer-new"
+
+
+def test_two_active_listings_are_refused_not_guessed():
+    """Silently picking one could point a sandbox reprice at a production offer."""
+    conn = db()
+    _listing_table(conn, [
+        ("MP-000003", 1, "sandbox", "EBAY_US", "offer-sandbox", "110"),
+        ("MP-000003", 1, "production", "EBAY_US", "offer-production", "220"),
+    ])
+    with pytest.raises(LookupError, match="2 active listings") as exc:
+        sp.offer_id_for(conn, "MP-000003")
+    assert "sandbox/EBAY_US/offer-sandbox" in str(exc.value)
+    assert "--offer-id" in str(exc.value)

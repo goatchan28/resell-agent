@@ -16,7 +16,7 @@ import sys
 import uuid
 from collections.abc import Callable
 from typing import Any
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from .pricing.comps import (
     CompBasis,
@@ -50,8 +50,11 @@ from .pricing.lifecycle import (
 from .pricing.proceeds import (
     PROVISIONAL_DEFAULT,
     CostLines,
+    FeeBasis,
+    FeeSchedule,
     meets_publication_floor,
     net_from_gross,
+    production_fee_basis_ok,
 )
 from .pricing.strategy import (
     BrandSignal,
@@ -407,6 +410,86 @@ def cmd_show(args, conn: sqlite3.Connection) -> int:
     return 0
 
 
+# --- fee schedules -------------------------------------------------------------
+
+
+def cmd_fee_schedule_set(args, conn: sqlite3.Connection) -> int:
+    """Record a fee schedule. The basis is a claim, so it has to be sourced.
+
+    `category_verified` and `ebay_quoted` mean somebody checked; without a URL
+    and a capture date that is an assertion nobody can retrace, and the whole
+    point of the basis enum is that production publishing can refuse an estimate.
+    So the command refuses to record a verified basis with nothing behind it.
+    """
+    basis = FeeBasis(args.basis)
+    if basis is not FeeBasis.PROVISIONAL_ESTIMATE:
+        missing = [f for f, v in (("--source-url", args.source_url),
+                                  ("--captured-at", args.captured_at)) if not v]
+        if missing:
+            print(
+                f"{basis} claims the rate was checked; {' and '.join(missing)} "
+                "must say where and when",
+                file=sys.stderr,
+            )
+            return 2
+    if not 0.0 < args.rate < 1.0:
+        print(f"rate {args.rate} is not a fraction between 0 and 1", file=sys.stderr)
+        return 2
+
+    schedule = FeeSchedule(
+        version=args.version,
+        marketplace=args.marketplace,
+        category_id=args.category_id,
+        effective_from=date.fromisoformat(args.effective_from) if args.effective_from else None,
+        rate=args.rate,
+        fixed_cents=args.fixed_cents,
+        cap_cents=args.cap_cents,
+        includes_shipping_in_base=not args.no_shipping_in_base,
+        includes_tax_in_base=args.tax_in_base,
+        basis=basis,
+        source_url=args.source_url,
+        captured_at=date.fromisoformat(args.captured_at) if args.captured_at else None,
+    )
+    sp.upsert_fee_schedule(conn, schedule)
+    scope = args.category_id or "default"
+    print(f"{schedule.version}  {args.marketplace}/{scope}  "
+          f"{schedule.rate:.4%} + {_money(schedule.fixed_cents)}  [{basis}]")
+    return 0
+
+
+def cmd_fee_schedule_list(args, conn: sqlite3.Connection) -> int:
+    rows = sp.list_fee_schedules(conn)
+    if not rows:
+        print("no fee schedules recorded; pricing falls back to the provisional "
+              "placeholder and production publishing will refuse it")
+        return 0
+    print(f"{'version':<32} {'scope':<22} {'rate':>8} {'fixed':>7}  basis")
+    for r in rows:
+        scope = f"{r['marketplace']}/{r['category_id'] or 'default'}"
+        print(f"{r['version']:<32} {scope:<22} {r['rate']:>7.4%} "
+              f"{_money(r['fixed_cents']):>7}  {r['basis']}")
+    return 0
+
+
+def cmd_fee_schedule_show(args, conn: sqlite3.Connection) -> int:
+    """Which schedule a price in this category would actually use."""
+    s = sp.active_fee_schedule(
+        conn, marketplace=args.marketplace, category_id=args.category_id
+    )
+    if s is None:
+        print(f"no schedule matches {args.marketplace}/{args.category_id or 'default'}; "
+              f"the provisional placeholder would be used")
+        return 1
+    ok, why = production_fee_basis_ok(s)
+    print(f"{s.version}  {s.rate:.4%} + {_money(s.fixed_cents)}  [{s.basis}]")
+    print(f"  shipping in fee base: {s.includes_shipping_in_base}   "
+          f"tax in fee base: {s.includes_tax_in_base}")
+    if s.source_url:
+        print(f"  source: {s.source_url} (captured {s.captured_at})")
+    print(f"  production: {'ok' if ok else why}")
+    return 0
+
+
 # --- parser ------------------------------------------------------------------
 
 
@@ -475,8 +558,12 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("propose", help="freeze a comp set and propose a price")
     pricing_args(c)
     c.add_argument("--price-cents", type=int, help="defaults to the band centre")
-    c.add_argument("--objective", default="balanced",
-                   choices=[str(o) for o in SellerObjective])
+    # No default. `recommend` shows all three with their anchors and net
+    # proceeds; choosing between them is the seller's decision, and a default
+    # here would let a proposal record an objective nobody picked.
+    c.add_argument("--objective", required=True,
+                   choices=[str(o) for o in SellerObjective],
+                   help="run `price recommend` first to see all three")
     c.add_argument("--reason", default="initial", choices=[str(r) for r in PriceReason])
     c.add_argument("--rationale")
     c.set_defaults(fn=cmd_propose)
@@ -505,6 +592,33 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--listing-approved", action="store_true")
     c.add_argument("--production", action="store_true")
     c.set_defaults(fn=cmd_show)
+
+    fs = sub.add_parser("fee-schedule", help="marketplace fee rates and their basis")
+    fs_sub = fs.add_subparsers(dest="fee_command", required=True)
+
+    f = fs_sub.add_parser("set", help="record or replace a fee schedule")
+    f.add_argument("--version", required=True)
+    f.add_argument("--marketplace", default="EBAY_US")
+    f.add_argument("--category-id", help="omit for the marketplace default row")
+    f.add_argument("--effective-from")
+    f.add_argument("--rate", type=float, required=True, help="e.g. 0.1335")
+    f.add_argument("--fixed-cents", type=int, default=0)
+    f.add_argument("--cap-cents", type=int, help="caps the percentage portion only")
+    f.add_argument("--no-shipping-in-base", action="store_true",
+                   help="eBay's cut normally applies to the total sale, shipping included")
+    f.add_argument("--tax-in-base", action="store_true")
+    f.add_argument("--basis", required=True, choices=[str(b) for b in FeeBasis])
+    f.add_argument("--source-url", help="required for a verified or quoted basis")
+    f.add_argument("--captured-at", help="ISO date; required for a verified basis")
+    f.set_defaults(fn=cmd_fee_schedule_set)
+
+    f = fs_sub.add_parser("list", help="every recorded schedule")
+    f.set_defaults(fn=cmd_fee_schedule_list)
+
+    f = fs_sub.add_parser("show", help="the schedule a category would actually use")
+    f.add_argument("--marketplace", default="EBAY_US")
+    f.add_argument("--category-id")
+    f.set_defaults(fn=cmd_fee_schedule_show)
 
     return ap
 

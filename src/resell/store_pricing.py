@@ -276,6 +276,15 @@ def upsert_fee_schedule(conn: sqlite3.Connection, s: FeeSchedule) -> str:
     return s.version
 
 
+def list_fee_schedules(conn: sqlite3.Connection) -> list[dict]:
+    conn.execute("PRAGMA foreign_keys = ON")
+    rows = conn.execute(
+        """SELECT * FROM fee_schedule
+           ORDER BY marketplace, category_id IS NULL, category_id, effective_from"""
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def active_fee_schedule(
     conn: sqlite3.Connection, *, marketplace: str, category_id: str | None
 ) -> FeeSchedule | None:

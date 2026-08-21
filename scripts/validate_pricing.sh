@@ -77,21 +77,20 @@ fi
 # but it means production publishing is unreachable until this gets a command.
 
 section "0. fee schedule"
-uv run python - <<'PY'
-import os, sqlite3
-from datetime import date
-from resell.pricing.proceeds import FeeBasis, FeeSchedule
-from resell import store_pricing as sp
-conn = sqlite3.connect(os.environ["RESELL_DB"]); conn.row_factory = sqlite3.Row
-sp.upsert_fee_schedule(conn, FeeSchedule(
-    version="ebay-us-clothing-2026-08", category_id="57988",
-    effective_from=date(2026, 1, 1), rate=0.1335, fixed_cents=40,
-    basis=FeeBasis.CATEGORY_VERIFIED,
-    source_url="https://www.ebay.com/help/selling/fees-credits-invoices/selling-fees",
-    captured_at=date.today(),
-))
-print("  fee schedule ebay-us-clothing-2026-08 recorded (category_verified)")
-PY
+run 0 uv run resell price fee-schedule set \
+  --version ebay-us-clothing-2026-08 --category-id 57988 \
+  --effective-from 2026-01-01 --rate 0.1335 --fixed-cents 40 \
+  --basis category_verified \
+  --source-url https://www.ebay.com/help/selling/fees-credits-invoices/selling-fees \
+  --captured-at 2026-08-21
+
+echo "  -- a verified basis with nothing behind it should be refused --"
+run 2 uv run resell price fee-schedule set --version unsourced \
+  --category-id 57988 --rate 0.1335 --basis category_verified
+
+run 0 uv run resell price fee-schedule show --category-id 57988
+check "the schedule is production-eligible" \
+  "printf '%s' \"\$OUT\" | grep -q 'production: ok'"
 
 # --- 1. comp observations ------------------------------------------------------
 # Note the second one: --shipping-cents omitted means "not reported", which is

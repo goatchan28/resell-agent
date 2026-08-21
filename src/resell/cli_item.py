@@ -1391,8 +1391,9 @@ _AUTOMATIC_STEPS = {
 }
 
 _MANUAL_NEXT = {
-    "pricing": ("propose a price",
-                "resell item propose {sku} --price-cents N --seller-shipping-cents N"),
+    "pricing": ("approve a price, then propose the listing",
+            "resell price approve ID, then "
+            "resell item propose {sku} --seller-shipping-cents N"),
     "proposed": ("approve the proposal",
                  "resell item approve {sku} --hash <from item show>"),
     "approved": ("publish", "resell item publish {sku} --dry-run"),
@@ -1635,6 +1636,7 @@ def cmd_item_verify_safeguards(args: argparse.Namespace) -> int:
     refused. Costs one SKU, which is never reused; the fixture is abandoned at the
     end and left in the database as an audit record.
     """
+    import dataclasses
     import sqlite3
 
     config, conn, gateway = _open()
@@ -1693,6 +1695,44 @@ def cmd_item_verify_safeguards(args: argparse.Namespace) -> int:
         return_policy_id=policy("return_policy_id"),
         merchant_location_key=policy("merchant_location_key"),
     )
+    # --- price authority -----------------------------------------------------
+    # The pricing layer owns price. Both probes run here because this is where
+    # their premises hold without being manufactured.
+
+    def seed_approved_price(cents: int) -> None:
+        from datetime import datetime, timezone
+
+        from resell import store_pricing as sp
+        from resell.pricing.lifecycle import PriceProposal, PriceReason
+        from resell.pricing.proceeds import FeeBasis
+
+        priced = PriceProposal(
+            proposal_id=f"pp_{sku}",
+            sku=sku,
+            reason=PriceReason.INITIAL,
+            price_cents=cents,
+            created_at=datetime.now(timezone.utc),
+            fee_basis=FeeBasis.CATEGORY_VERIFIED,
+            floor_ok=True,
+            rationale="verify-safeguards fixture",
+        )
+        sp.record_proposal(conn, priced)
+        sp.approve_proposal(conn, priced)
+
+    check(
+        "listing proposed with no approved price",
+        lambda: gateway.propose_listing(sku, proposal),
+    )
+
+    seed_approved_price(proposal.price_cents)
+
+    check(
+        "listing proposed at a price the pricing layer never approved",
+        lambda: gateway.propose_listing(
+            sku, dataclasses.replace(proposal, price_cents=proposal.price_cents + 100)
+        ),
+    )
+
     accepted = gateway.propose_listing(sku, proposal)
     good_hash = accepted.data["proposal_hash"]
     gateway.approve(sku, good_hash, operator=True)
@@ -1861,7 +1901,10 @@ def register(subparsers) -> None:
 
     propose = sub.add_parser("propose", help="pricing -> proposed (validation gate)")
     propose.add_argument("sku")
-    propose.add_argument("--price-cents", type=int, required=True)
+    propose.add_argument(
+        "--price-cents", type=int,
+        help="defaults to the approved price; given, it must match",
+    )
     propose.add_argument(
         "--shipping-terms",
         choices=[str(t) for t in ShippingTerms],

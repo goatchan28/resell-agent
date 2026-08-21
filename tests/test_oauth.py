@@ -703,6 +703,34 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def _approve_price(conn, sku: str, price_cents: int) -> None:
+    """The minimum pricing-layer setup a listing proposal now requires.
+
+    propose_listing reads the approved price and refuses to accept a listing
+    proposal that disagrees with it, so price is a precondition of listing
+    content rather than something typed alongside it. These tests are about
+    approvals, photos and publishing -- they need the price to exist, not to be
+    interesting, so this is the smallest thing that satisfies the gate.
+    """
+    from datetime import datetime, timezone
+
+    from resell import store_pricing as sp
+    from resell.pricing.lifecycle import PriceProposal, PriceReason
+    from resell.pricing.proceeds import FeeBasis
+
+    proposal = PriceProposal(
+        proposal_id=f"pp_{sku}_{price_cents}",
+        sku=sku,
+        reason=PriceReason.INITIAL,
+        price_cents=price_cents,
+        created_at=datetime.now(timezone.utc),
+        fee_basis=FeeBasis.CATEGORY_VERIFIED,
+        floor_ok=True,
+    )
+    sp.record_proposal(conn, proposal)
+    sp.approve_proposal(conn, proposal)
+
+
 def _valid_proposal(sku: str, photo_hashes: tuple[str, ...]):
     from resell.domain import Proposal, ShippingTerms
 
@@ -780,6 +808,7 @@ def test_approval_is_voided_by_content_change(tmp_path: Path):
     gateway.begin_identification(sku)
     gateway.propose_identification(sku, title="t", category_id="261186", condition_id="USED_GOOD")
     gateway.begin_pricing(sku)
+    _approve_price(conn, sku, 1999)
     accepted = gateway.propose_listing(
         sku, _valid_proposal(sku, (_digest("a"),)), required_aspects={"Author", "Format"}
     )
@@ -809,6 +838,7 @@ def test_approve_requires_matching_hash(tmp_path: Path):
     gateway.begin_identification(sku)
     gateway.propose_identification(sku, title="t", category_id="261186", condition_id="USED_GOOD")
     gateway.begin_pricing(sku)
+    _approve_price(conn, sku, 1999)
     gateway.propose_listing(
         sku, _valid_proposal(sku, (_digest("a"),)), required_aspects=set()
     )
@@ -831,6 +861,7 @@ def test_listed_requires_a_listing_id(tmp_path: Path):
     gateway.begin_identification(sku)
     gateway.propose_identification(sku, title="t", category_id="261186", condition_id="USED_GOOD")
     gateway.begin_pricing(sku)
+    _approve_price(conn, sku, 1999)
     accepted = gateway.propose_listing(
         sku, _valid_proposal(sku, (_digest("a"),)), required_aspects=set()
     )
@@ -885,9 +916,8 @@ def test_proposal_photos_must_belong_to_the_item(tmp_path: Path):
     gateway.propose_identification(sku, title="t", category_id="261186", condition_id="USED_GOOD")
     gateway.begin_pricing(sku)
     with pytest.raises(Rejected, match="not an attached validated photo"):
+        _approve_price(conn, sku, 1999)
         gateway.propose_listing(sku, _valid_proposal(sku, (_digest("elsewhere"),)))
-
-
 def test_proposal_does_not_require_uploaded_images(tmp_path: Path):
     """Uploads happen at publish, not at proposal: uploading earlier would burn
     EPS uploads on items that are never approved and start the 30-day expiry
@@ -905,6 +935,7 @@ def test_proposal_does_not_require_uploaded_images(tmp_path: Path):
     gateway.begin_pricing(sku)
 
     assert conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] == 0
+    _approve_price(conn, sku, 1999)
     accepted = gateway.propose_listing(sku, _valid_proposal(sku, (_digest("a"),)))
     assert accepted.to_state == ItemState.PROPOSED
 
@@ -1026,6 +1057,7 @@ def test_preconditions_are_enforced_on_state_entry(tmp_path: Path):
     gateway.begin_identification(sku)
     gateway.propose_identification(sku, title="t", category_id="3002", condition_id="USED_EXCELLENT")
     gateway.begin_pricing(sku)
+    _approve_price(conn, sku, 1999)
     accepted = gateway.propose_listing(sku, _valid_proposal(sku, (_digest("a"),)))
     gateway.approve(sku, accepted.data["proposal_hash"], operator=True)
 
@@ -1079,6 +1111,7 @@ def test_truncated_hash_is_distinguished_from_a_changed_proposal(tmp_path: Path)
     gateway.begin_identification(sku)
     gateway.propose_identification(sku, title="t", category_id="3002", condition_id="USED_EXCELLENT")
     gateway.begin_pricing(sku)
+    _approve_price(conn, sku, 1999)
     accepted = gateway.propose_listing(sku, _valid_proposal(sku, (_digest("a"),)))
     full = accepted.data["proposal_hash"]
     assert len(full) == 64
@@ -1119,6 +1152,7 @@ def _build_approved(gateway, conn, *, photo_count: int = 2):
         sku, title="Blazer 42R", category_id="3002", condition_id="USED_EXCELLENT"
     )
     gateway.begin_pricing(sku)
+    _approve_price(conn, sku, 8900)
     proposal = Proposal(
         sku=sku, marketplace="EBAY_US", title="Blazer 42R", description="Navy wool.",
         category_id="3002", condition_id="USED_EXCELLENT", aspects={"Brand": ["BB"]},
@@ -1440,6 +1474,7 @@ def test_local_check_failure_leaves_the_item_recoverable(tmp_path: Path):
         sku, title="t", category_id="3002", condition_id="USED_EXCELLENT"
     )
     gateway.begin_pricing(sku)
+    _approve_price(conn, sku, 1999)
     accepted = gateway.propose_listing(sku, _valid_proposal(sku, (digest,)))
     gateway.approve(sku, accepted.data["proposal_hash"], operator=True)
 

@@ -81,6 +81,93 @@ def _rehydrate_basis(
     return rehydrated
 
 
+def load_operator_candidates(
+    conn: sqlite3.Connection, sku: str
+) -> dict[str, list[Candidate]]:
+    """Stored candidates whose support is an operator statement.
+
+    Spans identification versions on purpose. An operator answering "40R" was
+    describing the object, not the model's current guess about it, so the answer
+    survives re-identification. Bases come from the evidence row, never from
+    anything a caller asserted.
+
+    Assumes `identification.sku`; if that column is named otherwise, this join is
+    the only thing to change.
+    """
+    rows = conn.execute(
+        """
+        SELECT ac.aspect_name AS aspect_name, ac.value AS value,
+               e.id AS evidence_id, e.basis AS basis
+        FROM aspect_candidate ac
+        JOIN identification i ON i.id = ac.identification_id
+        JOIN aspect_candidate_evidence ace ON ace.candidate_id = ac.id
+        JOIN evidence e ON e.id = ace.evidence_id
+        WHERE i.sku = ? AND e.basis = ?
+        """,
+        (sku, str(Basis.OPERATOR)),
+    ).fetchall()
+
+    support: dict[tuple[str, str], list[EvidenceRef]] = {}
+    for row in rows:
+        key = (row["aspect_name"], row["value"])
+        support.setdefault(key, []).append(
+            EvidenceRef(row["evidence_id"], Basis(row["basis"]))
+        )
+
+    out: dict[str, list[Candidate]] = {}
+    for (aspect_name, value), refs in support.items():
+        out.setdefault(aspect_name, []).append(
+            Candidate(value=value, support=tuple(refs))
+        )
+    return out
+
+
+def _merge_operator_candidates(
+    conn: sqlite3.Connection,
+    sku: str,
+    resolved: dict[str, list[Candidate]],
+    known_aspects: set[str],
+) -> dict[str, list[Candidate]]:
+    """Fold operator statements into the model's candidates before resolution.
+
+    Same value as one the model proposed: the support is unioned, so that
+    candidate gains an adjudicating basis and wins rather than competing with
+    itself. Different value: it joins as a competing candidate and wins on
+    adjudication. Two operator statements naming different values: both are
+    adjudicating, `analyse` finds more than one, and it falls through to
+    contradicted -- which is correct, because the operator has contradicted
+    themselves and inventing a winner would hide that.
+
+    Aspects outside the category's form are dropped; `analyse` is given a
+    cardinality map keyed on the form, and an aspect missing from it has no
+    defined behaviour.
+    """
+    stored = load_operator_candidates(conn, sku)
+    if not stored:
+        return resolved
+
+    merged = {name: list(candidates) for name, candidates in resolved.items()}
+    for aspect_name, operator_candidates in stored.items():
+        if aspect_name not in known_aspects:
+            continue
+        existing = merged.setdefault(aspect_name, [])
+        for candidate in operator_candidates:
+            match = next(
+                (c for c in existing if c.value == candidate.value), None
+            )
+            if match is None:
+                existing.append(candidate)
+                continue
+            union = {(ref.evidence_id, ref.basis): ref for ref in match.support}
+            union.update(
+                {(ref.evidence_id, ref.basis): ref for ref in candidate.support}
+            )
+            existing[existing.index(match)] = Candidate(
+                value=match.value, support=tuple(union.values())
+            )
+    return merged
+
+
 def map_aspects(
     conn: sqlite3.Connection,
     sku: str,
@@ -191,6 +278,9 @@ def map_aspects(
     }
     required_names = [spec.name for spec in specs if spec.required]
     cardinality = {spec.name: spec.cardinality for spec in specs}
+    # Operator statements are inputs to resolution, not audit records written
+    # after it. Without this, answering a blocking question changed nothing.
+    resolved = _merge_operator_candidates(conn, sku, resolved, set(cardinality))
     outcomes, gaps = analyse(
         required_names, resolved, cardinality, proposal.reasons_by_aspect
     )

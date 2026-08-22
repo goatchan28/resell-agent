@@ -15,7 +15,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from resell import db
+from resell import db, views
 from resell.config import load_config
 from resell.domain import (
     FeeBasis,
@@ -33,8 +33,6 @@ from resell.gateway import (
     active_listing,
     current_identification,
     get_item,
-    live_approval,
-    unresolved_blocking_questions,
     validated_photos,
 )
 from resell.images import inspect
@@ -69,6 +67,11 @@ def _rejected(exc: Rejected) -> int:
     for reason in exc.reasons:
         print(f"    {reason}", file=sys.stderr)
     return 1
+
+
+def _money(cents: int | None, *, unknown: str = "-") -> str:
+    """Cents to dollars, for display only. Nothing computes on this string."""
+    return unknown if cents is None else f"${cents / 100:.2f}"
 
 
 # --- commands ----------------------------------------------------------------
@@ -642,8 +645,7 @@ def cmd_item_evidence(args: argparse.Namespace) -> int:
 def cmd_item_draft(args: argparse.Namespace) -> int:
     """Write the listing copy, then check it against the record."""
     config, conn, gateway = _open(require_credentials=True)
-    from resell.ebay.client import EbayApiError, EbayClient
-    from resell.ebay.publisher import Publisher
+    from resell.ebay.client import EbayApiError
     from resell.reasoning.budget import BudgetExceeded, StageBudget
     from resell.reasoning.drafting import DraftingError, draft_listing, store_draft
     from resell.reasoning.vision import spend_so_far
@@ -657,16 +659,13 @@ def cmd_item_draft(args: argparse.Namespace) -> int:
     unresolved: tuple[str, ...] = ()
     category_id = args.category or identification["category_id"]
     if category_id:
-        with EbayClient(config, conn) as client:
-            try:
-                specs = Publisher(gateway, client, conn).aspect_schema(
-                    config.marketplace_id, category_id
-                )
-                unresolved = tuple(
-                    spec.name for spec in specs if spec.required and not aspects.get(spec.name)
-                )
-            except EbayApiError as exc:
-                print(f"  (aspect form unavailable: HTTP {exc.status_code})")
+        try:
+            specs = views.fetch_aspect_schema(config, conn, gateway, category_id)
+            unresolved = tuple(
+                spec.name for spec in specs if spec.required and not aspects.get(spec.name)
+            )
+        except EbayApiError as exc:
+            print(f"  (aspect form unavailable: HTTP {exc.status_code})")
 
     if not args.ignore_questions and blocking_question_gate(conn, args.sku, "drafting"):
         return 1
@@ -820,7 +819,23 @@ def cmd_item_research(args: argparse.Namespace) -> int:
 
     stage_budget = StageBudget.from_env("research")
     lookup_budget = LookupBudget.from_env("identity")
-    adapter = get_research_adapter(args.research_provider)
+    # `fetch` runs a ledgered extraction call per page, so it needs the connection,
+    # the SKU and a model adapter of its own. The extraction provider is separate
+    # from the reasoning provider on purpose: it is the narrowest, highest-volume
+    # stage and the first candidate for a cheaper or local model, and choosing it
+    # independently is what makes that a flag rather than a rewrite.
+    extra: dict = {}
+    if args.research_provider == "fetch":
+        from resell.reasoning.adapters import get_adapter
+
+        extra = {
+            "conn": conn,
+            "sku": args.sku,
+            "model_adapter": get_adapter(
+                args.extraction_provider or args.provider
+            ),
+        }
+    adapter = get_research_adapter(args.research_provider, **extra)
     rates = LookupRates.from_env(adapter.provider)
     performed = conn.execute(
         "SELECT COUNT(*) FROM research_lookup WHERE sku = ? AND scope = 'identity'",
@@ -864,6 +879,14 @@ def cmd_item_research(args: argparse.Namespace) -> int:
         print(f"\n  STOPPED [{outcome.stopped}] {outcome.stop_reason}")
         _print_mode(outcome)
         return 0
+
+    # An unusable plan is a failed call, not a decision about the item, and it
+    # exits non-zero so a scripted run does not read it as a completed round.
+    if outcome.stopped == "plan_unusable":
+        print(f"\n  FAILED [{outcome.stopped}] {outcome.stop_reason}", file=sys.stderr)
+        for note in outcome.notes:
+            print(f"    {note[:150]}", file=sys.stderr)
+        return 1
 
     plan = outcome.plan
     if plan:
@@ -1108,21 +1131,31 @@ def _apply_mapping(conn, gateway, sku: str, outcome, required: set[str],
     if carried:
         print(f"    carried forward from the previous version: {', '.join(carried)}")
 
-    opened = 0
+    opened, already = 0, []
     for gap in outcome.gaps:
         if not gap.blocking:
             continue
         try:
-            gateway.ask_operator(
+            accepted = gateway.ask_operator(
                 sku, question=gap.question,
                 why_it_matters=f"required aspect {gap.aspect_name} is {gap.resolution}",
                 aspect_name=gap.aspect_name,
             )
-            opened += 1
         except Rejected as exc:
             print(f"  could not open a question for {gap.aspect_name}: {exc.reasons[0]}")
+            continue
+        # Re-running the mapper is normal and must not multiply the inbox. The
+        # gateway refuses the duplicate; this reports it as standing rather than
+        # counting it as new.
+        if accepted.data.get("already_open"):
+            already.append((gap.aspect_name, accepted.data["question_id"]))
+        else:
+            opened += 1
     if opened:
         print(f"  {opened} blocking question(s) opened; answer with: resell item answer ID ANSWER")
+    for aspect_name, question_id in already:
+        print(f"  {aspect_name}: still waiting on question {question_id}, "
+              f"asked earlier and not answered")
     return 0
 
 
@@ -1133,8 +1166,7 @@ def cmd_item_aspects(args: argparse.Namespace) -> int:
     schema the reasoning plane will be handed as a form to fill.
     """
     config, conn, gateway = _open(require_credentials=True)
-    from resell.ebay.client import EbayApiError, EbayClient
-    from resell.ebay.publisher import Publisher
+    from resell.ebay.client import EbayApiError
 
     category_id = args.category
     identification = current_identification(conn, args.sku) if args.sku else None
@@ -1144,14 +1176,11 @@ def cmd_item_aspects(args: argparse.Namespace) -> int:
             print("no category on the identification; pass --category", file=sys.stderr)
             return 2
 
-    with EbayClient(config, conn) as client:
-        try:
-            schema = Publisher(gateway, client, conn).aspect_schema(
-                config.marketplace_id, category_id
-            )
-        except EbayApiError as exc:
-            print(f"aspect lookup failed for category {category_id}:\n{exc}", file=sys.stderr)
-            return 1
+    try:
+        schema = views.fetch_aspect_schema(config, conn, gateway, category_id)
+    except EbayApiError as exc:
+        print(f"aspect lookup failed for category {category_id}:\n{exc}", file=sys.stderr)
+        return 1
 
     current = {}
     if identification and identification["aspects"]:
@@ -1301,45 +1330,23 @@ def cmd_item_publish(args: argparse.Namespace) -> int:
 
 
 def cmd_item_list(args: argparse.Namespace) -> int:
-    """Every item, in SKU order. Includes terminal ones by default.
-
-    Abandoned items are shown rather than hidden: SKUs are never reused, so a gap
-    in the sequence is a question worth being able to answer.
-    """
+    """Every item, in SKU order. Includes terminal ones by default."""
     config, conn, _ = _open()
-    clauses, params = [], []
-    if args.state:
-        clauses.append(f"state IN ({','.join('?' * len(args.state))})")
-        params.extend(args.state)
-    if args.active:
-        clauses.append("state NOT IN ('abandoned', 'listed')")
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-
-    rows = conn.execute(
-        f"""
-        SELECT i.sku, i.state, i.acquisition_intent, i.purchase_cost_cents,
-               i.identification_effort, i.created_at, i.notes,
-               (SELECT COUNT(*) FROM photo p WHERE p.sku = i.sku) AS photos,
-               (SELECT COUNT(*) FROM evidence e WHERE e.sku = i.sku) AS evidence,
-               (SELECT l.listing_id FROM listing l
-                 WHERE l.sku = i.sku AND l.active = 1) AS listing_id
-          FROM item i {where} ORDER BY i.seq
-        """,
-        params,
-    ).fetchall()
-
-    if not rows:
+    items = views.item_summaries(
+        conn, states=tuple(args.state or ()), active_only=bool(args.active)
+    )
+    if not items:
         print("no items")
         return 0
 
     print(f"\n{'sku':<11} {'state':<15} {'intent':<10} {'cost':>8} {'ph':>3} {'ev':>3}  detail")
-    for row in rows:
-        cost = "-" if row["purchase_cost_cents"] is None else f"${row['purchase_cost_cents'] / 100:.2f}"
-        detail = row["listing_id"] or (row["notes"] or "")[:44]
-        print(f"{row['sku']:<11} {row['state']:<15} {row['acquisition_intent']:<10} "
-              f"{cost:>8} {row['photos']:>3} {row['evidence']:>3}  {detail}")
+    for item in items:
+        cost = _money(item.purchase_cost_cents)
+        detail = item.listing_id or (item.notes or "")[:44]
+        print(f"{item.sku:<11} {item.state:<15} {item.acquisition_intent:<10} "
+              f"{cost:>8} {item.photo_count:>3} {item.evidence_count:>3}  {detail}")
 
-    print(f"\n{len(rows)} item(s) in {config.env.name}")
+    print(f"\n{len(items)} item(s) in {config.env.name}")
     return 0
 
 
@@ -1355,32 +1362,22 @@ def blocking_question_gate(conn, sku: str, stage: str) -> list:
     later mapping run can settle what an earlier one asked about, and being asked
     again about something already decided teaches people to skip the prompt.
     """
-    rows = conn.execute(
-        "SELECT id, question, why_it_matters, aspect_name FROM open_question "
-        "WHERE sku = ? AND answered_at IS NULL AND blocking = 1 ORDER BY id",
-        (sku,),
-    ).fetchall()
-    if not rows:
+    questions = views.open_questions(conn, sku=sku, blocking_only=True)
+    if not questions:
         return []
 
-    identification = current_identification(conn, sku)
-    aspects = json.loads(identification["aspects"]) if (
-        identification and identification["aspects"]
-    ) else {}
-
-    print(f"\n  {len(rows)} blocking question(s) must be settled before {stage}:")
-    for row in rows:
-        print(f"\n    [{row['id']}] {row['question'][:96]}")
-        resolved = aspects.get(row["aspect_name"]) if row["aspect_name"] else None
-        if resolved:
-            print(f"         since resolved: {row['aspect_name']} = "
-                  f"{' + '.join(map(str, resolved))}")
-            print(f"         resell item answer {row['id']} \"confirmed: "
-                  f"{' + '.join(map(str, resolved))}\"")
+    print(f"\n  {len(questions)} blocking question(s) must be settled before {stage}:")
+    for question in questions:
+        print(f"\n    [{question.id}] {question.question[:96]}")
+        suggested = question.suggested_answer
+        if suggested:
+            print(f"         since resolved: {question.aspect_name} = {suggested}")
+            print(f"         resell item answer {question.id} "
+                  f"\"confirmed: {suggested}\"")
         else:
-            print(f"         resell item answer {row['id']} \"YOUR ANSWER\"")
+            print(f"         resell item answer {question.id} \"YOUR ANSWER\"")
     print(f"\n  Or proceed anyway with --ignore-questions.")
-    return list(rows)
+    return questions
 
 
 # Transitions the workflow may make on its own: no arguments, no judgment, only
@@ -1488,140 +1485,115 @@ def cmd_item_questions(args: argparse.Namespace) -> int:
     never gets called.
     """
     _, conn, _ = _open()
-    clauses = ["q.answered_at IS NULL"]
-    params: list = []
-    if args.sku:
-        clauses.append("q.sku = ?")
-        params.append(args.sku)
-    if args.blocking:
-        clauses.append("q.blocking = 1")
-
-    rows = conn.execute(
-        f"""
-        SELECT q.id, q.sku, q.question, q.why_it_matters, q.blocking, q.asked_at,
-               i.state
-          FROM open_question q JOIN item i ON i.sku = q.sku
-         WHERE {' AND '.join(clauses)}
-         ORDER BY q.sku, q.blocking DESC, q.id
-        """,
-        params,
-    ).fetchall()
-
-    if not rows:
+    questions = views.open_questions(
+        conn, sku=args.sku, blocking_only=bool(args.blocking)
+    )
+    if not questions:
         print("no open questions" + (f" for {args.sku}" if args.sku else ""))
         return 0
 
     current = None
-    for row in rows:
-        if row["sku"] != current:
-            current = row["sku"]
-            print(f"\n{row['sku']}  ({row['state']})")
-        mark = "BLOCKING" if row["blocking"] else "optional"
-        print(f"  [{row['id']:>3}] {mark}")
-        for line in _wrap(row["question"], 88):
+    for question in questions:
+        if question.sku != current:
+            current = question.sku
+            print(f"\n{question.sku}  ({question.item_state})")
+        mark = "BLOCKING" if question.blocking else "optional"
+        print(f"  [{question.id:>3}] {mark}")
+        for line in _wrap(question.question, 88):
             print(f"        {line}")
-        if row["why_it_matters"]:
-            for line in _wrap(f"why: {row['why_it_matters']}", 88):
+        if question.why_it_matters:
+            for line in _wrap(f"why: {question.why_it_matters}", 88):
                 print(f"        {line}")
-        print(f'        resell item answer {row["id"]} "YOUR ANSWER"')
+        if question.allowed_values:
+            shown = ", ".join(question.allowed_values[:12])
+            more = ("" if len(question.allowed_values) <= 12
+                    else f", and {len(question.allowed_values) - 12} more")
+            for line in _wrap(f"eBay accepts: {shown}{more}", 88):
+                print(f"        {line}")
+        suggested = question.suggested_answer or "YOUR ANSWER"
+        print(f'        resell item answer {question.id} "{suggested}"')
 
-    blocking = sum(1 for row in rows if row["blocking"])
-    print(f"\n{len(rows)} open ({blocking} blocking)")
+    blocking = sum(1 for question in questions if question.blocking)
+    print(f"\n{len(questions)} open ({blocking} blocking)")
     return 0
 
 
 def cmd_item_show(args: argparse.Namespace) -> int:
     config, conn, gateway = _open()
     try:
-        item = get_item(conn, args.sku)
+        item = views.item_detail(
+            conn, gateway, args.sku,
+            marketplace=config.marketplace_id, environment=config.env.name,
+        )
     except Rejected as exc:
         return _rejected(exc)
 
-    print(f"\n{item['sku']}  state={item['state']}  intent={item['acquisition_intent']}")
-    cost = item["purchase_cost_cents"]
-    print(f"  purchase cost: {'unknown' if cost is None else f'${cost / 100:.2f}'}")
-    if item["notes"]:
-        print(f"  notes: {item['notes']}")
+    print(f"\n{item.sku}  state={item.state}  intent={item.acquisition_intent}")
+    print(f"  purchase cost: {_money(item.purchase_cost_cents, unknown='unknown')}")
+    if item.notes:
+        print(f"  notes: {item.notes}")
 
-    photos = validated_photos(conn, args.sku)
-    total = conn.execute("SELECT COUNT(*) FROM photo WHERE sku = ?", (args.sku,)).fetchone()[0]
-    print(f"\n  photos: {len(photos)} valid of {total}")
-    for photo in photos:
-        print(f"    {photo['position']}. {Path(photo['source_path']).name}  "
-              f"{photo['image_format']}  sha={photo['content_sha256'][:12]}")
+    print(f"\n  photos: {len(item.photos)} valid of {item.photo_count_total}")
+    for photo in item.photos:
+        print(f"    {photo.position}. {photo.filename}  "
+              f"{photo.image_format}  sha={photo.content_sha256[:12]}")
 
-    identification = current_identification(conn, args.sku)
+    identification = item.identification
     if identification:
-        print(f"\n  identification v{identification['version']}  "
-              f"confidence={identification['confidence']} (diagnostic only)")
+        print(f"\n  identification v{identification.version}  "
+              f"confidence={identification.confidence} (diagnostic only)")
         for field in ("brand", "model", "title", "category_id", "condition_id"):
-            if identification[field]:
-                print(f"    {field}: {identification[field]}")
-        if identification["aspects"]:
-            print(f"    aspects: {identification['aspects']}")
+            value = getattr(identification, field)
+            if value:
+                print(f"    {field}: {value}")
+        if identification.aspects:
+            print(f"    aspects: {json.dumps(identification.aspects)}")
 
-    history = conn.execute(
-        "SELECT version, title, category_id, condition_id, superseded_at "
-        "FROM identification WHERE sku = ? AND superseded_at IS NOT NULL "
-        "ORDER BY version DESC LIMIT 5",
-        (args.sku,),
-    ).fetchall()
-    if history:
+    if item.superseded:
         print("\n  superseded identifications (values are recoverable):")
-        for row in history:
-            print(f"    v{row['version']}  category={row['category_id']} "
-                  f"condition={row['condition_id']}  {(row['title'] or '')[:44]}")
+        for row in item.superseded:
+            print(f"    v{row.version}  category={row.category_id} "
+                  f"condition={row.condition_id}  {(row.title or '')[:44]}")
 
-    questions = unresolved_blocking_questions(conn, args.sku)
-    if questions:
-        print(f"\n  unresolved blocking questions: {len(questions)}")
-        for question in questions:
-            print(f"    [{question['id']}] {question['question'][:88]}")
-    optional = conn.execute(
-        "SELECT COUNT(*) FROM open_question WHERE sku = ? AND answered_at IS NULL "
-        "AND blocking = 0", (args.sku,),
-    ).fetchone()[0]
-    if optional:
-        print(f"  {optional} non-blocking question(s); see: resell item questions {args.sku}")
+    if item.blocking_questions:
+        print(f"\n  unresolved blocking questions: {len(item.blocking_questions)}")
+        for question in item.blocking_questions:
+            print(f"    [{question.id}] {question.question[:88]}")
+    if item.optional_questions:
+        print(f"  {len(item.optional_questions)} non-blocking question(s); "
+              f"see: resell item questions {item.sku}")
 
-    listing = active_listing(conn, args.sku, config.marketplace_id, config.env.name)
+    listing = item.listing
     if listing:
-        print(f"\n  listing ({listing['marketplace']} / {listing['environment']})")
-        print(f"    price: ${(listing['price_cents'] or 0) / 100:.2f}   "
-              f"terms: {listing['shipping_terms']}   "
-              f"seller ship: ${listing['seller_shipping_cost_cents'] / 100:.2f}   "
-              f"buyer charge: ${listing['buyer_shipping_charge_cents'] / 100:.2f}")
-        print(f"    fees: ${(listing['estimated_fees_cents'] or 0) / 100:.2f} "
-              f"(basis: {listing['fee_basis']}, rate {listing['fee_rate_used']})")
-        print(f"    offer_id={listing['offer_id']}  listing_id={listing['listing_id']}")
+        print(f"\n  listing ({listing.marketplace} / {listing.environment})")
+        print(f"    price: {_money(listing.price_cents)}   "
+              f"terms: {listing.shipping_terms}   "
+              f"seller ship: {_money(listing.seller_shipping_cost_cents)}   "
+              f"buyer charge: {_money(listing.buyer_shipping_charge_cents)}")
+        print(f"    fees: {_money(listing.estimated_fees_cents)} "
+              f"(basis: {listing.fee_basis}, rate {listing.fee_rate_used})")
+        print(f"    offer_id={listing.offer_id}  listing_id={listing.listing_id}")
 
     # The current proposal hash must be retrievable at any time, not only from the
-    # output of `item propose`. It is computed, not stored, so it is derived here.
-    if listing:
-        current_hash = gateway._proposal_from_listing(args.sku, listing).content_hash()
-        print(f"\n  current proposal hash:\n    {current_hash}")
-        if item["state"] == str(ItemState.PROPOSED):
-            print(f"\n  approve with:\n    resell item approve {args.sku} --hash {current_hash}")
+    # output of `item propose`. It is computed, not stored.
+    if item.proposal_hash:
+        print(f"\n  current proposal hash:\n    {item.proposal_hash}")
+        if item.state == str(ItemState.PROPOSED):
+            print(f"\n  approve with:\n    resell item approve {item.sku} "
+                  f"--hash {item.proposal_hash}")
 
-    approval = live_approval(conn, args.sku)
-    if approval:
-        print(f"\n  live approval:\n    {approval['proposal_hash']}")
+    if item.live_approval_hash:
+        print(f"\n  live approval:\n    {item.live_approval_hash}")
     else:
         print("\n  live approval: none")
-    voided = conn.execute(
-        "SELECT COUNT(*) FROM approval WHERE sku = ? AND voided_at IS NOT NULL", (args.sku,)
-    ).fetchone()[0]
-    if voided:
-        print(f"  voided approvals: {voided}")
+    if item.voided_approvals:
+        print(f"  voided approvals: {item.voided_approvals}")
 
-    evidence = conn.execute(
-        "SELECT kind, source, send_to_model FROM evidence WHERE sku = ? ORDER BY id", (args.sku,)
-    ).fetchall()
-    if evidence:
-        print(f"\n  evidence: {len(evidence)} record(s)")
-        for row in evidence:
-            flag = "" if row["send_to_model"] else "  [withheld from model]"
-            print(f"    {row['kind']} from {row['source']}{flag}")
+    if item.evidence:
+        print(f"\n  evidence: {len(item.evidence)} record(s)")
+        for row in item.evidence:
+            flag = "" if row.send_to_model else "  [withheld from model]"
+            print(f"    {row.kind} from {row.source}{flag}")
     return 0
 
 
@@ -2005,7 +1977,12 @@ def register(subparsers) -> None:
     research.add_argument("--category", help="defaults to the identification's category")
     research.add_argument("--provider", default=None, help="model provider")
     research.add_argument("--research-provider", default=None,
-                          help="retrieval provider (default: manual)")
+                          help="retrieval provider: manual (you type the facts) or "
+                               "fetch (you give a URL, the page is read for you)")
+    research.add_argument("--extraction-provider", default=None,
+                          help="model for reading fetched pages; defaults to "
+                               "--provider. Separate so the cheapest stage can move "
+                               "to a cheaper model on its own")
     research.add_argument("--dry-run", action="store_true",
                           help="plan only; fetch nothing")
     research.add_argument("--rejudge", action="store_true",

@@ -17,7 +17,9 @@ else will follow.
 | `ebay/store.py` | Token persistence. No network |
 | `ebay/tokens.py` | The two grant flows: user (authorization code + refresh) and application (client credentials) |
 | `ebay/client.py` | Authenticated HTTP client: reactive 401 refresh, bounded retries, call logging |
-| `cli.py` | `auth login` / `status` / `refresh` / `logout`, `smoke`, `events` |
+| `cli.py` | `auth login` / `status` / `refresh` / `logout`, `smoke`, `events`, `ui` |
+| `views.py` | Read models. Every question the CLI and the UI both ask, answered once. No printing, no mutation |
+| `webui/` | Local operator UI (Flask, optional extra). Transport only — see [Operator UI](#operator-ui) |
 
 Layering is deliberate: pure logic, then persistence, then network, then
 transport. That is why the whole test suite runs with no credentials and no
@@ -107,6 +109,50 @@ uv run resell auth status   # expiries and scopes; never prints token material
 uv run resell events -n 20  # what actually happened
 uv run pytest               # 22 tests, no network or credentials needed
 ```
+
+## Operator UI
+
+A local web interface over the same backend the CLI drives. Start it with:
+
+```bash
+uv run resell ui        # http://127.0.0.1:5000
+```
+
+Flask is an optional extra, so install it if the command reports it missing:
+
+```bash
+uv pip install 'resell[ui]'
+```
+
+The environment and marketplace are shown on every page, because sandbox and
+production are different databases holding different real listings.
+
+**What it supports today**
+
+- upload photos, and create an item with its cost and acquisition intent
+- item list, and item detail: photos, identification, aspects, listing, approval
+  hashes, evidence
+- the item's aspects against eBay's live form for its category, with required
+  values marked missing
+- blocking and non-blocking questions, per item and as one cross-item inbox
+- answering a question, validated against the values eBay listed when it was
+  asked, with an explicit override for when that list is wrong
+- the listing draft: the current identification's copy alongside what was
+  actually proposed, so drift between them is visible
+- pricing: the band, its distributions and qualifiers, all three strategies with
+  net proceeds, and the price history
+
+**It is a local operator interface, not a service.** It binds 127.0.0.1, has no
+authentication and none is planned. The process holds a read-write handle on the
+item database, and an eBay refresh token lives in the same file.
+
+**The UI is a front end and nothing more.** Reads go through `views.py`, the
+shared read models the CLI also renders. Writes go straight to existing gateway
+functions — `ingest_item`, `attach_photo`, `answer_question` — and those three are
+the only mutations it can make. There is no approve, propose, publish or price
+route: those bind authority to a specific content hash, and that decision stays
+with the CLI. No SQL, no derivation and no policy lives in the Flask package; if
+the CLI would want a computation too, it belongs in `views.py`.
 
 ## Design decisions worth remembering
 

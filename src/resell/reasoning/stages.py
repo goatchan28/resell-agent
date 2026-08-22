@@ -200,6 +200,13 @@ different sizes, or one observation that cannot distinguish navy from black, are
 both cases where returning both readings is the right answer.
 - Do not cite an observation that merely mentions the topic. "The label reads MADE IN \
 EGYPT" supports a Country/Region of Manufacture value; it does not support a Size.
+- The observation you cite must state the value itself. An observation that only \
+supports it once you add knowledge from outside this list does not support it: a \
+regulatory panel reading "Apple Inc." does not establish Brand = Beats by Dr. Dre, \
+even though Apple owns Beats. The observation that reads "Beats" does. Cite that one. \
+If several observations name the value, cite them all; if the only one you can find \
+needs an outside fact to connect it, the honest answer is an empty candidates array \
+with `insufficient_evidence`.
 - External facts, where supplied, come from a product matched to this item. They can \
 settle things a photograph cannot -- which of two transcribed codes is the product \
 number, what a manufacturer calls a colourway. They cannot tell you the condition or \
@@ -539,6 +546,99 @@ def drafting_stage(
             name=DRAFT_TOOL_NAME,
             description=DRAFT_TOOL_SCHEMA["description"],
             json_schema=DRAFT_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
+EXTRACT_SYSTEM_PROMPT = """You are reading one web page and listing what it says about \
+the product it describes. You are not identifying anything and not judging anything: \
+another stage decides whether this product is the item on the table, and it needs a \
+clean record of what this page claims.
+
+Rules:
+
+- Every fact quotes the page. Put the page's own words in `excerpt`, verbatim. A \
+paraphrase cannot be checked, and a quotation that is not in the page is discarded \
+along with its fact.
+- Facts about the product only. Site navigation, cookie notices, delivery policy, \
+related products and customer reviews are not facts about this product. A page that \
+describes no product yields an empty list, which is a correct answer.
+- Separate identity from retail. Identity is what the thing is: model number, \
+colourway, materials, dimensions, generation, what is in the box. Retail is what \
+someone charges for it: price, discount, shipping cost, stock. Prices are always \
+retail even when the page presents them as a specification.
+- One claim per fact. "Navy, wool blend, made in Egypt" is three facts with three \
+excerpts, not one.
+- Do not resolve contradictions and do not fill gaps. If the page gives two model \
+numbers, list both and quote both. If it never states the material, say nothing about \
+material; inventing a plausible value is the failure this stage exists to avoid.
+- Do not describe the object the operator is holding. You have not seen it. \
+Everything here is a claim about a product on a page.
+
+Call the extract_candidate_facts tool exactly once."""
+
+
+MAX_PAGE_CHARS = 24_000
+
+
+def page_body_for_extraction(page_text: str, max_page_chars: int = MAX_PAGE_CHARS) -> str:
+    """The page text the extractor will actually be shown.
+
+    Exported so the caller can validate excerpts against exactly this string. The
+    alternative -- checking a quotation against the whole assembled prompt -- would
+    accept text lifted from the URL, the query or the motivation, and those are our
+    words rather than the page's. The excerpt check is the only thing standing
+    behind an automated extraction, so it must compare against the page and nothing
+    else.
+    """
+    return page_text[:max_page_chars]
+
+
+def extraction_stage(
+    page_text: str,
+    url: str,
+    query: str,
+    motivation: str,
+    max_output_tokens: int = 2000,
+    max_page_chars: int = MAX_PAGE_CHARS,
+) -> StageRequest:
+    """Build the fact-extraction request for one fetched page.
+
+    The narrowest stage in the system, and the one intended to move to a local model
+    first: no images, a small tool, and a job that is closer to parsing than to
+    reasoning. It goes through the same `ModelAdapter` protocol as every other
+    stage, so that move is a provider argument rather than a new interface.
+
+    The page is truncated, and the truncation is stated in the prompt. A silent cut
+    would make a fact absent from a long page indistinguishable from a fact the page
+    never carried -- and the parser rejects excerpts it cannot find, so a quotation
+    from beyond the cut has to fail visibly rather than look fabricated.
+    """
+    from resell.reasoning.tools import EXTRACT_TOOL_NAME, EXTRACT_TOOL_SCHEMA
+
+    body = page_body_for_extraction(page_text, max_page_chars)
+    truncated = len(page_text) > max_page_chars
+    instruction = (
+        f"Page URL: {url}\n"
+        f"Retrieved for the query: {query}\n"
+        f"Which was intended to settle: {motivation}\n\n"
+        f"Page text{' (truncated)' if truncated else ''}:\n\n{body}\n\n"
+    )
+    if truncated:
+        instruction += (
+            f"The text above is the first {max_page_chars} characters of "
+            f"{len(page_text)}. Quote only from what you were given.\n\n"
+        )
+    instruction += "List what this page states about the product it describes."
+    return StageRequest(
+        system_prompt=EXTRACT_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=EXTRACT_TOOL_NAME,
+            description=EXTRACT_TOOL_SCHEMA["description"],
+            json_schema=EXTRACT_TOOL_SCHEMA["input_schema"],
         ),
         max_tokens=max_output_tokens,
     )

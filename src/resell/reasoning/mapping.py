@@ -168,6 +168,26 @@ def _merge_operator_candidates(
     return merged
 
 
+def _donated_text(conn: sqlite3.Connection, citable: dict[int, str]) -> dict[int, str]:
+    """Payload text for the donated facts an aspect is permitted to cite.
+
+    `citable_candidate_evidence` returns ids mapped to a donation scope, not to
+    text, so the text is fetched here. Kept to the permitted ids alone: a citation
+    outside them is already dropped as an invented one, and reading it back would
+    give the citation checks an opinion about evidence the gate has refused.
+    """
+    if not citable:
+        return {}
+    placeholders = ",".join("?" * len(citable))
+    return {
+        row["id"]: str(row["payload"])
+        for row in conn.execute(
+            f"SELECT id, payload FROM evidence WHERE id IN ({placeholders})",
+            list(citable),
+        )
+    }
+
+
 def map_aspects(
     conn: sqlite3.Connection,
     sku: str,
@@ -232,22 +252,53 @@ def map_aspects(
         result.tool_input, valid_evidence_ids=in_scope, citable_candidates=citable
     )
 
-    # Before resolving, catch a permitted value standing in for the one that was
-    # actually read. This must happen here rather than at publish: by then the
-    # substitution has been approved and looks like a decision.
-    from resell.reasoning.gaps import detect_value_substitution
+    # Before resolving, two checks on the citations themselves. Both must happen
+    # here rather than at publish: by then a bad citation has been approved and
+    # looks like a decision.
+    from resell.reasoning.gaps import detect_uncited_value, detect_value_substitution
 
     allowed_by_aspect = {spec.name: spec.allowed_values for spec in specs}
-    text_by_id = {
-        row["id"]: str(row["payload"]) for row in observations
-    }
+    # Everything a candidate is allowed to cite, so a citation check can read what
+    # was actually cited. Observations and donated facts both, because a candidate
+    # may cite either and a half-populated map would make the second check fail
+    # open on exactly the candidates that lean on external facts.
+    text_by_id = {row["id"]: str(row["payload"]) for row in observations}
+    text_by_id.update(_donated_text(conn, citable))
+
     filtered: dict[str, list] = {}
     for name, candidates in proposal.candidates_by_aspect.items():
         kept = []
         for candidate in candidates:
+            cited_ids = tuple(ref.evidence_id for ref in candidate.support)
             cited_text = " ".join(
-                text_by_id.get(ref.evidence_id, "") for ref in candidate.support
+                text_by_id.get(evidence_id, "") for evidence_id in cited_ids
             )
+            # Miscitation first, and the order is the finding rather than a
+            # preference. Brand = "Beats by Dr. Dre" cited from a panel reading
+            # "Apple Inc." trips both checks, and the substitution check's verdict
+            # -- "the evidence names 'Apple', and where they differ the evidence
+            # wins" -- points at the wrong fault entirely: the value was right and
+            # the citation was wrong. "Some other observation names this, cite
+            # that one" is the specific diagnosis, so it gets asked first.
+            #
+            # Only where the aspect has a single candidate, though. Two readings
+            # off one hedged observation -- "the fabric could read as either shade"
+            # -- is the model correctly declining to choose, and this check would
+            # drop whichever reading some other observation happens to name,
+            # converting an ambiguity into a confident answer. `analyse` already
+            # handles competing candidates properly: it refuses to pick and asks
+            # for a photo. Deciding here would be worse than not checking.
+            miscited = (
+                detect_uncited_value(name, candidate.value, cited_ids, text_by_id)
+                if len(candidates) == 1 else None
+            )
+            if miscited:
+                proposal.malformed.append(miscited)
+                continue
+            # The swap check does run against competing candidates, and must: the
+            # pair ("Navy" cited from a tag reading NAVY, "Blue" cited from the
+            # same tag) is a substitution rather than an ambiguity, and dropping
+            # "Blue" is the right answer.
             swap = detect_value_substitution(
                 name, candidate.value, cited_text, allowed_by_aspect.get(name, ())
             )

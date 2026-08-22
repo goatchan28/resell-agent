@@ -80,6 +80,16 @@ class Config:
         """Space-separated scopes. Callers must not pre-encode; the HTTP layer does."""
         return " ".join(self.scopes)
 
+    @property
+    def has_credentials(self) -> bool:
+        """Whether this config could authenticate. Same rule `load_config` applies.
+
+        A caller that was handed a config rather than loading one still needs to
+        ask this before reaching for eBay, and duplicating the three-field check
+        at each such site is how they drift apart.
+        """
+        return bool(self.client_id and self.client_secret and self.runame)
+
 
 def _load_dotenv() -> None:
     """Load .env if python-dotenv is installed. Optional so the package imports bare."""

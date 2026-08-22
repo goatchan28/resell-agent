@@ -822,7 +822,8 @@ class Gateway:
 
     def record_candidate_facts(
         self, sku: str, *, candidate_ref: str, source_url: str, authority: str,
-        facts: list[tuple[str, str]], restriction: str | None = None,
+        facts: list[tuple[str, str] | tuple[str, str, str | None]],
+        restriction: str | None = None,
         title: str = "", retrieval_method: str = "automated_fetch",
     ) -> list[int]:
         """Record facts about a candidate product. Never about this item.
@@ -830,17 +831,25 @@ class Gateway:
         subject is fixed to candidate_product here rather than passed in, because a
         retrieval path that could write this_item evidence would bypass the entire
         donation gate.
+
+        Each fact is `(claim, domain)` or `(claim, domain, excerpt)`. The excerpt is
+        the source text the claim was extracted from, and it is what makes an
+        automated extraction checkable: the operator who transcribes a page is the
+        witness to what it said, and a model reading fetched HTML is not. A
+        transcription passes no excerpt, and that absence is the honest record.
         """
         get_item(self.conn, sku)
         ids = []
-        for claim, domain in facts:
+        for fact in facts:
+            claim, domain = fact[0], fact[1]
+            excerpt = fact[2] if len(fact) > 2 else None
             cursor = self.conn.execute(
                 "INSERT INTO evidence (sku, kind, source, payload, send_to_model, "
                 "recorded_at, basis, subject, candidate_ref, fact_domain, "
                 "source_authority, source_url, retrieved_at, source_restriction, "
-                "retrieval_method) "
+                "retrieval_method, source_excerpt) "
                 "VALUES (?, 'candidate_product_fact', ?, ?, ?, ?, ?, "
-                "'candidate_product', ?, ?, ?, ?, ?, ?, ?)",
+                "'candidate_product', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sku,
                     # The provenance the system can vouch for: who supplied it.
@@ -849,6 +858,7 @@ class Gateway:
                     0 if restriction else 1,
                     now_iso(), str(Basis.EXTERNAL_SOURCE), candidate_ref, domain,
                     authority, source_url, now_iso(), restriction, retrieval_method,
+                    excerpt or None,
                 ),
             )
             ids.append(cursor.lastrowid)
@@ -908,6 +918,40 @@ class Gateway:
             basis=str(Basis.EXTERNAL_SOURCE), subject=str(Subject.THIS_ITEM),
         )
 
+    def _upsert_aspect_candidate(
+        self, identification_id: int, aspect_name: str, value: str
+    ) -> int:
+        """The candidate's id, inserting it first if it is not already there.
+
+        The id is always read back with a SELECT, and that is the whole point of
+        this existing. `cursor.lastrowid` after an `INSERT OR IGNORE` that ignored
+        is not zero and not None -- it is the rowid of whatever was last inserted,
+        on any table. Two call sites relied on `lastrowid or SELECT ...`, so the
+        fallback never ran and a stale id went into the foreign key.
+
+        How it showed up: answering a duplicated question about Model, where the
+        first answer had already created the candidate. The preceding statement was
+        the evidence insert, so `candidate_id` became an evidence id. It was larger
+        than any aspect_candidate id, so the foreign key rejected it and
+        `answer_question` raised -- after its UPDATE had committed, leaving the
+        question answered and the item stuck in needs_info with nothing outstanding.
+
+        The crash was the good outcome. Had the evidence id happened to be a real
+        aspect_candidate id, the citation would have been filed silently against
+        somebody else's candidate, and "this value is supported" would have been a
+        lie the database was happy with.
+        """
+        self.conn.execute(
+            "INSERT OR IGNORE INTO aspect_candidate "
+            "(identification_id, aspect_name, value, created_at) VALUES (?, ?, ?, ?)",
+            (identification_id, aspect_name, value, now_iso()),
+        )
+        return self.conn.execute(
+            "SELECT id FROM aspect_candidate WHERE identification_id = ? "
+            "AND aspect_name = ? AND value = ?",
+            (identification_id, aspect_name, value),
+        ).fetchone()[0]
+
     def record_aspect_candidates(self, sku: str, identification_id: int, outcomes) -> int:
         """Store candidate sets with their citations.
 
@@ -922,17 +966,9 @@ class Gateway:
                 for candidate in outcome.candidates:
                     if not candidate.support:
                         continue
-                    cursor = self.conn.execute(
-                        "INSERT OR IGNORE INTO aspect_candidate "
-                        "(identification_id, aspect_name, value, created_at) "
-                        "VALUES (?, ?, ?, ?)",
-                        (identification_id, outcome.aspect_name, candidate.value, now_iso()),
+                    candidate_id = self._upsert_aspect_candidate(
+                        identification_id, outcome.aspect_name, candidate.value
                     )
-                    candidate_id = cursor.lastrowid or self.conn.execute(
-                        "SELECT id FROM aspect_candidate WHERE identification_id = ? "
-                        "AND aspect_name = ? AND value = ?",
-                        (identification_id, outcome.aspect_name, candidate.value),
-                    ).fetchone()[0]
                     for ref in candidate.support:
                         self.conn.execute(
                             "INSERT OR IGNORE INTO aspect_candidate_evidence "
@@ -952,10 +988,27 @@ class Gateway:
         `allowed_values` is eBay's list for the aspect, captured now so the answer
         can be checked later without a Taxonomy call. Empty for FREE_TEXT aspects
         and for anything that is not about an aspect at all.
+
+        Asking something already outstanding is a no-op. `map-aspects --apply` opens
+        one question per unresolved required aspect, and it is meant to be re-run --
+        so without this, three runs left three identical questions about Model, and
+        answering one of them left the item in needs_info behind the other two. An
+        unanswered question is a request that has not been met yet; asking again
+        does not make it more true.
         """
         if not question.strip():
             raise Rejected("AskOperator", ["question is empty"])
         get_item(self.conn, sku)
+
+        existing = self._outstanding_question(sku, aspect_name, question)
+        if existing is not None:
+            state = current_state(self.conn, sku)
+            return Accepted(
+                "AskOperator", sku, state, state,
+                f"already open as question {existing}",
+                {"question_id": existing, "already_open": True},
+            )
+
         self.conn.execute(
             "INSERT INTO open_question (sku, question, why_it_matters, blocking, "
             "asked_at, aspect_name, allowed_values_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -968,6 +1021,34 @@ class Gateway:
                 sku, ItemState.NEEDS_INFO, command="AskOperator", detail=question[:120]
             )
         return Accepted("AskOperator", sku, state, state, question[:120])
+
+    def _outstanding_question(
+        self, sku: str, aspect_name: str | None, question: str
+    ) -> int | None:
+        """An unanswered question already asking this, or None.
+
+        Keyed on the aspect where there is one, because that is what the question
+        is *about*: two runs of the mapper word the same gap identically today, but
+        a reworded prompt asking again about Model is still the same request, and
+        matching on text would let it through.
+
+        Without an aspect there is nothing to key on but the text, so that is what
+        is compared -- exactly, not loosely. A free-form question the operator
+        deliberately asked twice in different words is not something to collapse.
+        """
+        if aspect_name:
+            row = self.conn.execute(
+                "SELECT id FROM open_question WHERE sku = ? AND aspect_name = ? "
+                "AND answered_at IS NULL ORDER BY id LIMIT 1",
+                (sku, aspect_name),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT id FROM open_question WHERE sku = ? AND aspect_name IS NULL "
+                "AND question = ? AND answered_at IS NULL ORDER BY id LIMIT 1",
+                (sku, question),
+            ).fetchone()
+        return row["id"] if row else None
 
     def resume_identification(self, sku: str) -> Accepted:
         """needs_info -> identifying, once nothing blocking is outstanding.
@@ -1180,6 +1261,16 @@ class Gateway:
             (answer, now_iso(), question_id),
         )
 
+        # Duplicates opened before the check in `ask_operator` existed, or opened
+        # under a different wording, are settled by the same statement. One operator
+        # answer about Model answers every outstanding request for Model: leaving
+        # the siblings open would hold the item in needs_info on a question that has
+        # in fact been answered, which is the trap this pairs with preventing.
+        #
+        # Note what this is not: the model closing its own question. The answer being
+        # propagated is the operator's, and only to requests about the same aspect.
+        siblings = self._settle_duplicate_questions(sku, row["aspect_name"], question_id, answer)
+
         payload = {"question": row["question"], "answer": answer}
         if unlisted:
             # The override is the record, not the permission.
@@ -1199,30 +1290,61 @@ class Gateway:
         if aspect_name:
             identification = current_identification(self.conn, sku)
             if identification is not None:
-                cursor = self.conn.execute(
-                    "INSERT OR IGNORE INTO aspect_candidate "
-                    "(identification_id, aspect_name, value, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (identification["id"], aspect_name, value, now_iso()),
+                candidate_id = self._upsert_aspect_candidate(
+                    identification["id"], aspect_name, value
                 )
-                candidate_id = cursor.lastrowid or self.conn.execute(
-                    "SELECT id FROM aspect_candidate WHERE identification_id = ? "
-                    "AND aspect_name = ? AND value = ?",
-                    (identification["id"], aspect_name, value),
-                ).fetchone()[0]
                 self.conn.execute(
                     "INSERT OR IGNORE INTO aspect_candidate_evidence "
                     "(candidate_id, evidence_id) VALUES (?, ?)",
                     (candidate_id, evidence_id),
                 )
 
+        also = f" (and {len(siblings)} duplicate: {siblings})" if siblings else ""
         state = current_state(self.conn, sku)
         if state == ItemState.NEEDS_INFO and not unresolved_blocking_questions(self.conn, sku):
-            return self._transition(
+            accepted = self._transition(
                 sku, ItemState.IDENTIFYING, command="AnswerQuestion",
-                detail="all blocking questions answered",
+                detail=f"all blocking questions answered{also}",
             )
-        return Accepted("AnswerQuestion", sku, state, state, f"question {question_id} answered")
+        else:
+            accepted = Accepted(
+                "AnswerQuestion", sku, state, state,
+                f"question {question_id} answered{also}",
+            )
+        # Set on both paths. Settling the last duplicate is exactly the case that
+        # releases the item, so the transition path is the one that most needs to
+        # report what it closed.
+        if siblings:
+            accepted.data["duplicates_settled"] = siblings
+        return accepted
+
+    def _settle_duplicate_questions(
+        self, sku: str, aspect_name: str | None, answered_id: int, answer: str
+    ) -> list[int]:
+        """Close the other outstanding questions about the same aspect.
+
+        Returns the ids closed, so the caller can say so rather than have questions
+        disappear silently. The recorded answer names where it came from: the
+        operator answered one request, and this is the record of it settling the
+        others, not a second independent statement.
+        """
+        if not aspect_name:
+            return []
+        rows = self.conn.execute(
+            "SELECT id FROM open_question WHERE sku = ? AND aspect_name = ? "
+            "AND answered_at IS NULL AND id != ? ORDER BY id",
+            (sku, aspect_name, answered_id),
+        ).fetchall()
+        if not rows:
+            return []
+        stamp = now_iso()
+        settled = [row["id"] for row in rows]
+        self.conn.executemany(
+            "UPDATE open_question SET answer = ?, answered_at = ? WHERE id = ?",
+            [(f"{answer}  [settled by the answer to question {answered_id}]",
+              stamp, question_id) for question_id in settled],
+        )
+        return settled
 
     def approve(self, sku: str, proposal_hash: str, *, operator: bool = False) -> Accepted:
         """Operator-only. proposed -> approved.

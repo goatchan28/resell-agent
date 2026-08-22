@@ -1,0 +1,41 @@
+{# One question, one answer form, exactly one field named `answer`.
+
+   Where eBay supplied a value list it becomes a datalist on that same field: the
+   list is visible and clickable, and the submitted value is still a single
+   string, so the route never has to decide which of two inputs the operator
+   meant. That list is what Gateway.answer_question validates against.
+
+   `value_not_listed` is a separate, explicit checkbox. eBay does not guarantee
+   its list is exhaustive, and disagreeing with it is an operator decision that
+   goes on the record -- never something a form submission implies. #}
+<form method="post"
+      action="{{ url_for('answer', question_id=question.id) }}"
+      class="answer">
+  <input type="hidden" name="sku" value="{{ question.sku }}">
+  <input type="hidden" name="next" value="{{ next or 'item' }}">
+
+  <label>answer
+    <input type="text" name="answer" required autocomplete="off"
+           value="{{ question.suggested_answer or '' }}"
+           {% if question.allowed_values %}list="values-{{ question.id }}"{% endif %}>
+  </label>
+
+  {% if question.allowed_values %}
+    <datalist id="values-{{ question.id }}">
+      {% for value in question.allowed_values %}
+        <option value="{{ value }}"></option>
+      {% endfor %}
+    </datalist>
+    <p class="allowed">eBay lists {{ question.allowed_values | length }} value(s)
+      for {{ question.aspect_name }}:
+      <span class="values">{{ question.allowed_values[:12] | join(', ') }}
+      {%- if question.allowed_values | length > 12 %}, and
+        {{ question.allowed_values | length - 12 }} more{% endif %}</span></p>
+    <label class="override">
+      <input type="checkbox" name="value_not_listed" value="1">
+      not in eBay's list, and I am overriding it
+    </label>
+  {% endif %}
+
+  <button type="submit">record answer</button>
+</form>

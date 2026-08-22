@@ -8,9 +8,18 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+# Flask is an extra, not a dependency. The CLI is the reference front end and has
+# to keep working on a machine where the UI was never installed -- which is also
+# what stops the read models in views.py from quietly acquiring a Flask import.
+[project.optional-dependencies]
+ui = [
+    "flask>=3.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "flask>=3.0",
 ]
 
 [project.scripts]

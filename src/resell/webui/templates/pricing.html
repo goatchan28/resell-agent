@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}{{ item.sku }} pricing{% endblock %}
+
+{% block content %}
+{% with active = 'pricing' %}{% include "_item_nav.html" %}{% endwith %}
+
+<h2>where the price stands</h2>
+{# Price authority is the pricing approval's, listing authority is the listing
+   approval's. Shown side by side so neither looks derived from the other. #}
+<dl class="wide">
+  <dt>price state<dd>{{ view.price_state or '—' }}
+  <dt>live price<dd>{{ view.live_price_cents | money }}
+  <dt>latest proposal<dd>
+    {% if view.latest_proposal_id %}
+      <code>{{ view.latest_proposal_id }}</code>
+      {{ view.latest_proposal_price_cents | money }}
+      <span class="muted">{{ view.latest_proposal_reason }}</span>
+    {% else %}—{% endif %}
+  <dt>price approval<dd>{{ 'live' if view.price_approval_live else 'none' }}
+  <dt>listing approval<dd>{{ 'live' if item.live_approval_hash else 'none' }}
+    <span class="muted">repricing does not void this</span>
+</dl>
+
+<h2>the band</h2>
+<p class="summary">{{ view.summary }}</p>
+
+{% if view.unpriceable %}
+  <p class="warn">unpriceable: {{ view.reason }}</p>
+{% else %}
+  <dl class="wide">
+    <dt>range<dd>{{ view.band_low_cents | money }} –
+      {{ view.band_high_cents | money }},
+      centre <strong>{{ view.band_central_cents | money }}</strong>
+    <dt>price kind<dd>{{ view.price_kind }}
+      <span class="muted">{{ view.band_relation }}</span>
+    <dt>comps in the set<dd>{{ view.comp_count }}
+    <dt>diagnostic confidence<dd>{{ '%.2f' | format(view.diagnostic_confidence) }}
+      <span class="muted">not a gate</span>
+  </dl>
+{% endif %}
+
+{% if view.distributions %}
+  <table>
+    <thead><tr><th>sample<th class="n">n<th class="n">min<th class="n">max
+        <th class="n">median<th class="n">iqr
+    <tbody>
+    {% for label, n, low, high, median, iqr in view.distributions %}
+      <tr><td>{{ label }}<td class="n">{{ n }}<td class="n">{{ low | money }}
+        <td class="n">{{ high | money }}<td class="n">{{ median | money }}
+        <td class="n">{{ iqr | money }}
+    {% endfor %}
+  </table>
+{% endif %}
+
+{% if view.qualifiers %}
+  <p class="flags">flags: {{ view.qualifiers | join(', ') }}</p>
+{% endif %}
+{% if view.comparability_profile %}
+  <p class="muted">ladder:
+    {% for rung, count in view.comparability_profile | dictsort %}
+      {{ rung }}={{ count }}{{ ', ' if not loop.last }}
+    {% endfor %}</p>
+{% endif %}
+{% for exclusion in view.sample_exclusions %}
+  <p class="muted">excluded: {{ exclusion }}</p>
+{% endfor %}
+{% for price, kind in view.retail_context %}
+  <p class="muted">retail {{ price | money }} [{{ kind }}, context only]</p>
+{% endfor %}
+
+<h2>strategies</h2>
+{% if view.strategies %}
+  <p class="muted">Three prices from one comp set. Which one to take is the
+    seller's decision, which is why there is no button here: a proposal freezes
+    the comp set and claims an objective, and both belong to
+    <code>resell price propose</code>.</p>
+  <table>
+    <thead><tr><th>objective<th class="n">list<th class="n">net proceeds
+        <th>anchor<th>trade-off
+    <tbody>
+    {% for strategy in view.strategies %}
+      <tr class="{{ 'default' if strategy.is_default }}">
+        <td>{{ strategy.objective }}{% if strategy.is_default %}
+            <span class="badge">default</span>{% endif %}
+        <td class="n">{{ strategy.price_cents | money }}
+        <td class="n">{{ strategy.net_proceeds_cents | money }}
+        <td>{{ strategy.anchor }}{% if strategy.floor_bound %}
+            <span class="badge blocking">floor</span>{% endif %}
+        <td class="muted">{{ strategy.tradeoff }}
+    {% endfor %}
+  </table>
+  {% if view.sold_evidence_note %}
+    <p class="note">sold evidence: {{ view.sold_evidence_note }}</p>
+  {% endif %}
+  {% if view.uncertainty_note %}
+    <p class="note">uncertainty: {{ view.uncertainty_note }}</p>
+  {% endif %}
+  {% for note in view.notes %}
+    <p class="note">{{ note }}</p>
+  {% endfor %}
+  <p class="muted">fees: {{ view.fee_schedule_version }}, {{ view.fee_basis }}</p>
+  <p class="muted"><code>resell price propose {{ item.sku }}
+    --condition-band {{ request_values.condition_band }}
+    --identity-resolution {{ request_values.identity_resolution }}
+    --objective {{ (view.strategies | selectattr('is_default') | first).objective }}</code></p>
+{% else %}
+  <p class="empty">the evidence supports no strategy yet</p>
+{% endif %}
+
+<h2>assumptions</h2>
+{# Every field here is an operator claim. Changing one recomputes the page and
+   records nothing: the defaults come from the identification, and none of them
+   gains authority by being shown. #}
+<form method="get" class="inline wrap">
+  <label>condition band
+    <select name="condition_band">
+      {% for band in condition_bands %}
+        <option value="{{ band }}"
+          {{ 'selected' if band == request_values.condition_band }}>{{ band }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>identity
+    <select name="identity_resolution">
+      {% for value in ('unresolved', 'resolved') %}
+        <option value="{{ value }}"
+          {{ 'selected' if value == request_values.identity_resolution }}>{{ value }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>window days
+    <input type="number" name="window_days" min="1"
+           value="{{ request_values.window_days }}">
+  </label>
+  <label>seller shipping, cents
+    <input type="number" name="shipping_cost_cents" min="0"
+           value="{{ request_values.shipping_cost_cents }}">
+  </label>
+  <label>minimum net, cents
+    <input type="number" name="minimum_net_cents" min="0"
+           value="{{ request_values.minimum_net_cents }}">
+  </label>
+  <button type="submit">recompute</button>
+</form>
+
+<h2>price history</h2>
+{% if view.history %}
+  <table>
+    <thead><tr><th>when<th>event<th class="n">price<th>reason<th>marketplace ref
+    <tbody>
+    {% for event in view.history %}
+      <tr><td>{{ event.occurred_at[:19] }}<td>{{ event.event_type }}
+        <td class="n">{{ event.price_cents | money }}
+        <td>{{ event.reason or '' }}<td>{{ event.marketplace_ref or '' }}
+    {% endfor %}
+  </table>
+{% else %}
+  <p class="empty">nothing recorded</p>
+{% endif %}
+{% endblock %}

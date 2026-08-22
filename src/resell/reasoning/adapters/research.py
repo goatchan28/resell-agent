@@ -46,10 +46,18 @@ class ResearchQuery:
 
 @dataclass(frozen=True)
 class RetrievedFact:
-    """One fact about a candidate product. Never about the item on the table."""
+    """One fact about a candidate product. Never about the item on the table.
+
+    `excerpt` is the source text the claim came from, and it is empty exactly when
+    nothing quotable exists: an operator typing what a page said is the witness to
+    it, and their transcription is the claim rather than a quotation of one. A fact
+    extracted from a fetched page has no such witness, so it carries the words it
+    was drawn from and the extraction parser refuses it otherwise.
+    """
 
     claim: str
     domain: FactDomain = FactDomain.IDENTITY
+    excerpt: str = ""
 
 
 class RetrievalMethod(StrEnum):
@@ -213,9 +221,23 @@ class ManualResearchAdapter:
         return SourceAuthority.UNKNOWN
 
 
+def _operator_url_adapter(**kwargs):
+    """Imported on use, not at module scope.
+
+    `web` imports the extraction stage, which imports the tool schemas, which this
+    module is already imported by. Deferring the import keeps that from becoming a
+    cycle and keeps `research.py` importable with no model adapter present.
+    """
+    from resell.reasoning.adapters.web import OperatorUrlResearchAdapter
+
+    return OperatorUrlResearchAdapter(**kwargs)
+
+
 ADAPTERS: dict[str, type] = {
     "manual": ManualResearchAdapter,
-    # "web": WebSearchAdapter,
+    # Operator supplies the URL; the system fetches the page and extracts the facts.
+    "fetch": _operator_url_adapter,
+    # "web": a search backend in front of `fetch`, once one is chosen and licensed.
     # "ebay_catalog": pending the licensing answer -- see the module docstring.
 }
 

@@ -548,6 +548,20 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
     # Values eBay listed for the aspect when the question was asked,
     # so an answer can be validated without a Taxonomy call.
     ("ALTER TABLE open_question ADD COLUMN allowed_values_json TEXT",),
+    # 18 -- the text a candidate-product fact was extracted from.
+    #
+    # An operator who reads a page and types what it says is the witness to that
+    # fact: the provenance is their word, and `retrieval_method` records as much.
+    # An automated fetch plus a model extraction has no witness at all. The fact's
+    # only support is the page text it came out of, and without storing that, the
+    # donation gate computes what a candidate may contribute from an extraction
+    # nobody can check.
+    #
+    # The same rule the observation stage already applies: a `text_read` must cite
+    # the photo it was read from, or it is an assertion rather than evidence.
+    # Nullable, because a transcription genuinely has no excerpt -- and that
+    # absence is informative rather than missing data.
+    ("ALTER TABLE evidence ADD COLUMN source_excerpt TEXT",),
 )
 
 

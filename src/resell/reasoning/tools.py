@@ -151,6 +151,75 @@ def _looks_like_entry(value: dict) -> bool:
     return bool(_ENTRY_MARKERS & set(value))
 
 
+def unwrap_tool_input(payload: object, expected: set[str], malformed: list[str]) -> object:
+    """Recover a whole argument object that arrived as a string inside one property.
+
+    The observed shape, from the planning stage, on every call it ever made:
+
+        {"assessment": "{\\"proposed_mode\\": ...}, \\"lookups\\": [...]}"}
+
+    Note where the quote closes. The first key was parsed as structure and the whole
+    remainder of the document became its string value -- so the string is not a
+    serialised `assessment`, it is `{assessment}, "lookups": [...]}` and does not
+    parse on its own. Re-prefixing the key it was split on reconstructs the intended
+    document exactly.
+
+    The plan inside was good: two well-cited lookups, one at a manufacturer and one
+    at a reference source. It was discarded because `assessment` was a `str` where a
+    dict belonged, and the resulting emptiness was then read as the planner deciding
+    no research was warranted.
+
+    Two strategies, both narrow, and neither runs while the expected keys are usable
+    as given:
+
+      1. a property whose string parses to a dict carrying an expected key -- the
+         plain "serialised the arguments" case
+      2. a single-property dict whose string, with `{"key": ` put back in front of
+         it, parses to a dict carrying an expected key -- the case above
+
+    Same posture as `_as_list` one level up: a badly-shaped response costs the
+    entries it broke, not the whole pass.
+
+    Not schema size, before that theory gets retried: this schema is 1462 bytes and
+    the observation schema, which has never done this, is 2109.
+    """
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            malformed.append("tool input was an unparseable string")
+            return None
+    if not isinstance(payload, dict):
+        return payload
+
+    # Nothing to do when any expected key already holds a usable structure.
+    if any(not isinstance(payload.get(key), (str, type(None))) for key in expected):
+        return payload
+
+    for key, value in payload.items():
+        if not isinstance(value, str):
+            continue
+        candidates = (
+            value,
+            # The key was consumed as structure; put it back.
+            f"{{{json.dumps(key)}: {value}",
+        )
+        for attempt, text in enumerate(candidates):
+            try:
+                inner = json.loads(text)
+            except ValueError:
+                continue
+            if not isinstance(inner, dict) or not expected & set(inner):
+                continue
+            malformed.append(
+                f"the argument object arrived as a JSON string"
+                + (f" split at {key!r}" if attempt else f" inside {key!r}")
+                + "; reconstructed it rather than discarding the call"
+            )
+            return inner
+    return payload
+
+
 def _as_list(value: object, label: str, malformed: list[str]) -> list:
     """Coerce a container to a list, recording anything unusable.
 
@@ -199,12 +268,11 @@ def parse_observe_tool_input(payload: object) -> ObservationProposal:
     """
     proposal = ObservationProposal()
 
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            proposal.malformed.append("tool input was an unparseable string")
-            return proposal
+    payload = unwrap_tool_input(
+        payload, {"observations", "identifiers", "identity_search"}, proposal.malformed
+    )
+    if payload is None:
+        return proposal
     if not isinstance(payload, dict):
         proposal.malformed.append(
             f"tool input was {type(payload).__name__}, expected an object"
@@ -506,12 +574,9 @@ def parse_map_tool_input(
 
     proposal = MappingProposal()
 
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            proposal.malformed.append("tool input was an unparseable string")
-            return proposal
+    payload = unwrap_tool_input(payload, {"aspects"}, proposal.malformed)
+    if payload is None:
+        return proposal
     if not isinstance(payload, dict):
         proposal.malformed.append(
             f"tool input was {type(payload).__name__}, expected an object"
@@ -715,6 +780,20 @@ class ResearchPlan:
     rationale: str = ""
     lookups: list[PlannedLookup] = field(default_factory=list)
     malformed: list[str] = field(default_factory=list)
+    # Whether an assessment was actually read, as opposed to defaulted. Without
+    # this, a plan that could not be parsed at all is indistinguishable from one
+    # whose author decided no research was warranted -- and the caller recorded the
+    # second as a negative finding when it was really the first.
+    assessment_read: bool = False
+
+    @property
+    def usable(self) -> bool:
+        """Whether there is anything here to act on.
+
+        No assessment and no lookups means the response yielded nothing, whatever
+        else went wrong. A plan with either is workable.
+        """
+        return self.assessment_read or bool(self.lookups)
 
 
 def parse_plan_tool_input(
@@ -730,18 +809,22 @@ def parse_plan_tool_input(
     already_searched = {q.casefold() for q in (already_searched or set())}
     plan = ResearchPlan()
 
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            plan.malformed.append("tool input was an unparseable string")
-            return plan
+    payload = unwrap_tool_input(payload, {"assessment", "lookups"}, plan.malformed)
+    if payload is None:
+        return plan
     if not isinstance(payload, dict):
         plan.malformed.append(f"tool input was {type(payload).__name__}, expected an object")
         return plan
 
     assessment = payload.get("assessment")
+    if isinstance(assessment, str):
+        # The assessment alone serialised, with the rest of the object intact.
+        try:
+            assessment = json.loads(assessment)
+        except ValueError:
+            pass
     if isinstance(assessment, dict):
+        plan.assessment_read = True
         plan.sufficient = bool(assessment.get("sufficient"))
         plan.proposed_mode = str(assessment.get("proposed_mode", "unresolved"))
         plan.rationale = str(assessment.get("rationale", ""))
@@ -911,17 +994,19 @@ def parse_match_tool_input(
 
     proposal = MatchProposal()
 
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            proposal.malformed.append("tool input was an unparseable string")
-            return proposal
+    payload = unwrap_tool_input(payload, {"assessment", "claims"}, proposal.malformed)
+    if payload is None:
+        return proposal
     if not isinstance(payload, dict):
         proposal.malformed.append(f"tool input was {type(payload).__name__}, expected an object")
         return proposal
 
     assessment = payload.get("assessment")
+    if isinstance(assessment, str):
+        try:
+            assessment = json.loads(assessment)
+        except ValueError:
+            pass
     if isinstance(assessment, dict):
         proposal.any_match = bool(assessment.get("any_match"))
         proposal.rationale = str(assessment.get("rationale", ""))
@@ -1061,12 +1146,11 @@ def parse_draft_tool_input(payload: object, *, valid_evidence_ids: set[int]):
     from resell.reasoning.listing import DraftClaim, ListingDraft
 
     draft = ListingDraft()
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            draft.malformed.append("tool input was an unparseable string")
-            return draft
+    payload = unwrap_tool_input(
+        payload, {"title", "description", "claims"}, draft.malformed
+    )
+    if payload is None:
+        return draft
     if not isinstance(payload, dict):
         draft.malformed.append(f"tool input was {type(payload).__name__}")
         return draft
@@ -1093,3 +1177,147 @@ def parse_draft_tool_input(payload: object, *, valid_evidence_ids: set[int]):
         claims.append(DraftClaim(text=text, evidence_ids=tuple(ids)))
     draft.claims = tuple(claims)
     return draft
+
+
+# --- fact extraction ---------------------------------------------------------
+
+EXTRACT_TOOL_NAME = "extract_candidate_facts"
+
+# Deliberately the narrowest tool in the system. Extraction is mechanical work at
+# the highest volume of any stage -- one call per fetched page -- which makes it the
+# first thing worth running on a cheaper or local model. Keeping the schema tiny is
+# what makes that swap a configuration change rather than a prompt rewrite.
+EXTRACT_TOOL_SCHEMA: dict[str, Any] = {
+    "name": EXTRACT_TOOL_NAME,
+    "description": (
+        "Extract facts about the product a page describes, each quoting the page "
+        "text it came from."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "product_title": {
+                "type": "string",
+                "description": "The product this page is about, as the page names it.",
+            },
+            "facts": {
+                "type": "array",
+                "description": (
+                    "One entry per fact the page states about the product. Empty when "
+                    "the page describes no product, which is a correct answer."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "claim": {
+                            "type": "string",
+                            "description": (
+                                "One fact about the product, e.g. 'Colourway: Navy "
+                                "Mini Houndstooth' or 'Model number A3211'."
+                            ),
+                        },
+                        "domain": {
+                            "type": "string",
+                            "enum": ["identity", "retail"],
+                            "description": (
+                                "identity: what the product is. retail: what someone "
+                                "charges for it. Prices, discounts, shipping and "
+                                "availability are retail."
+                            ),
+                        },
+                        "excerpt": {
+                            "type": "string",
+                            "description": (
+                                "The page text this claim came from, quoted verbatim "
+                                "and not paraphrased. Required: it is the only support "
+                                "the claim has."
+                            ),
+                        },
+                    },
+                    "required": ["claim", "domain", "excerpt"],
+                },
+            },
+        },
+        "required": ["product_title", "facts"],
+    },
+}
+
+
+@dataclass
+class ExtractedFacts:
+    """Facts pulled from one page, with what could not be used."""
+
+    product_title: str = ""
+    # (claim, domain, excerpt)
+    facts: tuple[tuple[str, str, str], ...] = ()
+    malformed: list[str] = field(default_factory=list)
+
+
+def parse_extract_tool_input(payload: object, *, page_text: str) -> ExtractedFacts:
+    """Validate an extraction. Never raises.
+
+    Two rules, both checked here rather than trusted:
+
+    A claim must carry an excerpt, and the excerpt must actually occur in the page
+    that was fetched. That second check is the whole reason the excerpt is worth
+    storing -- without it the field is just more model output, and a fabricated
+    quotation would look exactly like a real one. Whitespace is normalised before
+    comparing, because HTML-to-text collapses line breaks unpredictably and a
+    quotation that differs only in spacing is still the page's own words.
+
+    A `retail` domain is accepted as given but never widened: `citable_candidate_
+    evidence` admits identity facts only, so a retail fact misfiled as identity is
+    the error that matters and a mislabelled identity fact merely goes unused.
+    """
+    extracted = ExtractedFacts()
+
+    payload = unwrap_tool_input(
+        payload, {"product_title", "facts"}, extracted.malformed
+    )
+    if payload is None:
+        return extracted
+    if not isinstance(payload, dict):
+        extracted.malformed.append(
+            f"tool input was {type(payload).__name__}, expected an object"
+        )
+        return extracted
+
+    extracted.product_title = str(payload.get("product_title", "")).strip()
+    haystack = " ".join(page_text.split()).casefold()
+
+    kept: list[tuple[str, str, str]] = []
+    for index, raw in enumerate(
+        _as_list(payload.get("facts"), "facts", extracted.malformed)
+    ):
+        if not isinstance(raw, dict):
+            extracted.malformed.append(f"fact {index}: expected an object")
+            continue
+        claim = str(raw.get("claim", "")).strip()
+        excerpt = str(raw.get("excerpt", "")).strip()
+        domain = str(raw.get("domain", "")).strip().lower()
+
+        if not claim:
+            extracted.malformed.append(f"fact {index}: empty claim")
+            continue
+        if not excerpt:
+            extracted.malformed.append(
+                f"fact {index}: {claim[:50]!r} quotes nothing from the page; a fact "
+                f"with no excerpt has no support"
+            )
+            continue
+        if " ".join(excerpt.split()).casefold() not in haystack:
+            extracted.malformed.append(
+                f"fact {index}: the excerpt for {claim[:50]!r} does not appear in the "
+                f"fetched page, so the quotation is not the page's own words"
+            )
+            continue
+        if domain not in ("identity", "retail"):
+            extracted.malformed.append(
+                f"fact {index}: unknown domain {domain!r} for {claim[:40]!r}; "
+                f"recorded as retail, which cannot be cited by an aspect"
+            )
+            domain = "retail"
+        kept.append((claim, domain, excerpt))
+
+    extracted.facts = tuple(kept)
+    return extracted

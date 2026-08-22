@@ -646,6 +646,11 @@ VALUE_SYNONYMS: dict[str, tuple[str, ...]] = {
     "lyocell": ("tencel",),
     "faux leather": ("pu leather", "synthetic leather", "pleather"),
     "flax": ("linen",),
+    # Brands, where eBay records the full form and the object says the short one.
+    # Same rule as the fibres: an identical referent, not a similar one. Without
+    # the alias, citing the observation that actually reads "Beats" fails to
+    # support eBay's own value and the correct mapping is rejected.
+    "beats by dr. dre": ("beats",),
 }
 
 
@@ -714,6 +719,64 @@ def detect_value_substitution(
         f"{aspect_name}: {value!r} does not appear in the cited evidence, which names "
         f"{named}. All are allowed values, so nothing else would catch this -- where "
         f"they mean different things, the evidence wins."
+    )
+
+
+def detect_uncited_value(
+    aspect_name: str,
+    value: str,
+    cited_ids: tuple[int, ...],
+    text_by_id: dict[int, str],
+) -> str | None:
+    """Catch a value whose support is in evidence other than the evidence cited.
+
+    The case this exists for: MP-000005 is a Beats speaker. Three observations say
+    so outright -- two read the brand off the front, one names it as an inference.
+    The mapping proposed Brand correctly and cited the regulatory panel on the
+    bottom, which reads "Apple Inc.". Apple does own Beats, so the citation is not
+    a random one; it is a fact about a related entity that only supports the value
+    if you already know how the two are connected. Knowledge from outside these
+    observations is exactly what a citation is supposed to make unnecessary.
+
+    Narrow on purpose, and narrower than it looks: it fires only when *no* cited
+    observation names the value and *some* uncited one does. That pairing is what
+    makes it a citation error rather than a judgement call -- a better citation was
+    demonstrably available and sitting in the same set.
+
+    A genuinely inferred value that nothing names literally is left alone; so is a
+    candidate citing evidence whose text we cannot read, which fails open rather
+    than inventing a rejection out of a missing lookup. Unlike
+    `detect_value_substitution` this needs no allowed-value list, so it is the only
+    citation check that covers a free-text aspect -- which is most of them.
+
+    Asked before `detect_value_substitution`, because a case that trips both is a
+    miscitation and not a swap: the substitution message would name the related
+    entity as the value the evidence supports, which is the opposite of true.
+
+    The caller asks this only about an aspect with a single candidate, and that
+    restriction is not incidental -- see `map_aspects`. Two readings offered from
+    one hedged observation is the model declining to choose, and dropping whichever
+    one some other observation happens to name would convert an ambiguity into a
+    confident answer.
+    """
+    if not cited_ids or any(cited_id not in text_by_id for cited_id in cited_ids):
+        return None
+    cited_text = " ".join(text_by_id[cited_id] for cited_id in cited_ids)
+    if value_appears_in(value, cited_text):
+        return None
+
+    supporting = [
+        evidence_id for evidence_id, text in sorted(text_by_id.items())
+        if evidence_id not in cited_ids and value_appears_in(value, text)
+    ]
+    if not supporting:
+        return None
+    named = ", ".join(str(evidence_id) for evidence_id in supporting)
+    return (
+        f"{aspect_name}: {value!r} is not named by the cited evidence "
+        f"{list(cited_ids)}, but is named by {named}. Cite the observation that "
+        f"states the value; a fact about a related thing only supports it if you "
+        f"already know how the two connect, and that knowledge is not in evidence."
     )
 
 

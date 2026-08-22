@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}resell{% endblock %} — {{ environment }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+
+<header>
+  <nav>
+    <a href="{{ url_for('items') }}">items</a>
+    <a href="{{ url_for('all_questions') }}">questions</a>
+  </nav>
+  <span class="env env-{{ environment }}">{{ environment }} / {{ marketplace }}</span>
+</header>
+
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <ul class="flashes">
+        {% for category, message in messages %}
+          <li class="flash flash-{{ category }}">{{ message }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+</main>

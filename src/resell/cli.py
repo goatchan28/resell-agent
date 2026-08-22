@@ -6,6 +6,7 @@
     resell auth logout     delete stored tokens for this environment
     resell smoke           call eBay with both token kinds to prove auth works
     resell events          tail the event log
+    resell ui              serve the local operator UI on 127.0.0.1
 
 argparse rather than a CLI framework: this is stdlib, and the dependency list for
 a personal tool is worth keeping short.
@@ -394,6 +395,37 @@ def cmd_db(args: argparse.Namespace) -> int:
     return cli_db.main(args.rest, config.db_path)
 
 
+def cmd_ui(args: argparse.Namespace) -> int:
+    """Serve the local operator UI.
+
+    Flask is an extra rather than a dependency, so the import is here and the
+    failure names the fix. The CLI is the reference front end and has to keep
+    working on a machine where the UI was never installed.
+    """
+    try:
+        from resell.webui import serve
+    except ImportError:
+        print(
+            "The operator UI needs Flask, which is an optional extra.\n"
+            "  uv pip install 'resell[ui]'   (or: pip install 'flask>=3.0')",
+            file=sys.stderr,
+        )
+        return 2
+
+    config = load_config(require_credentials=False)
+    print(f"\nresell operator UI  —  {config.env.name} / {config.marketplace_id}")
+    print(f"  database: {config.db_path}")
+    print(f"  http://{args.host}:{args.port}\n")
+    # Loopback by default: this process has a read-write handle on the item
+    # database, an eBay refresh token lives in the same file, and there is no
+    # authentication here. --host is available for the case where the operator
+    # genuinely means it, and says so.
+    if args.host != "127.0.0.1":
+        print(f"  WARNING: bound to {args.host}, which is not loopback. This UI has "
+              f"no authentication.\n", file=sys.stderr)
+    return serve(host=args.host, port=args.port, debug=args.debug)
+
+
 def cmd_price(args: argparse.Namespace) -> int:
     """Comps, pricing, strategies, and repricing."""
     from resell import cli_price
@@ -475,6 +507,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser_price.add_argument("rest", nargs=argparse.REMAINDER)
     parser_price.set_defaults(func=cmd_price)
+
+    ui = subparsers.add_parser("ui", help="serve the local operator UI")
+    ui.add_argument("--host", default="127.0.0.1",
+                    help="loopback by default; this UI has no authentication")
+    ui.add_argument("--port", type=int, default=5000)
+    ui.add_argument("--debug", action="store_true", help="Flask reloader and tracebacks")
+    ui.set_defaults(func=cmd_ui)
 
     images = subparsers.add_parser("images", help="listing photo handling")
     images_sub = images.add_subparsers(dest="images_command", required=True)

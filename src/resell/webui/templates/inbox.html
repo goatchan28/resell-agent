@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}questions{% endblock %}
+
+{% block content %}
+<h1>open questions</h1>
+<p class="muted">Everything the agent has asked and nobody has answered, across
+  every item. Blocking first.</p>
+
+{% if questions %}
+  {% set previous = namespace(sku=None) %}
+  {% for question in questions %}
+    {% if question.sku != previous.sku %}
+      {% set previous.sku = question.sku %}
+      <h2><a href="{{ url_for('item', sku=question.sku) }}">{{ question.sku }}</a>
+        <span class="state state-{{ question.item_state }}">{{ question.item_state }}</span></h2>
+    {% endif %}
+    <article class="question {{ 'blocking' if question.blocking }}">
+      <h3>[{{ question.id }}]
+        <span class="badge {{ 'blocking' if question.blocking }}">{{
+          'blocking' if question.blocking else 'optional' }}</span>
+        {{ question.question }}</h3>
+      {% if question.why_it_matters %}
+        <p class="why">why: {{ question.why_it_matters }}</p>
+      {% endif %}
+      {% if question.suggested_answer %}
+        <p class="resolved">Since resolved: <strong>{{ question.aspect_name }}
+          = {{ question.suggested_answer }}</strong></p>
+      {% endif %}
+      {% with next = 'inbox' %}{% include "_answer_form.html" %}{% endwith %}
+    </article>
+  {% endfor %}
+  <p class="count">{{ questions | length }} open
+    ({{ questions | selectattr('blocking') | list | length }} blocking)</p>
+{% else %}
+  <p class="ok">no open questions</p>
+{% endif %}
+{% endblock %}

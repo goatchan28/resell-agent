@@ -274,6 +274,25 @@ def run_round(
     # "assessment missing" gave no clue which stage produced it.
     outcome.notes.extend(f"plan: {note}" for note in plan.malformed)
 
+    # A response nothing could be read out of is not a decision about this item.
+    # Recording it as one wrote "research not pursued" into evidence, which is the
+    # audit trail for a deliberate choice not to search. Nothing reads those rows
+    # back today, so the immediate cost is a log that misdescribes what happened --
+    # but it is append-only, and `identity_resolution` derives the same fact from
+    # `research_lookup` instead, so the two would simply disagree with each other
+    # for the life of the item.
+    #
+    # Nothing is written, no mode is declared, and the call is already in the ledger
+    # with its reasons, so re-running is the whole remedy.
+    if not plan.usable:
+        outcome.stopped = "plan_unusable"
+        outcome.stop_reason = (
+            "the planner's arguments could not be read, so there is no assessment "
+            "and no lookups. Nothing was recorded and no lookup was spent; re-run "
+            "to try again."
+        )
+        return outcome
+
     if plan.sufficient or not plan.lookups:
         outcome.stopped = "sufficient"
         outcome.stop_reason = plan.rationale or "the planner proposed no lookups"
@@ -328,7 +347,10 @@ def run_round(
                 gateway.record_candidate_facts(
                     sku, candidate_ref=document.candidate_ref,
                     source_url=document.url, authority=str(document.authority),
-                    facts=[(fact.claim, str(fact.domain)) for fact in document.facts],
+                    facts=[
+                        (fact.claim, str(fact.domain), fact.excerpt)
+                        for fact in document.facts
+                    ],
                     restriction=document.restriction, title=document.title,
                     retrieval_method=str(document.retrieval_method),
                 )

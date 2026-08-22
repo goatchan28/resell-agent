@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}{{ item.sku }} draft{% endblock %}
+
+{% block content %}
+{% with active = 'draft' %}{% include "_item_nav.html" %}{% endwith %}
+
+{% if draft.blocking_questions %}
+  <p class="warn">{{ draft.blocking_questions | length }} blocking question(s) are
+    open. Drafting around a question nobody saw is what the gate exists to
+    prevent — <a href="{{ url_for('questions', sku=item.sku) }}">answer them</a>.</p>
+{% endif %}
+
+<h2>current identification</h2>
+<p class="muted">The model's belief right now. This is what a fresh
+  <code>item propose</code> would send.</p>
+{% if draft.identification_title or draft.identification_description %}
+  <div class="draft">
+    <p class="draft-title">{{ draft.identification_title or '(no title)' }}</p>
+    <p class="muted">{{ draft.title_length }}/80 characters</p>
+    <pre>{{ draft.identification_description or '(no description)' }}</pre>
+  </div>
+{% else %}
+  <p class="empty">nothing drafted yet — <code>resell item draft {{ item.sku }}
+    --apply</code></p>
+{% endif %}
+
+<h2>proposed content</h2>
+<p class="muted">What is on the listing record, and what an approval binds. A hash
+  approves specific bytes, so this and the block above are shown separately.</p>
+{% if draft.proposed_title or draft.proposed_description %}
+  <div class="draft">
+    <p class="draft-title">{{ draft.proposed_title or '(no title)' }}</p>
+    <pre>{{ draft.proposed_description or '(no description)' }}</pre>
+  </div>
+{% else %}
+  <p class="empty">nothing proposed yet</p>
+{% endif %}
+
+{% if draft.content_differs_from_proposal %}
+  <p class="warn">The identification has moved on from what was proposed. Until
+    <code>item propose</code> runs again, the approval and the listing still refer
+    to the older copy above.</p>
+{% endif %}
+
+<dl class="wide">
+  <dt>proposal hash<dd><code>{{ draft.proposal_hash or '—' }}</code>
+  <dt>live approval<dd><code>{{ draft.live_approval_hash or 'none' }}</code>
+</dl>
+
+<h2>aspects carried into the copy
+  <span class="muted">{{ draft.aspects | length }}</span></h2>
+{% if draft.aspects %}
+  <table class="kv">
+    {% for name, values in draft.aspects | dictsort %}
+      <tr><th>{{ name }}<td>{{ values | join(' + ') }}
+    {% endfor %}
+  </table>
+{% else %}
+  <p class="empty">none resolved</p>
+{% endif %}
+{% endblock %}

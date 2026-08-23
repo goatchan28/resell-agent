@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}today{% endblock %}
+{% block content %}
+
+{% if run %}{% include "_run.html" %}{% endif %}
+
+{% if cards %}
+  {% for card in cards %}{% include "_card.html" %}{% endfor %}
+{% else %}
+  <p class="empty">Nothing needs you right now.</p>
+{% endif %}
+
+{% if working %}
+  <section class="quiet">
+    <h3>the agent still has work to do on these</h3>
+    {% for row in working %}
+      {# One form, two destinations. `formaction` overrides the action for the
+         second button, which keeps the row a single row -- two side-by-side forms
+         would each need their own grid cell and the columns would stop lining up. #}
+      <form method="post" action="{{ url_for('run', sku=row.sku) }}" class="row"
+            data-long>
+        <span>{{ row.sku }}</span>
+        <span>{{ row.title | shorten(48) }}</span>
+        <span class="tiny">{{ row.summary }}</span>
+        <span class="row-actions">
+          {% if row.active_run %}
+            <span class="tiny quiet"><span class="run-spinner" aria-hidden="true"></span>
+              working</span>
+          {% else %}
+          <button type="submit" class="secondary" data-busy="running…">run</button>
+          <button type="submit" class="quiet-action"
+                  formaction="{{ url_for('abandon', sku=row.sku) }}"
+                  title="Stops work on this item. Nothing is deleted — bring it back from Inventory.">set aside</button>
+          {% endif %}
+        </span>
+      </form>
+    {% endfor %}
+  </section>
+{% endif %}
+
+<section class="intake">
+  <h3>new item</h3>
+  <form method="post" action="{{ url_for('create_item') }}"
+        enctype="multipart/form-data" data-long>
+    <input type="file" name="photos" multiple accept="image/*" required>
+    <input type="number" name="cost_dollars" step="0.01" min="0" placeholder="what you paid">
+    <button type="submit" class="primary" data-busy="uploading…">upload</button>
+  </form>
+  <p class="tiny">Photographs are the input. Everything else is worked out, and you
+    will be asked only when the answer is not in them.</p>
+</section>
+
+{% if done %}
+  <p class="tiny quiet">{{ done | length }} item(s) finished or abandoned —
+    <a href="{{ url_for('inventory') }}">inventory</a></p>
+{% endif %}
+{% endblock %}

@@ -120,9 +120,11 @@ class ConditionBand(StrEnum):
 
     eBay's condition IDs are category-dependent (Taxonomy `getItemConditionPolicies`
     is the authority, and clothing in particular reuses 1000/1500 for "new with
-    tags" / "new without tags"). `CONDITION_ID_TO_BAND` below is therefore marked
-    provisional and should be replaced by a per-category normalisation once the
-    condition policies are fetched. The band, not the raw id, is what stratifies.
+    tags" / "new without tags"). The id is the canonical vocabulary and this ladder
+    is derived from it: `pricing.condition` resolves text to an id, and
+    `CONDITION_ID_TO_BAND` turns the id into a rung. The band, not the raw id, is
+    what stratifies -- ordering is all a comparison needs, and the ordering holds
+    across categories even where the labels do not.
     """
 
     NEW_WITH_TAGS = "new_with_tags"
@@ -154,7 +156,13 @@ class ConditionBand(StrEnum):
 # Taxonomy call contradicts is a bug in this table, not in the caller.
 CONDITION_ID_TO_BAND: dict[int, ConditionBand] = {
     1000: ConditionBand.NEW_WITH_TAGS,
-    1500: ConditionBand.NEW_WITHOUT_TAGS,
+    # One id, two category labels: "New (other)" nearly everywhere, "New without
+    # tags" in apparel. Open-box cameras and tagless garments arrive as the same
+    # number and cannot be told apart without the category, so both band to
+    # `new_other`. The `new_without_tags` rung stays on the ladder because an
+    # operator setting our own item's condition *does* know the category, and the
+    # rung above it is then meaningful.
+    1500: ConditionBand.NEW_OTHER,
     1750: ConditionBand.NEW_OTHER,
     2000: ConditionBand.REFURBISHED,
     2010: ConditionBand.REFURBISHED,
@@ -162,6 +170,15 @@ CONDITION_ID_TO_BAND: dict[int, ConditionBand] = {
     2030: ConditionBand.REFURBISHED,
     2500: ConditionBand.REFURBISHED,
     2750: ConditionBand.USED_EXCELLENT,
+    # 3000 looks like it should be the top used rung -- its Sell API enum name is
+    # USED_EXCELLENT -- and it is not. It is the *generic* used condition, shown as
+    # "Pre-owned" or "Used" in almost every category, and it is what the large
+    # majority of used listings carry. The graded rungs 4000/5000/6000 ("Very
+    # Good", "Good", "Acceptable") are mostly books and media. Banding 3000 to the
+    # top would inflate every ordinary second-hand comp on the site.
+    #
+    # This is the clearest case of the enum name and the category label disagreeing,
+    # which is why the id is canonical and neither name is.
     3000: ConditionBand.USED_GOOD,
     4000: ConditionBand.USED_EXCELLENT,
     5000: ConditionBand.USED_GOOD,
@@ -189,6 +206,10 @@ class ConditionSource(StrEnum):
     SELLER_DECLARED = "seller_declared"
     OPERATOR_OBSERVED = "operator_observed"
     EVIDENCE_CITED = "evidence_cited"
+    # Nobody said. A search index returns a price with no condition attached, and
+    # defaulting that to `seller_declared` would attribute to a seller a statement
+    # they never made -- the one thing this enum exists to prevent.
+    UNSTATED = "unstated"
 
 
 # --- provenance and licensing ------------------------------------------------
@@ -197,6 +218,12 @@ class ConditionSource(StrEnum):
 class RetrievalMethod(StrEnum):
     OPERATOR_TRANSCRIBED = "operator_transcribed"
     AUTOMATED_FETCH = "automated_fetch"
+    # A search engine's structured description of a listing, not the listing. The
+    # bytes of the page were never loaded, so there is no excerpt in the sense the
+    # rest of this codebase means -- what is stored is the index's own words.
+    # Weaker than `automated_fetch` and stronger than nothing, and it must stay
+    # distinguishable from both.
+    SEARCH_INDEX = "search_index"
 
 
 class ModelVisibility(StrEnum):
@@ -255,6 +282,10 @@ class CompObservation:
     adapter: str | None = None
     query_text: str | None = None
     raw_payload_hash: str | None = None
+    # The page text the price was read from. None when the operator transcribed the
+    # listing: they are the witness to it, and there is no quotation to keep. An
+    # automated extraction has no witness, so it carries the words it read.
+    source_excerpt: str | None = None
     model_visibility: ModelVisibility = ModelVisibility.FULL
     retention_expires_at: datetime | None = None
 

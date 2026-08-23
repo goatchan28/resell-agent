@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from resell.migrate import (
+    BASE_VERSION,
     COLUMN_ADDITIONS,
     applied_versions,
     columns_of,
@@ -43,7 +44,18 @@ CREATE TABLE price_proposal (
 );
 """
 
-STRATEGY_COLUMNS = {a.column for a in COLUMN_ADDITIONS}
+# Filtered by table. The first version of this took every declared addition,
+# which was correct only while price_proposal was the sole table with any --
+# comp research added one to comp_observation and the assertions below started
+# demanding it of the wrong table.
+STRATEGY_COLUMNS = {
+    a.column for a in COLUMN_ADDITIONS if a.table == "price_proposal"
+}
+# Derived, not listed. Every hardcoded count and version set in this file broke
+# the first time a migration touched a second table, which is a test failing for
+# the one reason it should not: the thing it describes working correctly.
+PROPOSAL_ADDITIONS = [a for a in COLUMN_ADDITIONS if a.table == "price_proposal"]
+EXPECTED_VERSIONS = {BASE_VERSION} | {a.version for a in COLUMN_ADDITIONS}
 
 
 def empty_db() -> sqlite3.Connection:
@@ -93,7 +105,7 @@ def test_fresh_database_gets_the_full_schema_in_one_pass():
 def test_fresh_database_records_every_version_as_satisfied():
     conn = empty_db()
     migrate(conn)
-    assert applied_versions(conn) == {"001_pricing", "002_pricing_strategy"}
+    assert applied_versions(conn) == EXPECTED_VERSIONS
 
 
 # --- pre-strategy database ---------------------------------------------------
@@ -104,13 +116,13 @@ def test_pre_strategy_database_is_missing_the_columns_before_migration():
     ok, why = verify(conn)
     assert not ok
     assert "price_proposal.objective" in why
-    assert len(missing_columns(conn)) == len(COLUMN_ADDITIONS)
+    assert len(missing_columns(conn)) == len(PROPOSAL_ADDITIONS)
 
 
 def test_pre_strategy_database_is_upgraded_in_place():
     conn = pre_strategy_db()
     report = migrate(conn)
-    assert len(report.columns_added) == len(COLUMN_ADDITIONS)
+    assert len(report.columns_added) == len(PROPOSAL_ADDITIONS)
     assert STRATEGY_COLUMNS <= columns_of(conn, "price_proposal")
     ok, _ = verify(conn)
     assert ok
@@ -151,7 +163,7 @@ def test_a_correct_database_with_no_ledger_is_backfilled_not_altered():
 
     report = migrate(conn)
     assert report.columns_added == []
-    assert set(report.versions_recorded) == {"001_pricing", "002_pricing_strategy"}
+    assert set(report.versions_recorded) == EXPECTED_VERSIONS
     detail = conn.execute(
         "SELECT detail FROM schema_migration WHERE version='002_pricing_strategy'"
     ).fetchone()[0]

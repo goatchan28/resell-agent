@@ -115,6 +115,13 @@ new used pre owned preowned excellent good fair
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9'\-/.]*")
 _EDGE = "'.-/"
 
+# A typographic dash between two characters is a hyphen wearing better clothes.
+# "5-45 lb" was refused and "5–45 lb" sailed through, which is the same claim and
+# the same invention. Only dashes with no space either side are folded: an em dash
+# separating clauses is punctuation, and joining the words around it would invent a
+# compound that nobody wrote.
+_DASH = re.compile(r"(?<=[A-Za-z0-9])[‐-―](?=[A-Za-z0-9])")
+
 
 @dataclass(frozen=True)
 class DraftClaim:
@@ -153,8 +160,70 @@ class DraftReview:
 
 
 def _tokens(text: str) -> list[str]:
-    stripped = (t.strip(_EDGE).lower() for t in _TOKEN.findall(text))
+    stripped = (t.strip(_EDGE).lower() for t in _TOKEN.findall(_DASH.sub("-", text)))
     return [t for t in stripped if t]
+
+
+def _article(word: str) -> str:
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+def _only_as_a_name(text: str, term: str, supported_text: str) -> bool:
+    """Whether every use of `term` sits inside a phrase the record already holds.
+
+    A regulated word is regulated as an *assertion*. "Vintage" claims an age a
+    buyer can rely on; the same letters inside a proper name claim nothing. This
+    book's publisher is Vintage Contemporaries, its colour might be Mint Green,
+    its material Genuine Leather -- all record values, none of them claims, and
+    all of them refused drafts until this existed.
+
+    The rule is positional, not lexical: each occurrence is looked at where it
+    sits, and excused only if the words around it reproduce something the record
+    says. A window is used rather than a fixed bigram so a three- or four-word
+    name works too.
+
+    Deliberately unforgiving in one direction. **Every** occurrence must be
+    excused; one bare use anywhere spoils it for the draft. Otherwise naming the
+    publisher would license "a lovely vintage find" two sentences later, and the
+    exception would swallow the rule it is carved out of.
+    """
+    supported = " ".join(supported_text.split()).casefold()
+    if not supported:
+        return False
+    words = _tokens(text)
+    folded = term.casefold().split()
+    if not folded:
+        return False
+
+    span = len(folded)
+    found_any = False
+    for index in range(len(words) - span + 1):
+        if words[index:index + span] != folded:
+            continue
+        found_any = True
+        if not _phrase_around(words, index, span, supported):
+            return False
+    return found_any
+
+
+# How far either side of the word to look for the rest of a name. Four covers
+# "The Criterion Collection" and "Genuine Italian Calf Leather" without reaching
+# so far that unrelated words happen to line up.
+_NAME_WINDOW = 4
+
+
+def _phrase_around(words: list[str], index: int, span: int, supported: str) -> bool:
+    """Whether any multi-word phrase containing this occurrence is in the record."""
+    lo = max(0, index - _NAME_WINDOW)
+    hi = min(len(words), index + span + _NAME_WINDOW)
+    for start in range(lo, index + 1):
+        for end in range(index + span, hi + 1):
+            if end - start < span + 1:
+                continue          # the term alone is not a name
+            phrase = " ".join(words[start:end])
+            if phrase in supported:
+                return True
+    return False
 
 
 def _contains_phrase(text: str, phrase: str) -> bool:
@@ -192,10 +261,22 @@ def review_draft(
             review.problems.append(f"{term!r} cannot be supported by evidence: {why}")
 
     for term, needs in CONDITIONAL_TERMS.items():
-        if _contains_phrase(combined, term) and needs not in available_support:
-            review.problems.append(
-                f"{term!r} requires {needs} evidence, and none is recorded"
+        if not _contains_phrase(combined, term) or needs in available_support:
+            continue
+        if _only_as_a_name(combined, term, supported_text):
+            # The word is part of something the record already names, not a claim
+            # about the object. "Vintage Contemporaries" is an imprint -- it sits
+            # in this book's Publisher aspect -- and reading it as an age
+            # assertion refused the draft twice, then the repair, and left the
+            # operator to write the listing by hand.
+            review.warnings.append(
+                f"{term!r} appears only inside a name the record holds, so it is "
+                f"not read as {_article(needs)} {needs} claim"
             )
+            continue
+        review.problems.append(
+            f"{term!r} requires {needs} evidence, and none is recorded"
+        )
 
     for index, claim in enumerate(draft.claims):
         if not claim.text.strip():
@@ -241,6 +322,14 @@ def review_draft(
             parts = [part for part in token.split("-") if part]
             if parts and all(part in supported for part in parts):
                 return True
+        # The substring fallback is for morphology -- "dumbbells" against
+        # "dumbbell" -- and it must not extend to figures. "5" is a substring of
+        # "17.5", so a title claiming a 5 lb minimum found a host in a dial marking
+        # and was accepted; every one- and two-digit invention can find one
+        # somewhere. A number is a specification, so it matches exactly or not at
+        # all.
+        if any(c.isdigit() for c in token):
+            return False
         return any(token in word or word in token for word in supported if len(word) > 3)
     untraceable = [
         token for token in _tokens(draft.title)

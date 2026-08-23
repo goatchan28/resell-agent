@@ -71,9 +71,23 @@ class PriceQualifier(StrEnum):
     STALE_COMPS = "stale_comps"
     CONDITION_MISMATCH = "condition_mismatch"
     CONDITION_UNKNOWN_IN_SAMPLE = "condition_unknown_in_sample"
+    # The band itself came from asks whose condition nobody stated -- typically a
+    # search index, which returns a price and no condition. Distinct from
+    # `condition_mismatch`, which asserts a difference was observed. Nothing was
+    # observed here, and a band built on that must not claim otherwise.
+    ASKING_UNKNOWN_CONDITION = "asking_unknown_condition"
     SHIPPING_UNKNOWN = "shipping_unknown"
     MIXED_COMPARISON_BASIS = "mixed_comparison_basis"
     RETAIL_ONLY = "retail_only"
+    # No comparable evidence at all: the number is the operator's judgement. The
+    # loudest qualifier there is, and the reason a manual price still goes through
+    # the proposal seam rather than around it -- the price is theirs to set, and
+    # the record has to say the market never supported it.
+    OPERATOR_JUDGEMENT = "operator_judgement"
+    # A thin condition-matched pool widened with marketplace asks whose condition
+    # nobody stated. Both are asking prices from marketplaces -- no price kind was
+    # crossed -- and the alternative was letting one observation speak over twelve.
+    POOLED_UNKNOWN_CONDITION = "pooled_unknown_condition"
     ABOVE_RETAIL_CEILING = "above_retail_ceiling"
     ADJUSTED = "adjusted"
     LONG_DAYS_ON_MARKET = "long_days_on_market"
@@ -174,6 +188,115 @@ class RetailReference:
     citation: str | None = None
 
 
+class EvidenceRole(StrEnum):
+    """What a piece of evidence was allowed to do.
+
+    Named rather than inferred from the output, because the interesting cases are
+    the ones where evidence was present and did nothing: a retail price that is
+    context, a sold comp in the wrong condition that was retained and not applied,
+    an ask that has sat too long. Those all look identical to "absent" in a band,
+    and they are not the same thing at all.
+    """
+
+    SET_THE_BAND = "set the band"
+    RETAINED_NOT_APPLIED = "retained, not applied"
+    CONTEXT_ONLY = "context only"
+    CEILING_CHECK = "ceiling check"
+    DEMAND_ONLY = "demand signal only"
+    EXCLUDED = "excluded"
+    RECLASSIFIED = "reclassified"
+
+
+@dataclass(frozen=True)
+class EvidenceContribution:
+    """One line of the account of how the number was reached."""
+
+    source: str
+    n: int
+    role: EvidenceRole
+    detail: str
+    low_cents: int | None = None
+    high_cents: int | None = None
+    # The middle of the pool, and where the observations came from. Both were
+    # computed and then thrown away: a line reading "n=12, $50-$95" says less than
+    # it knows, and "search index" against "fetched page" is the difference
+    # between a third party's summary and bytes we loaded.
+    median_cents: int | None = None
+    origins: tuple[str, ...] = ()
+
+    @property
+    def contributed(self) -> bool:
+        return self.role is EvidenceRole.SET_THE_BAND
+
+
+@dataclass(frozen=True)
+class DemandSignal:
+    """How long things sit, modelled apart from what they cost.
+
+    Deliberately not folded into the band. Days on market says something about
+    liquidity, not about value, and averaging it into a price would be mixing two
+    quantities the way pooling asks with sales would. It informs which strategy an
+    operator picks; it moves no number on its own.
+
+    Only asks carry it usefully. A sold comp's days-on-market is the time that sale
+    took, which is a fact about a completed transaction rather than about the
+    market as it stands.
+    """
+
+    n_asks: int = 0
+    n_with_days: int = 0
+    median_days: int | None = None
+    max_days: int | None = None
+    n_beyond_window: int = 0
+    window_days: int = DEFAULT_WINDOW_DAYS
+
+    @property
+    def measured(self) -> bool:
+        return self.n_with_days > 0
+
+    def describe(self) -> str:
+        if not self.measured:
+            return (
+                f"no days-on-market recorded on {self.n_asks} ask(s); liquidity is "
+                f"unmeasured, which is not the same as fast"
+            )
+        parts = [
+            f"{self.n_with_days} of {self.n_asks} ask(s) report days on market, "
+            f"median {self.median_days}d"
+        ]
+        if self.n_beyond_window:
+            parts.append(
+                f"{self.n_beyond_window} beyond the {self.window_days}-day window, "
+                f"which is evidence the asking price is wrong rather than evidence "
+                f"of what the market pays"
+            )
+        return "; ".join(parts)
+
+
+def measure_demand(asking, window_days: int) -> DemandSignal:
+    """Days-on-market across the asking pool. No prices touched."""
+    days = [
+        c.observation.days_on_market for c in asking
+        if c.observation.days_on_market is not None
+    ]
+    if not days:
+        return DemandSignal(n_asks=len(asking), window_days=window_days)
+    ordered = sorted(days)
+    middle = len(ordered) // 2
+    median = (
+        ordered[middle] if len(ordered) % 2
+        else round((ordered[middle - 1] + ordered[middle]) / 2)
+    )
+    return DemandSignal(
+        n_asks=len(asking),
+        n_with_days=len(days),
+        median_days=median,
+        max_days=ordered[-1],
+        n_beyond_window=sum(1 for d in days if d > window_days),
+        window_days=window_days,
+    )
+
+
 @dataclass(frozen=True)
 class PricingInput:
     sku: str
@@ -229,6 +352,10 @@ class PriceRecommendation:
     qualifiers: tuple[PriceQualifier, ...] = ()
     retail_context: tuple[RetailReference, ...] = ()
     diagnostic_confidence: float = 0.0
+    # The account of how the number was reached, including the evidence that was
+    # present and did nothing.
+    contributions: tuple[EvidenceContribution, ...] = ()
+    demand: DemandSignal | None = None
 
     def has(self, q: PriceQualifier) -> bool:
         return q in self.qualifiers
@@ -331,7 +458,13 @@ def recommend(inp: PricingInput) -> PriceRecommendation:
     ):
         quals.add(PriceQualifier.NO_SAME_PRODUCT_COMPS)
 
-    # Retail never joins the sample.
+    # Retail never joins the sample. It used to be filtered out silently, which
+    # made a retail price recorded as a comp indistinguishable from one nobody
+    # recorded -- so an operator who supplied it saw no trace of it anywhere.
+    # It is reclassified as context, and the reclassification is reported.
+    reference_comps = [
+        c for c in included if c.observation.price_kind is PriceKind.REFERENCE
+    ]
     included = [c for c in included if c.observation.price_kind is not PriceKind.REFERENCE]
 
     realized = [c for c in included if c.observation.price_kind is PriceKind.REALIZED]
@@ -357,6 +490,7 @@ def recommend(inp: PricingInput) -> PriceRecommendation:
     # wrong, not evidence of what the market pays. Excluded from the sample with
     # a recorded reason, and only while at least two asks survive.
     exclusions: list[str] = []
+    asking_before_staleness = list(asking)
     fresh_asking = [
         c for c in asking
         if (c.observation.days_on_market or 0) <= inp.window_days
@@ -371,6 +505,11 @@ def recommend(inp: PricingInput) -> PriceRecommendation:
                 )
         asking = fresh_asking
         quals.add(PriceQualifier.STALE_ASKS_EXCLUDED)
+
+    # Measured across every ask, including the ones excluded from the band for
+    # sitting too long -- an ask that has sat 200 days is the most informative
+    # thing in the sample about liquidity and the least informative about value.
+    demand = measure_demand(asking_before_staleness, inp.window_days)
 
     item_band = inp.item_condition_band
     r_comp = [c for c in realized if condition_comparable(c.observation.condition_band, item_band)]
@@ -402,6 +541,15 @@ def recommend(inp: PricingInput) -> PriceRecommendation:
         r_comp_dist, r_off_dist, a_comp_dist, a_off_dist, quals,
     )
 
+    contributions = build_contributions(
+        chosen_pool=chosen_pool,
+        r_comp=r_comp, r_off=r_off, a_comp=a_comp, a_off=a_off,
+        r_comp_d=r_comp_dist, r_off_d=r_off_dist,
+        a_comp_d=a_comp_dist, a_off_d=a_off_dist,
+        excluded=excluded, reference_comps=reference_comps, retail=inp.retail,
+        demand=demand, exclusions=exclusions,
+    )
+
     base = PriceRecommendation(
         sku=inp.sku,
         unpriceable=True,
@@ -419,6 +567,8 @@ def recommend(inp: PricingInput) -> PriceRecommendation:
         comparability_profile=profile,
         identity_ceiling=ceiling,
         retail_context=inp.retail,
+        demand=demand,
+        contributions=contributions,
     )
 
     if chosen is None:
@@ -490,6 +640,135 @@ def recommend(inp: PricingInput) -> PriceRecommendation:
     )
 
 
+# How a marketplace observation reached us. A search engine's structured summary
+# of a listing and a page whose bytes we loaded are different things, and a line
+# that reports twelve observations without saying which is overstating them.
+_ORIGIN_NAMES = {
+    "search_index": "search index",
+    "automated_fetch": "fetched page",
+    "operator_transcribed": "typed by you",
+}
+
+
+def _origins(pool) -> tuple[str, ...]:
+    """Where a pool's observations came from, most common first."""
+    counts: dict[str, int] = {}
+    for scored in pool:
+        name = _ORIGIN_NAMES.get(
+            str(scored.observation.retrieval_method),
+            str(scored.observation.retrieval_method),
+        )
+        counts[name] = counts.get(name, 0) + 1
+    return tuple(
+        name if len(counts) == 1 else f"{name} ({n})"
+        for name, n in sorted(counts.items(), key=lambda kv: -kv[1])
+    )
+
+
+def build_contributions(
+    *,
+    chosen_pool,
+    r_comp, r_off, a_comp, a_off,
+    r_comp_d, r_off_d, a_comp_d, a_off_d,
+    excluded, reference_comps, retail, demand, exclusions,
+) -> tuple[EvidenceContribution, ...]:
+    """One line per evidence type, saying what it was allowed to do.
+
+    Written so the absent lines are as informative as the present ones. "No
+    realised sales" and "realised sales that were retained and applied to nothing"
+    produce the same band and mean very different things about how much to trust
+    it, and only one of them is visible in a distribution table.
+
+    Order is fixed rather than sorted by size: marketplace evidence first, strongest
+    first, then the things that are not comps at all. What set the number should be
+    the first thing read.
+    """
+    chosen_ids = {id(c) for c in chosen_pool}
+    lines: list[EvidenceContribution] = []
+
+    def pool_line(source: str, pool, dist, when_unused: EvidenceRole, detail: str):
+        if not pool:
+            return
+        used = bool(pool) and id(pool[0]) in chosen_ids
+        lines.append(EvidenceContribution(
+            source=source, n=len(pool),
+            role=EvidenceRole.SET_THE_BAND if used else when_unused,
+            detail=detail,
+            low_cents=dist.min_cents if dist else None,
+            high_cents=dist.max_cents if dist else None,
+            median_cents=dist.median_cents if dist else None,
+            origins=_origins(pool),
+        ))
+
+    pool_line(
+        "sold, condition matched", r_comp, r_comp_d, EvidenceRole.RETAINED_NOT_APPLIED,
+        "realised sales in this item's condition -- the strongest evidence there is",
+    )
+    pool_line(
+        "sold, other condition", r_off, r_off_d, EvidenceRole.RETAINED_NOT_APPLIED,
+        "realised, but for a materially different condition, so it estimates "
+        "something else",
+    )
+    pool_line(
+        "asks, condition matched", a_comp, a_comp_d, EvidenceRole.RETAINED_NOT_APPLIED,
+        "what comparable examples are being offered at; nobody has paid these",
+    )
+    # Split for reporting only -- both halves are one pool in `_choose`, and the
+    # number is unchanged. "Other condition" and "condition unknown" are different
+    # claims, and a line that merges them tells an operator a difference was seen
+    # when none was.
+    a_off_known = [c for c in a_off if c.observation.condition_band is not ConditionBand.UNKNOWN]
+    a_off_unknown = [c for c in a_off if c.observation.condition_band is ConditionBand.UNKNOWN]
+    pool_line(
+        "asks, other condition", a_off_known, summarize(
+            [c.observation.comparison_price_cents for c in a_off_known], PriceKind.ASKING
+        ) if a_off_known else None,
+        EvidenceRole.RETAINED_NOT_APPLIED,
+        "offers for a different condition; the weakest pool that can still set a band",
+    )
+    pool_line(
+        "asks, condition unstated", a_off_unknown, summarize(
+            [c.observation.comparison_price_cents for c in a_off_unknown], PriceKind.ASKING
+        ) if a_off_unknown else None,
+        EvidenceRole.RETAINED_NOT_APPLIED,
+        "an approximate asking market: prices with no condition attached, so the "
+        "spread is real and its position on the ladder is not",
+    )
+
+    if reference_comps:
+        lines.append(EvidenceContribution(
+            source="retail recorded as a comp", n=len(reference_comps),
+            role=EvidenceRole.RECLASSIFIED,
+            detail="a retail price is not a market observation; moved to context and "
+                   "kept out of every distribution",
+        ))
+    if retail:
+        prices = [r.price_cents for r in retail]
+        lines.append(EvidenceContribution(
+            source="retail context", n=len(retail), role=EvidenceRole.CEILING_CHECK,
+            detail="what it costs new; bounds the answer and never joins a sample",
+            low_cents=min(prices), high_cents=max(prices),
+        ))
+    if demand is not None and demand.n_asks:
+        lines.append(EvidenceContribution(
+            source="days on market", n=demand.n_with_days,
+            role=EvidenceRole.DEMAND_ONLY, detail=demand.describe(),
+        ))
+    if excluded:
+        lines.append(EvidenceContribution(
+            source="excluded by the operator", n=len(excluded),
+            role=EvidenceRole.EXCLUDED,
+            detail="ruled out as comparisons; retained so the exclusion is auditable",
+        ))
+    if exclusions:
+        lines.append(EvidenceContribution(
+            source="dropped from the sample", n=len(exclusions),
+            role=EvidenceRole.EXCLUDED,
+            detail="; ".join(exclusions)[:200],
+        ))
+    return tuple(lines)
+
+
 def _choose(r_comp, r_off, a_comp, a_off, r_comp_d, r_off_d, a_comp_d, a_off_d, quals):
     """Which sample sets the number.
 
@@ -505,7 +784,8 @@ def _choose(r_comp, r_off, a_comp, a_off, r_comp_d, r_off_d, a_comp_d, a_off_d, 
     band and condition-matched asks exist, the asks position the price and the
     realized evidence is retained, reported, and applied to nothing.
 
-    Nothing is pooled across kinds and no number is transformed.
+    Nothing is pooled across kinds and no number is transformed. One pooling
+    happens *within* a kind: see the thin-matched case below.
     """
     if r_comp:
         return r_comp_d, PriceKind.REALIZED, r_comp, "condition_matched"
@@ -517,6 +797,32 @@ def _choose(r_comp, r_off, a_comp, a_off, r_comp_d, r_off_d, a_comp_d, a_off_d, 
             quals.add(PriceQualifier.SOLD_EVIDENCE_OUT_OF_BAND)
         else:
             quals.add(PriceQualifier.ASKING_ONLY)
+
+        # A thin matched pool, widened by marketplace asks whose condition nobody
+        # stated. One matched ask at $110 used to speak over twelve observations
+        # saying $50-$95, and the recommendation collapsed to a single point --
+        # marketplace evidence discarded for lacking a label, which is exactly
+        # what "unknown condition should reduce weight, not remove the data"
+        # rules out.
+        #
+        # No price kind is crossed: both pools are asking prices from
+        # marketplaces, differing only in whether anyone said what condition the
+        # goods were in. That is a reason to trust the band less, and the
+        # qualifier says so -- it is not a reason to pretend the observations do
+        # not exist.
+        unstated = [c for c in a_off
+                    if c.observation.condition_band is ConditionBand.UNKNOWN]
+        if len(a_comp) < THIN_SAMPLE_N and len(unstated) > len(a_comp):
+            pooled = a_comp + unstated
+            quals.add(PriceQualifier.POOLED_UNKNOWN_CONDITION)
+            quals.add(PriceQualifier.CONDITION_UNKNOWN_IN_SAMPLE)
+            return (
+                summarize(
+                    [c.observation.comparison_price_cents for c in pooled],
+                    PriceKind.ASKING,
+                ),
+                PriceKind.ASKING, pooled, "asks_widened_by_unstated",
+            )
         return a_comp_d, PriceKind.ASKING, a_comp, "condition_matched_asks"
 
     if r_off:
@@ -524,8 +830,15 @@ def _choose(r_comp, r_off, a_comp, a_off, r_comp_d, r_off_d, a_comp_d, a_off_d, 
         return r_off_d, PriceKind.REALIZED, r_off, "condition_mismatched"
 
     if a_off:
-        quals.add(PriceQualifier.CONDITION_MISMATCH)
         quals.add(PriceQualifier.ASKING_ONLY)
+        # `condition_mismatch` says a difference was observed. When every ask in
+        # the pool has an unstated condition, none was: the honest claim is that
+        # the band is an asking spread of unknown condition, which is weaker and
+        # differently weak. A mixed pool is still a mismatch.
+        if all(c.observation.condition_band is ConditionBand.UNKNOWN for c in a_off):
+            quals.add(PriceQualifier.ASKING_UNKNOWN_CONDITION)
+            return a_off_d, PriceKind.ASKING, a_off, "asking_condition_unstated"
+        quals.add(PriceQualifier.CONDITION_MISMATCH)
         return a_off_d, PriceKind.ASKING, a_off, "condition_mismatched"
 
     return None, None, [], "none"

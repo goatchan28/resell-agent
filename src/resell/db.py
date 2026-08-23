@@ -562,6 +562,53 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
     # Nullable, because a transcription genuinely has no excerpt -- and that
     # absence is informative rather than missing data.
     ("ALTER TABLE evidence ADD COLUMN source_excerpt TEXT",),
+    # 19 -- what a lookup cost.
+    #
+    # `LookupBudget` has always allocated against a per-search price, but nothing
+    # recorded what was actually spent, so search spend was budgeted and then
+    # invisible -- absent from `resell item cost`, which claimed to be the total
+    # cost of processing an item. A paid search backend makes that a real
+    # understatement rather than a theoretical one.
+    #
+    # Nullable: lookups performed before this column existed cost an unknown
+    # amount, and writing 0 would assert they were free.
+    ("ALTER TABLE research_lookup ADD COLUMN cost_micros INTEGER",),
+    # 20 -- what a run is doing, while it does it.
+    #
+    # Pressing Run held a browser request open for minutes with nothing on the
+    # screen: no way to tell whether the click registered, what stage the agent
+    # was in, or whether it had hung. Starting a run and watching one are now
+    # different requests, and this is what the second one reads.
+    #
+    # In the database rather than in memory because the run happens on a
+    # background thread and the polling request is a different one -- and because
+    # a run that dies with the process should still be visible afterwards as
+    # something that started and never finished, rather than vanishing.
+    (
+        """
+        CREATE TABLE agent_run (
+            run_id      TEXT PRIMARY KEY,
+            sku         TEXT NOT NULL REFERENCES item(sku),
+            status      TEXT NOT NULL CHECK (status IN ('running','done','failed')),
+            started_at  TEXT NOT NULL,
+            finished_at TEXT,
+            detail      TEXT NOT NULL DEFAULT ''
+        )
+        """,
+        """
+        CREATE TABLE agent_run_step (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id     TEXT NOT NULL REFERENCES agent_run(run_id),
+            at         TEXT NOT NULL,
+            elapsed_ms INTEGER NOT NULL,
+            phase      TEXT NOT NULL,
+            message    TEXT NOT NULL,
+            ok         INTEGER NOT NULL DEFAULT 1
+        )
+        """,
+        "CREATE INDEX idx_run_step ON agent_run_step (run_id, id)",
+        "CREATE INDEX idx_run_sku ON agent_run (sku, started_at)",
+    ),
 )
 
 

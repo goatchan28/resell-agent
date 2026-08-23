@@ -62,6 +62,11 @@ COLUMN_ADDITIONS: tuple[ColumnAddition, ...] = (
                    "TEXT NOT NULL DEFAULT ''"),
     ColumnAddition("002_pricing_strategy", "price_proposal", "sold_evidence_note",
                    "TEXT NOT NULL DEFAULT ''"),
+    # Added with comp research. An operator who reads a listing and types its
+    # price is the witness to it; a model reading fetched HTML is not, so an
+    # automatically extracted comp carries the text its numbers came from. Same
+    # rule and same reason as `evidence.source_excerpt` on the identity side.
+    ColumnAddition("003_comp_research", "comp_observation", "source_excerpt", "TEXT"),
 )
 
 # Every table the schema declares. Checked by name so a partially applied script
@@ -69,6 +74,7 @@ COLUMN_ADDITIONS: tuple[ColumnAddition, ...] = (
 EXPECTED_TABLES: tuple[str, ...] = (
     "comp_observation",
     "comp_claim",
+    "comp_candidate",
     "comp_set",
     "comp_set_member",
     "fee_schedule",

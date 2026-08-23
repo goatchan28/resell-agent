@@ -71,8 +71,53 @@ AUTHORITY_BY_DOMAIN: dict[str, SourceAuthority] = {
 }
 
 
+# Hosts no adapter may fetch, whatever an operator pastes and whatever a planner
+# proposes. This is not a quality judgement -- it is a licensing one, and it is
+# enforced at the fetcher rather than at each caller because a rule that depends on
+# every future adapter remembering it is not a rule.
+#
+# Comp research makes this sharper than identity research did: comparable sold
+# listings are eBay's core data, so the temptation to fetch is structural. The
+# operator can still read a page themselves and transcribe it -- that is a person
+# using a site they are entitled to use, and it is recorded as their account.
+FORBIDDEN_DOMAINS: dict[str, str] = {
+    "ebay.com": "eBay's agreement restricts Restricted API data from reaching a "
+                "third-party AI and prohibits LLM-driven scraping of the site",
+    "ebay.co.uk": "same eBay agreement",
+    "ebay.de": "same eBay agreement",
+    "ebay.com.au": "same eBay agreement",
+    "ebay.ca": "same eBay agreement",
+    "ebay.fr": "same eBay agreement",
+    "ebay.it": "same eBay agreement",
+    "ebay.es": "same eBay agreement",
+}
+
+
 def registered_domains() -> tuple[str, ...]:
     return tuple(sorted(AUTHORITY_BY_DOMAIN))
+
+
+def fetch_permitted(url: str) -> tuple[bool, str]:
+    """Whether any adapter may retrieve this URL at all.
+
+    Separate from authority and asked first. Authority answers "how much is this
+    page worth"; this answers "may we load it", and a no here is not overridable by
+    a stronger match or a better source -- there is no combination of evidence that
+    makes fetching a forbidden host acceptable.
+    """
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if not host:
+        return True, "no host to check"
+    labels = host.split(".")
+    for cut in range(len(labels) - 1):
+        suffix = ".".join(labels[cut:])
+        reason = FORBIDDEN_DOMAINS.get(suffix)
+        if reason is not None:
+            return False, (
+                f"{suffix} must not be fetched: {reason}. Read the page yourself "
+                f"and transcribe it if you need it."
+            )
+    return True, "not a forbidden host"
 
 
 def authority_for_url(url: str) -> tuple[SourceAuthority, str]:

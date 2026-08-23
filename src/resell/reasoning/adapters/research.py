@@ -233,6 +233,35 @@ def _operator_url_adapter(**kwargs):
     return OperatorUrlResearchAdapter(**kwargs)
 
 
+class NoRetrievalAdapter:
+    """No search backend is configured, and says so rather than pretending.
+
+    The planning half of identification research is worth running without it: the
+    planner decides whether research is warranted at all, and its most valuable
+    answer is often `sufficient` -- "the evidence already supports the best
+    identification available", which declares the mode and needs no lookups.
+
+    When it does propose lookups, this refuses them. Refusing rather than
+    returning an empty list is deliberate: `run_round` records a lookup when one is
+    performed, and a lookup recorded against a search that never happened would
+    move the item from `unattempted` to `searched_not_found` -- a claim that
+    somebody looked and found nothing, which is a fact about the object and would
+    not be true.
+    """
+
+    provider = "none"
+
+    def cost_micros_per_lookup(self) -> int:
+        return 0
+
+    def search(self, query: ResearchQuery) -> list[RetrievedDocument]:
+        raise ResearchError(
+            self.provider,
+            "no search backend is configured, so nothing can be retrieved. This is "
+            "a gap in the tool rather than something to do by hand.",
+        )
+
+
 ADAPTERS: dict[str, type] = {
     "manual": ManualResearchAdapter,
     # Operator supplies the URL; the system fetches the page and extracts the facts.

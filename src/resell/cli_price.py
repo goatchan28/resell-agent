@@ -69,6 +69,12 @@ def _money(cents: int | None) -> str:
     return "n/a" if cents is None else f"${cents / 100:.2f}"
 
 
+def _wrap(text: str, width: int) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(text, width) or [""]
+
+
 def _uid(p: str) -> str:
     return f"{p}_{uuid.uuid4().hex[:12]}"
 
@@ -116,6 +122,12 @@ def cmd_comp_add(args, conn: sqlite3.Connection) -> int:
     sp.record_comp_observation(conn, obs)
     flag = "" if obs.shipping_known else "  [shipping unknown]"
     print(f"{obs.comp_id}  {kind.verb} {_money(obs.comparison_price_cents)}{flag}")
+    # An observation belongs to no item until a claim connects it, and pricing
+    # reads the join. Recording one and stopping here leaves it invisible, which
+    # is exactly what it looks like when a band does not move.
+    print(f"  not yet evidence for any item. Attach it:\n"
+          f"    resell price claim SKU {obs.comp_id} --comparability RUNG "
+          f"--cite-item EV --cite-comp title --identity-resolution RESOLUTION")
     return 0
 
 
@@ -193,9 +205,44 @@ def cmd_recommend(args, conn: sqlite3.Connection) -> int:
         print(f"  ladder    {rec.comparability_profile}")
     if rec.qualifiers:
         print(f"  flags     {', '.join(rec.qualifiers)}")
-    for x in rec.sample_exclusions:
-        print(f"  excluded  {x}")
     print(f"  (diagnostic confidence {rec.diagnostic_confidence}, not a gate)")
+
+    # How each kind of evidence was allowed to count. The lines that contributed
+    # nothing are the point: evidence present and unused looks identical to
+    # evidence absent, in a band.
+    if rec.contributions:
+        print("\n  how the evidence counted")
+        for line in rec.contributions:
+            span = ""
+            if line.low_cents is not None:
+                span = (f"  {_money(line.low_cents)}-{_money(line.high_cents)}"
+                        if line.low_cents != line.high_cents
+                        else f"  {_money(line.low_cents)}")
+            mark = "*" if line.contributed else " "
+            print(f"  {mark} {line.source:<26} n={line.n:<3} {line.role}{span}")
+            # The middle of the pool and where it came from. A line reading
+            # "n=12, $50-$95" says less than it knows, and twelve observations
+            # summarised by a search engine are not twelve pages we read.
+            facts = []
+            if line.median_cents is not None and line.n > 1:
+                facts.append(f"median {_money(line.median_cents)}")
+            if line.origins:
+                facts.append("source: " + ", ".join(line.origins))
+            if facts:
+                print(f"      {' · '.join(facts)}")
+            for wrapped in _wrap(line.detail, 84):
+                print(f"      {wrapped}")
+
+    unclaimed = sp.unclaimed_observations(conn)
+    if unclaimed:
+        print(f"\n  {len(unclaimed)} comp observation(s) are recorded but attached to "
+              f"no item, so nothing above counts them:")
+        for row in unclaimed:
+            print(f"    {row['comp_id']}  {_money(row['price_cents'])}  "
+                  f"{(row['title'] or '')[:46]}")
+        print(f"    resell price claim {args.sku} COMP_ID --comparability RUNG "
+              f"--cite-item EV --cite-comp title \\\n"
+              f"      --identity-resolution {args.identity_resolution}")
 
     ss, sched, costs = _strategies(args, conn, rec)
     if ss is None:
@@ -208,6 +255,10 @@ def cmd_recommend(args, conn: sqlite3.Connection) -> int:
               f"{_money(s.net_proceeds_cents):>7}   {s.anchor.describe()}"
               + ("  [floor]" if s.floor_bound else ""))
         print(f"    {s.tradeoff}")
+    if rec.demand is not None and rec.demand.n_asks:
+        print(f"\n  demand:        {rec.demand.describe()}")
+        print("                 modelled apart from price; it informs which strategy "
+              "to pick, and moves no number")
     if ss.sold_evidence_note:
         print(f"\n  sold evidence: {ss.sold_evidence_note}")
     if ss.uncertainty_note:
@@ -240,9 +291,9 @@ def cmd_propose(args, conn: sqlite3.Connection) -> int:
             print(lang_why, file=sys.stderr)
             return 2
 
-    sched = sp.active_fee_schedule(
+    sched, sched_version = sp.recorded_schedule(
         conn, marketplace=args.marketplace, category_id=args.category_id
-    ) or PROVISIONAL_DEFAULT
+    )
     costs = CostLines(seller_paid_shipping_cents=args.shipping_cost_cents)
     proceeds = net_from_gross(price, schedule=sched, costs=costs)
     floor_ok, floor_why = meets_publication_floor(
@@ -274,7 +325,7 @@ def cmd_propose(args, conn: sqlite3.Connection) -> int:
         band_central_cents=rec.band_central_cents,
         band_high_cents=rec.band_high_cents,
         qualifiers=rec.qualifiers,
-        fee_schedule_version=sched.version,
+        fee_schedule_version=sched_version,
         fee_basis=sched.basis,
         net_proceeds_cents=proceeds.net_cents,
         floor_ok=floor_ok,
@@ -440,6 +491,134 @@ def cmd_history(args, conn: sqlite3.Connection) -> int:
         ref = f"  {e['marketplace_ref']}" if e["marketplace_ref"] else ""
         print(f"{e['occurred_at'][:19]}  {e['event_type']:<11} "
               f"{_money(e['price_cents']):>9}  {e['reason'] or ''}{ref}")
+    return 0
+
+
+def cmd_research(args, conn: sqlite3.Connection) -> int:
+    """Search for comps, record what was found, and stop short of a number.
+
+    Deliberately produces no price and no recommendation. `price recommend` reads
+    what this records; `price propose` is what commits to a figure.
+    """
+    from resell.config import load_config
+    from resell.domain import FeeModel
+    from resell.gateway import Gateway
+    from resell.reasoning.adapters import get_adapter
+    from resell.reasoning.adapters.marketplace import get_marketplace_adapter
+    from resell.reasoning.budget import BudgetExceeded, LookupBudget, StageBudget
+    from resell.reasoning.comp_loop import CompLoopError, run_comp_round
+
+    config = load_config(require_credentials=False)
+    gateway = Gateway(
+        conn, marketplace=config.marketplace_id, environment=config.env.name,
+        fees=FeeModel(),
+    )
+    stage_budget = StageBudget.from_env("comp_research")
+    lookup_budget = LookupBudget.from_env("pricing")
+    performed = conn.execute(
+        "SELECT COUNT(*) FROM research_lookup WHERE sku = ? AND scope = 'pricing'",
+        (args.sku,),
+    ).fetchone()[0]
+
+    print(f"\n{args.sku}: comp research{'  [DRY RUN]' if args.dry_run else ''}")
+    print(f"  budget: {performed}/{lookup_budget.max_lookups} pricing lookups")
+    print("  retrieval is operator-directed: you supply the results page, it is "
+          "fetched and read.\n  eBay is not fetched; use `price comp-add` to record "
+          "an eBay listing by hand.")
+
+    try:
+        outcome = run_comp_round(
+            conn, gateway, args.sku,
+            model_adapter=get_adapter(args.provider),
+            research_adapter=get_marketplace_adapter(args.research_provider),
+            stage_budget=stage_budget, lookup_budget=lookup_budget,
+            dry_run=args.dry_run,
+        )
+    except BudgetExceeded as exc:
+        print(f"\nREFUSED before calling the model: {exc}", file=sys.stderr)
+        return 1
+    except CompLoopError as exc:
+        print(f"\ncomp research failed: {exc}", file=sys.stderr)
+        return 1
+
+    plan = outcome.plan
+    if plan is not None and getattr(plan, "lookups", None):
+        print(f"\n  plan: {len(plan.lookups)} search(es)")
+        for lookup in plan.lookups:
+            print(f"    [{lookup.seeking}] {lookup.query}")
+            print(f"        cites {list(lookup.evidence_ids)} — {lookup.motivation[:70]}")
+    for note in outcome.notes:
+        print(f"  NOTE {note[:120]}")
+    if outcome.deferred:
+        print(f"\n  DEFERRED {len(outcome.deferred)}: {outcome.deferral_reason[:70]}")
+
+    if outcome.stopped == "plan_unusable":
+        print(f"\n  FAILED [{outcome.stopped}] {outcome.stop_reason}", file=sys.stderr)
+        return 1
+    if outcome.stopped:
+        print(f"\n  STOPPED [{outcome.stopped}] {outcome.stop_reason[:160]}")
+        return 0
+    if args.dry_run:
+        print(f"\n  WOULD run {len(outcome.performed)} search(es). Nothing fetched, "
+              f"nothing recorded.")
+        return 0
+
+    print(f"\n  {outcome.comps_recorded} comp(s) recorded from "
+          f"{len(outcome.performed)} search(es)")
+    if outcome.kinds:
+        print("    by kind:   " + ", ".join(
+            f"{kind} {count}" for kind, count in sorted(outcome.kinds.items())))
+    if outcome.ladder:
+        print("    by rung:   " + ", ".join(
+            f"{rung} {count}" for rung, count in sorted(outcome.ladder.items())))
+    print(f"    claims:    {outcome.claims_recorded}")
+
+    # The downgrades are the headline, not a footnote: each one is a listing the
+    # extractor called a sale that the page did not support.
+    for entry in outcome.downgraded:
+        print(f"    DOWNGRADED to asking — {entry[:100]}")
+    for entry in outcome.refused:
+        print(f"    REFUSED {entry[:110]}")
+
+    if outcome.comps_recorded:
+        print(f"\n  Nothing here is a price. To see what the evidence supports:\n"
+              f"    resell price recommend {args.sku} --condition-band BAND "
+              f"--identity-resolution RESOLUTION")
+    return 0
+
+
+def cmd_source_policy_set(args, conn: sqlite3.Connection) -> int:
+    """Record what a data source's licence permits. Required before eBay is called.
+
+    `derived_only` is the setting the eBay APIs need: code may compute statistics
+    from the rows and the model may see the statistics, but the rows never enter a
+    prompt. Because the estimate is arithmetic, that costs nothing but the model's
+    view of the raw listings.
+    """
+    try:
+        sp.set_source_policy(
+            conn, source=args.source, model_visibility=args.model_visibility,
+            policy_version=args.policy_version, licence_ref=args.licence_ref,
+            note=args.note or "",
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"{args.source}: {args.model_visibility} [{args.policy_version}]")
+    return 0
+
+
+def cmd_source_policy_list(args, conn: sqlite3.Connection) -> int:
+    rows = sp.list_source_policies(conn)
+    if not rows:
+        print("no source policies recorded; every source defaults to derived_only")
+        return 0
+    print(f"\n{'source':<32} {'visibility':<14} {'version':<14} licence")
+    for row in rows:
+        print(f"{row['source']:<32} {row['model_visibility']:<14} "
+              f"{row['policy_version']:<14} {row['licence_ref'] or ''}")
+        if row["note"]:
+            print(f"    {row['note']}")
     return 0
 
 
@@ -652,11 +831,39 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("sku")
     c.set_defaults(fn=cmd_history)
 
+    c = sub.add_parser(
+        "research", help="search for comps and record them; recommends no price"
+    )
+    c.add_argument("sku")
+    c.add_argument("--provider", default=None, help="reasoning model provider")
+    c.add_argument("--research-provider", default=None,
+                   help="retrieval provider (default: fetch)")
+    c.add_argument("--dry-run", action="store_true",
+                   help="plan only; fetch nothing and record nothing")
+    c.set_defaults(fn=cmd_research)
+
     c = sub.add_parser("show", help="current price state and publish readiness")
     c.add_argument("sku")
     c.add_argument("--listing-approved", action="store_true")
     c.add_argument("--production", action="store_true")
     c.set_defaults(fn=cmd_show)
+
+    sp_parser = sub.add_parser(
+        "source-policy", help="what each data source's licence permits"
+    )
+    sp_sub = sp_parser.add_subparsers(dest="source_policy_command", required=True)
+    f = sp_sub.add_parser("set", help="record a decision about one source")
+    f.add_argument("--source", required=True,
+                   help="e.g. ebay_browse, ebay_marketplace_insights, poshmark.com")
+    f.add_argument("--model-visibility", required=True,
+                   choices=("full", "derived_only", "none"),
+                   help="derived_only: statistics may reach a prompt, rows may not")
+    f.add_argument("--policy-version", required=True, help="e.g. the licence date")
+    f.add_argument("--licence-ref", help="which agreement this decision rests on")
+    f.add_argument("--note")
+    f.set_defaults(fn=cmd_source_policy_set)
+    f = sp_sub.add_parser("list", help="every recorded decision")
+    f.set_defaults(fn=cmd_source_policy_list)
 
     fs = sub.add_parser("fee-schedule", help="marketplace fee rates and their basis")
     fs_sub = fs.add_subparsers(dest="fee_command", required=True)

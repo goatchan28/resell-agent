@@ -12,6 +12,7 @@ the same validation an operator's input would.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -146,6 +147,51 @@ class ObservationProposal:
 # Fields that mark a dict as one entry rather than a container of entries.
 _ENTRY_MARKERS = frozenset({"claim", "basis", "scheme", "raw_transcription"})
 
+# The second shape of the same fault. Where the planner split a JSON document at
+# its first key, drafting split an *XML-formatted* tool call at its second: `title`
+# arrived correctly and `description` swallowed the entire remainder --
+#
+#     ...ready for your next set.</parameter>
+#     <parameter name="marketing_copy">Whether you're building...</parameter>
+#     <parameter name="claims">[{...}]
+#
+# Nothing raised. The draft parsed, passed review, and was stored with the markup
+# and the marketing copy inside the description a buyer would read, and with no
+# claims at all -- so every citation silently vanished from an architecture whose
+# entire premise is that claims carry citations. Closing tags come back as either
+# `</parameter>` or `</description>`, so both are accepted.
+_XML_PARAM = re.compile(
+    r"</(?:parameter|[A-Za-z_][\w.\-]*)>\s*<parameter\s+name=\"([^\"]+)\"\s*>",
+    re.DOTALL,
+)
+_XML_TAIL = re.compile(r"</(?:parameter|[A-Za-z_][\w.\-]*)>\s*\Z", re.DOTALL)
+
+
+def _split_xml_parameters(value: str) -> dict[str, str] | None:
+    """Split one over-long string back into the parameters it ran together.
+
+    The head keeps the key it arrived under; each `<parameter name="x">` opens the
+    next. Returns None unless at least one boundary is present, so ordinary prose
+    is never touched.
+    """
+    parts = _XML_PARAM.split(value)
+    if len(parts) < 3:
+        return None
+    recovered = {"": _XML_TAIL.sub("", parts[0]).rstrip()}
+    for name, text in zip(parts[1::2], parts[2::2], strict=False):
+        recovered[name] = _XML_TAIL.sub("", text).rstrip()
+    return recovered
+
+
+def _maybe_json(text: str) -> object:
+    """A recovered array or object is structure; anything else is prose."""
+    if text[:1] in "[{":
+        try:
+            return json.loads(text)
+        except ValueError:
+            return text
+    return text
+
 
 def _looks_like_entry(value: dict) -> bool:
     return bool(_ENTRY_MARKERS & set(value))
@@ -191,6 +237,25 @@ def unwrap_tool_input(payload: object, expected: set[str], malformed: list[str])
             return None
     if not isinstance(payload, dict):
         return payload
+
+    # Before the structural check below, because this fault leaves the expected keys
+    # looking perfectly usable -- `title` a string, `description` a string -- while
+    # one of them holds three parameters' worth of text.
+    for key, value in payload.items():
+        if not isinstance(value, str) or "<parameter name=" not in value:
+            continue
+        recovered = _split_xml_parameters(value)
+        if not recovered:
+            continue
+        merged = dict(payload)
+        merged[key] = recovered.pop("")
+        for name, text in recovered.items():
+            merged[name] = _maybe_json(text)
+        malformed.append(
+            f"the arguments arrived as XML run together inside {key!r}; split them "
+            f"back out ({', '.join(sorted(recovered))}) rather than publishing markup"
+        )
+        return merged
 
     # Nothing to do when any expected key already holds a usable structure.
     if any(not isinstance(payload.get(key), (str, type(None))) for key in expected):
@@ -785,6 +850,17 @@ class ResearchPlan:
     # whose author decided no research was warranted -- and the caller recorded the
     # second as a negative finding when it was really the first.
     assessment_read: bool = False
+    # Lookups the planner proposed and this parser refused. Distinct from
+    # proposing none: MP-000013's planner proposed two well-motivated searches,
+    # both were dropped for omitting `evidence_ids`, and the empty list that left
+    # behind was reported as "the evidence is already sufficient". The item
+    # recorded a deliberate decision not to search that nobody had made.
+    dropped_lookups: int = 0
+
+    @property
+    def proposed_but_unusable(self) -> bool:
+        """The planner wanted to search and nothing it asked for survived."""
+        return self.dropped_lookups > 0 and not self.lookups
 
     @property
     def usable(self) -> bool:
@@ -861,6 +937,7 @@ def parse_plan_tool_input(
             )
         ids = [i for i in ids if i in valid_evidence_ids]
         if not ids:
+            plan.dropped_lookups += 1
             plan.malformed.append(
                 f"lookup {index} ({query!r}): no observation motivates this search; "
                 f"a lookup with nothing behind it is browsing, not planning"
@@ -1321,3 +1398,576 @@ def parse_extract_tool_input(payload: object, *, page_text: str) -> ExtractedFac
 
     extracted.facts = tuple(kept)
     return extracted
+
+
+# --- comp research -----------------------------------------------------------
+
+COMP_PLAN_TOOL_NAME = "plan_comp_research"
+
+COMP_PLAN_TOOL_SCHEMA: dict[str, Any] = {
+    "name": COMP_PLAN_TOOL_NAME,
+    "description": "Decide which marketplace searches would establish what this sells for.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "assessment": {
+                "type": "object",
+                "properties": {
+                    "sufficient": {
+                        "type": "boolean",
+                        "description": (
+                            "True when the comps already recorded are enough. An "
+                            "empty plan with a reason is a good answer."
+                        ),
+                    },
+                    "rationale": {"type": "string"},
+                },
+                "required": ["sufficient", "rationale"],
+            },
+            "lookups": {
+                "type": "array",
+                "description": "Searches, most valuable first; the list may be trimmed.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "seeking": {
+                            "type": "string",
+                            "enum": ["sold", "asking"],
+                            "description": (
+                                "Which kind of price this search is meant to find. "
+                                "Realised sales are worth more than open offers."
+                            ),
+                        },
+                        "motivation": {"type": "string"},
+                        "evidence_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": (
+                                "Observations of the item that justify this search. "
+                                "Required: a query with nothing behind it is browsing."
+                            ),
+                        },
+                    },
+                    "required": ["query", "seeking", "motivation", "evidence_ids"],
+                },
+            },
+        },
+        "required": ["assessment", "lookups"],
+    },
+}
+
+
+COMP_EXTRACT_TOOL_NAME = "extract_comps"
+
+COMP_EXTRACT_TOOL_SCHEMA: dict[str, Any] = {
+    "name": COMP_EXTRACT_TOOL_NAME,
+    "description": "List the marketplace listings a page shows, quoting each one.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "listings": {
+                "type": "array",
+                "description": (
+                    "One entry per listing on the page. Empty when the page shows "
+                    "none, which is a correct answer."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "price_cents": {
+                            "type": "integer",
+                            "description": "The listing price in cents, excluding postage.",
+                        },
+                        "price_state": {
+                            "type": "string",
+                            "enum": ["sold", "asking"],
+                            "description": (
+                                "sold only where the page says the item sold. If it "
+                                "is an open offer, say asking."
+                            ),
+                        },
+                        "shipping_cents": {
+                            "type": "integer",
+                            "description": (
+                                "Postage in cents. Omit entirely when the page does "
+                                "not state it; omission is not zero."
+                            ),
+                        },
+                        "condition_text": {
+                            "type": "string",
+                            "description": "The seller's own condition wording, verbatim.",
+                        },
+                        "sale_date": {
+                            "type": "string",
+                            "description": "ISO date the sale completed, where shown.",
+                        },
+                        "external_id": {
+                            "type": "string",
+                            "description": "The listing's id on the marketplace, where shown.",
+                        },
+                        "url": {"type": "string"},
+                        "excerpt": {
+                            "type": "string",
+                            "description": (
+                                "The page text this listing's price came from, quoted "
+                                "verbatim. Must contain the price."
+                            ),
+                        },
+                    },
+                    "required": ["title", "price_cents", "price_state", "excerpt"],
+                },
+            }
+        },
+        "required": ["listings"],
+    },
+}
+
+
+COMP_JUDGE_TOOL_NAME = "judge_comps"
+
+COMP_JUDGE_TOOL_SCHEMA: dict[str, Any] = {
+    "name": COMP_JUDGE_TOOL_NAME,
+    "description": "Judge how comparable each retrieved listing is to this item.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "judgements": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "comp_id": {"type": "string"},
+                        "comparability": {
+                            "type": "string",
+                            "enum": ["same_product", "same_family_variant",
+                                     "category_attribute", "superficial", "excluded"],
+                            "description": (
+                                "same_product: the identical product. "
+                                "same_family_variant: same line, different variant. "
+                                "category_attribute: same kind of thing. "
+                                "superficial: merely resembles it. "
+                                "excluded: must not count, and say why."
+                            ),
+                        },
+                        "item_evidence_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": (
+                                "Observations of your item this was matched on. "
+                                "Required."
+                            ),
+                        },
+                        "comp_fields": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Fields of the listing matched against, e.g. title, "
+                                "condition_text. Required."
+                            ),
+                        },
+                        "rationale": {"type": "string"},
+                        "excluded_reason": {
+                            "type": "string",
+                            "description": "Required when comparability is excluded.",
+                        },
+                    },
+                    "required": ["comp_id", "comparability", "item_evidence_ids",
+                                 "comp_fields", "rationale"],
+                },
+            }
+        },
+        "required": ["judgements"],
+    },
+}
+
+
+@dataclass
+class CompLookup:
+    query: str
+    seeking: str
+    motivation: str
+    evidence_ids: tuple[int, ...]
+
+
+@dataclass
+class CompPlan:
+    sufficient: bool = False
+    rationale: str = ""
+    lookups: list[CompLookup] = field(default_factory=list)
+    malformed: list[str] = field(default_factory=list)
+    assessment_read: bool = False
+    # Lookups the planner proposed and this parser refused. Distinct from
+    # proposing none: MP-000013's planner proposed two well-motivated searches,
+    # both were dropped for omitting `evidence_ids`, and the empty list that left
+    # behind was reported as "the evidence is already sufficient". The item
+    # recorded a deliberate decision not to search that nobody had made.
+    dropped_lookups: int = 0
+
+    @property
+    def proposed_but_unusable(self) -> bool:
+        """The planner wanted to search and nothing it asked for survived."""
+        return self.dropped_lookups > 0 and not self.lookups
+
+    @property
+    def usable(self) -> bool:
+        return self.assessment_read or bool(self.lookups)
+
+
+def parse_comp_plan_tool_input(
+    payload: object, *, valid_evidence_ids: set[int], already_searched: set[str] | None = None
+) -> CompPlan:
+    """Validate a comp search plan. Never raises.
+
+    Same two rules as identity planning: a query cites the observations that
+    motivate it, and a query already run for this item is dropped.
+    """
+    already_searched = {q.casefold() for q in (already_searched or set())}
+    plan = CompPlan()
+
+    payload = unwrap_tool_input(payload, {"assessment", "lookups"}, plan.malformed)
+    if payload is None:
+        return plan
+    if not isinstance(payload, dict):
+        plan.malformed.append(f"tool input was {type(payload).__name__}, expected an object")
+        return plan
+
+    assessment = payload.get("assessment")
+    if isinstance(assessment, str):
+        try:
+            assessment = json.loads(assessment)
+        except ValueError:
+            pass
+    if isinstance(assessment, dict):
+        plan.assessment_read = True
+        plan.sufficient = bool(assessment.get("sufficient"))
+        plan.rationale = str(assessment.get("rationale", ""))
+    else:
+        plan.malformed.append("assessment missing; cannot tell whether searching is warranted")
+
+    for index, raw in enumerate(_as_list(payload.get("lookups"), "lookups", plan.malformed)):
+        if not isinstance(raw, dict):
+            plan.malformed.append(f"lookup {index}: expected an object")
+            continue
+        query = str(raw.get("query", "")).strip()
+        if not query:
+            plan.malformed.append(f"lookup {index}: empty query")
+            continue
+        if query.casefold() in already_searched:
+            plan.malformed.append(
+                f"lookup {index}: {query!r} was already performed for this item; skipped"
+            )
+            continue
+        ids = []
+        for item in raw.get("evidence_ids") if isinstance(raw.get("evidence_ids"), list) else []:
+            try:
+                ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        unknown = [i for i in ids if i not in valid_evidence_ids]
+        if unknown:
+            plan.malformed.append(f"lookup {index}: cites unknown evidence {unknown}")
+        ids = [i for i in ids if i in valid_evidence_ids]
+        if not ids:
+            plan.malformed.append(
+                f"lookup {index}: {query!r} cites no observation of the item; that is "
+                f"browsing, not research"
+            )
+            continue
+        seeking = str(raw.get("seeking", "asking")).strip().lower()
+        if seeking not in ("sold", "asking"):
+            seeking = "asking"
+        plan.lookups.append(
+            CompLookup(query=query, seeking=seeking,
+                       motivation=str(raw.get("motivation", "")), evidence_ids=tuple(ids))
+        )
+    return plan
+
+
+@dataclass
+class ExtractedComp:
+    title: str
+    price_cents: int
+    price_state: str
+    excerpt: str
+    shipping_cents: int | None = None
+    condition_text: str = ""
+    sale_date: str = ""
+    external_id: str = ""
+    url: str = ""
+
+
+@dataclass
+class ExtractedComps:
+    listings: tuple[ExtractedComp, ...] = ()
+    malformed: list[str] = field(default_factory=list)
+
+
+def parse_comp_extract_tool_input(payload: object, *, page_text: str) -> ExtractedComps:
+    """Validate extracted listings. Never raises.
+
+    Every listing must quote the page, and the quotation must contain the price.
+    The text-only check that suffices for an identity fact is not enough here: the
+    fact *is* a number, so a real quotation beside an invented figure would pass it
+    and go straight into a distribution.
+    """
+    from resell.reasoning.comp_reading import price_supported_by
+
+    out = ExtractedComps()
+    payload = unwrap_tool_input(payload, {"listings"}, out.malformed)
+    if payload is None:
+        return out
+    if not isinstance(payload, dict):
+        out.malformed.append(f"tool input was {type(payload).__name__}, expected an object")
+        return out
+
+    haystack = " ".join(page_text.split()).casefold()
+    kept: list[ExtractedComp] = []
+    for index, raw in enumerate(_as_list(payload.get("listings"), "listings", out.malformed)):
+        if not isinstance(raw, dict):
+            out.malformed.append(f"listing {index}: expected an object")
+            continue
+        title = str(raw.get("title", "")).strip()
+        excerpt = str(raw.get("excerpt", "")).strip()
+        try:
+            price_cents = int(raw.get("price_cents"))
+        except (TypeError, ValueError):
+            out.malformed.append(f"listing {index}: {title[:40]!r} has no usable price")
+            continue
+        if price_cents < 0:
+            out.malformed.append(f"listing {index}: negative price")
+            continue
+        if not excerpt:
+            out.malformed.append(
+                f"listing {index}: {title[:40]!r} quotes nothing from the page"
+            )
+            continue
+        if " ".join(excerpt.split()).casefold() not in haystack:
+            out.malformed.append(
+                f"listing {index}: the excerpt for {title[:40]!r} is not in the "
+                f"fetched page"
+            )
+            continue
+        if not price_supported_by(price_cents, excerpt):
+            out.malformed.append(
+                f"listing {index}: the quoted text for {title[:40]!r} does not contain "
+                f"{price_cents / 100:.2f}; the price is not supported by what was read"
+            )
+            continue
+
+        shipping = raw.get("shipping_cents")
+        try:
+            shipping_cents = None if shipping is None else int(shipping)
+        except (TypeError, ValueError):
+            shipping_cents = None
+        if shipping_cents is not None and shipping_cents < 0:
+            shipping_cents = None
+
+        kept.append(ExtractedComp(
+            title=title or "(untitled listing)",
+            price_cents=price_cents,
+            price_state=str(raw.get("price_state", "asking")).strip().lower(),
+            excerpt=excerpt,
+            shipping_cents=shipping_cents,
+            condition_text=str(raw.get("condition_text", "")).strip(),
+            sale_date=str(raw.get("sale_date", "")).strip(),
+            external_id=str(raw.get("external_id", "")).strip(),
+            url=str(raw.get("url", "")).strip(),
+        ))
+    out.listings = tuple(kept)
+    return out
+
+
+@dataclass
+class CompJudgement:
+    comp_id: str
+    comparability: str
+    item_evidence_ids: tuple[int, ...]
+    comp_fields: tuple[str, ...]
+    rationale: str
+    excluded_reason: str | None = None
+
+
+@dataclass
+class CompJudgements:
+    judgements: tuple[CompJudgement, ...] = ()
+    malformed: list[str] = field(default_factory=list)
+
+
+def parse_comp_judge_tool_input(
+    payload: object, *, valid_item_evidence: set[int], valid_comp_ids: set[str]
+) -> CompJudgements:
+    """Validate comparability judgements. Never raises.
+
+    Citations on both sides are required here as they are in `validate_claim`, and
+    for the same reason: a judgement citing only the listing is a description of a
+    web page. The ladder ceiling is *not* checked here -- `record_comp_claim`
+    enforces it against the item's identity resolution, which is a stored fact
+    rather than anything this parser can see.
+    """
+    out = CompJudgements()
+    payload = unwrap_tool_input(payload, {"judgements"}, out.malformed)
+    if payload is None:
+        return out
+    if not isinstance(payload, dict):
+        out.malformed.append(f"tool input was {type(payload).__name__}, expected an object")
+        return out
+
+    valid_ladder = {"same_product", "same_family_variant", "category_attribute",
+                    "superficial", "excluded"}
+    kept: list[CompJudgement] = []
+    for index, raw in enumerate(
+        _as_list(payload.get("judgements"), "judgements", out.malformed)
+    ):
+        if not isinstance(raw, dict):
+            out.malformed.append(f"judgement {index}: expected an object")
+            continue
+        comp_id = str(raw.get("comp_id", "")).strip()
+        if comp_id not in valid_comp_ids:
+            out.malformed.append(
+                f"judgement {index}: {comp_id!r} is not a comp retrieved for this item"
+            )
+            continue
+        rung = str(raw.get("comparability", "")).strip().lower()
+        if rung not in valid_ladder:
+            out.malformed.append(f"judgement {index}: unknown comparability {rung!r}")
+            continue
+
+        ids = []
+        for item in (raw.get("item_evidence_ids") or []):
+            try:
+                ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        unknown = [i for i in ids if i not in valid_item_evidence]
+        if unknown:
+            out.malformed.append(f"judgement {index}: cites unknown item evidence {unknown}")
+        ids = [i for i in ids if i in valid_item_evidence]
+        fields = tuple(
+            str(f).strip() for f in (raw.get("comp_fields") or []) if str(f).strip()
+        )
+        excluded_reason = str(raw.get("excluded_reason", "")).strip() or None
+
+        if rung == "excluded":
+            if not excluded_reason:
+                out.malformed.append(
+                    f"judgement {index}: an excluded comp must record why"
+                )
+                continue
+        else:
+            if not ids:
+                out.malformed.append(
+                    f"judgement {index}: cites no observation of the item, so it is a "
+                    f"description of a listing rather than a comparison"
+                )
+                continue
+            if not fields:
+                out.malformed.append(
+                    f"judgement {index}: names no field of the listing it matched against"
+                )
+                continue
+
+        kept.append(CompJudgement(
+            comp_id=comp_id, comparability=rung, item_evidence_ids=tuple(ids),
+            comp_fields=fields, rationale=str(raw.get("rationale", "")),
+            excluded_reason=excluded_reason,
+        ))
+    out.judgements = tuple(kept)
+    return out
+
+
+# --- condition -----------------------------------------------------------------
+
+CONDITION_TOOL_NAME = "choose_condition"
+
+CONDITION_TOOL_SCHEMA: dict[str, Any] = {
+    "name": CONDITION_TOOL_NAME,
+    "description": "Choose the marketplace condition grade that describes this item.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "condition": {
+                "type": "string",
+                "description": "Exactly one of the grades you were given.",
+            },
+            "evidence_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Observations supporting the grade. Required.",
+            },
+            "rationale": {"type": "string"},
+            "uncertain_because": {
+                "type": "string",
+                "description": (
+                    "What the photographs did not settle, where anything. Empty when "
+                    "the grade is clear."
+                ),
+            },
+        },
+        "required": ["condition", "evidence_ids", "rationale"],
+    },
+}
+
+
+@dataclass
+class ConditionChoice:
+    condition: str = ""
+    evidence_ids: tuple[int, ...] = ()
+    rationale: str = ""
+    uncertain_because: str = ""
+    malformed: list[str] = field(default_factory=list)
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.condition)
+
+
+def parse_condition_tool_input(
+    payload: object, *, allowed: set[str], valid_evidence_ids: set[int]
+) -> ConditionChoice:
+    """Validate a condition choice. Never raises.
+
+    The allowed set is eBay's, for this category, and is enforced here rather than
+    discovered at publish. A grade outside it is dropped entirely: recording it
+    would put a value in the identification that the marketplace refuses, which is
+    exactly the stall this stage exists to prevent.
+    """
+    choice = ConditionChoice()
+    payload = unwrap_tool_input(
+        payload, {"condition", "evidence_ids"}, choice.malformed
+    )
+    if payload is None or not isinstance(payload, dict):
+        choice.malformed.append("tool input was not an object")
+        return choice
+
+    condition = str(payload.get("condition", "")).strip()
+    if condition not in allowed:
+        choice.malformed.append(
+            f"{condition!r} is not one of the grades this category accepts "
+            f"({', '.join(sorted(allowed))}); nothing recorded"
+        )
+        return choice
+
+    ids = []
+    for item in (payload.get("evidence_ids") or []):
+        try:
+            ids.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    unknown = [i for i in ids if i not in valid_evidence_ids]
+    if unknown:
+        choice.malformed.append(f"cites unknown evidence {unknown}")
+    ids = [i for i in ids if i in valid_evidence_ids]
+    if not ids:
+        choice.malformed.append(
+            "cites no observation; a grade is a claim about the object and carries "
+            "the same burden as any other"
+        )
+        return choice
+
+    choice.condition = condition
+    choice.evidence_ids = tuple(ids)
+    choice.rationale = str(payload.get("rationale", ""))
+    choice.uncertain_because = str(payload.get("uncertain_because", "")).strip()
+    return choice

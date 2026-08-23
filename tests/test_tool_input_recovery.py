@@ -321,3 +321,81 @@ def test_the_recovered_plan_reaches_retrieval(tmp_path):
     assert outcome.stopped is None or outcome.stopped == "searched_not_found"
     assert outcome.plan is not None
     assert len(outcome.plan.lookups) == 2
+
+
+# --- the XML variant: arguments run together inside one string --------------------
+
+
+DRAFT_RUN_TOGETHER = {
+    "title": "Bowflex SelectTech Adjustable Dumbbells, Pair with Cradle Stands",
+    "description": (
+        "Pair of Bowflex adjustable dumbbells with a rotating selector dial."
+        "</parameter>\n"
+        '<parameter name="marketing_copy">Swap an entire rack for one compact pair.'
+        "</parameter>\n"
+        '<parameter name="claims">'
+        '[{"text": "the dial reads 45 at its highest", "evidence_ids": [198]}]'
+    ),
+}
+
+
+def test_run_together_parameters_are_split_back_out():
+    """MP-000009: `title` arrived clean and `description` swallowed the rest."""
+    malformed = []
+    out = unwrap_tool_input(
+        DRAFT_RUN_TOGETHER, {"title", "description", "claims"}, malformed
+    )
+    assert out["description"].endswith("selector dial.")
+    assert out["marketing_copy"] == "Swap an entire rack for one compact pair."
+    assert out["claims"] == [
+        {"text": "the dial reads 45 at its highest", "evidence_ids": [198]}
+    ]
+    assert "split them back out" in malformed[0]
+
+
+def test_the_markup_never_survives_into_the_description():
+    """It reached a stored draft once. A buyer would have read it."""
+    out = unwrap_tool_input(
+        DRAFT_RUN_TOGETHER, {"title", "description", "claims"}, []
+    )
+    assert "<parameter" not in out["description"]
+    assert "</parameter>" not in out["description"]
+
+
+def test_the_citations_survive_rather_than_vanishing():
+    """The worse half of that failure: `claims` was empty, so a draft whose whole
+    premise is that every assertion cites evidence was stored citing nothing, and
+    the review that checks citations had nothing to object to."""
+    from resell.reasoning.tools import parse_draft_tool_input
+
+    draft = parse_draft_tool_input(DRAFT_RUN_TOGETHER, valid_evidence_ids={198})
+    assert [c.evidence_ids for c in draft.claims] == [(198,)]
+
+
+def test_a_closing_tag_named_after_the_key_is_accepted_too():
+    """Observed both ways on consecutive calls: `</parameter>` and `</description>`."""
+    payload = {
+        "title": "A title",
+        "description": (
+            "Body text.</description>\n"
+            '<parameter name="marketing_copy">Copy.'
+        ),
+    }
+    out = unwrap_tool_input(payload, {"title", "description", "claims"}, [])
+    assert out["description"] == "Body text."
+    assert out["marketing_copy"] == "Copy."
+
+
+def test_ordinary_prose_is_left_exactly_as_written():
+    payload = {"title": "A title", "description": "A description mentioning no markup."}
+    assert unwrap_tool_input(payload, {"title", "description"}, []) == payload
+
+
+def test_an_unparseable_recovered_array_is_kept_as_text_not_dropped():
+    """Losing it silently is how the original fault stayed invisible."""
+    payload = {
+        "title": "A title",
+        "description": 'Body.</parameter>\n<parameter name="claims">[{"text": broken',
+    }
+    out = unwrap_tool_input(payload, {"title", "description", "claims"}, [])
+    assert out["claims"].startswith('[{"text"')

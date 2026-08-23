@@ -25,6 +25,7 @@ class RateBasis(StrEnum):
 
     PROVISIONAL_ESTIMATE = "provisional_estimate"  # placeholder; verify before trusting
     CONFIGURED = "configured"                      # operator supplied it
+    PUBLISHED = "published"                        # the provider's own list price
 
 
 class BudgetExceeded(RuntimeError):
@@ -48,6 +49,17 @@ class ModelRates:
 
     @classmethod
     def from_env(cls, provider: str, model: str) -> ModelRates:
+        """Rates for this model: configured, else published, else the placeholder.
+
+        The order matters. An operator who set the environment variables has said
+        something specific and it wins; otherwise a model we have a list price for
+        is charged at that price; and only a model we know nothing about falls back
+        to the placeholder, which is deliberately not cheap.
+
+        Cost is computed and stored per call, so a rate that changes later does not
+        rewrite what an item already cost. That is the reason this can be a plain
+        table rather than a dated one.
+        """
         raw_input = os.environ.get("RESELL_RATE_INPUT_MICROS_PER_1K")
         raw_output = os.environ.get("RESELL_RATE_OUTPUT_MICROS_PER_1K")
         if raw_input and raw_output:
@@ -57,6 +69,9 @@ class ModelRates:
                 basis=RateBasis.CONFIGURED,
                 source=f"environment, for {provider}/{model}",
             )
+        published = PUBLISHED_RATES.get(model)
+        if published is not None:
+            return published
         return cls()
 
     def cost_micros(self, input_tokens: int, output_tokens: int) -> int:
@@ -64,6 +79,39 @@ class ModelRates:
             input_tokens * self.input_micros_per_1k / 1000
             + output_tokens * self.output_micros_per_1k / 1000
         )
+
+
+# Anthropic's published list prices, as micros per 1000 tokens -- so $3.00 per
+# million input tokens is 3000 micros per 1000 tokens.
+#
+# Image tokens are not a separate line. The API counts them into
+# `usage.input_tokens`, which is what the ledger records, so vision cost is
+# already in the input figure rather than being missed or double-counted.
+#
+# Checked 2026-08-22. A stored cost is computed at call time and never revisited,
+# so an out-of-date entry here misprices future calls only -- but it does misprice
+# them silently, which is why the basis travels with every row.
+PUBLISHED_RATES: dict[str, ModelRates] = {
+    "claude-opus-5": ModelRates(
+        input_micros_per_1k=5000, output_micros_per_1k=25000,
+        basis=RateBasis.PUBLISHED,
+        source="Anthropic list price, $5.00/$25.00 per 1M, checked 2026-08-22",
+    ),
+    "claude-sonnet-5": ModelRates(
+        # Introductory pricing, $2.00/$10.00 per 1M, runs to 2026-08-31. Recorded
+        # at the standard rate instead: over-stating a cost is the safe direction
+        # for a budget guard, and the discount ends within days of this being set.
+        input_micros_per_1k=3000, output_micros_per_1k=15000,
+        basis=RateBasis.PUBLISHED,
+        source="Anthropic list price, $3.00/$15.00 per 1M, checked 2026-08-22 "
+               "(intro pricing of $2.00/$10.00 runs to 2026-08-31)",
+    ),
+    "claude-haiku-4-5": ModelRates(
+        input_micros_per_1k=1000, output_micros_per_1k=5000,
+        basis=RateBasis.PUBLISHED,
+        source="Anthropic list price, $1.00/$5.00 per 1M, checked 2026-08-22",
+    ),
+}
 
 
 @dataclass(frozen=True)

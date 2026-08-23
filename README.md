@@ -142,6 +142,265 @@ production are different databases holding different real listings.
 - pricing: the band, its distributions and qualifiers, all three strategies with
   net proceeds, and the price history
 
+## Search backend
+
+Identification research and comp discovery both plan queries. Without a search
+backend they could not run them, and the operator pasted URLs by hand. Enable
+autonomous discovery with:
+
+```bash
+echo 'RESELL_SEARCH_BACKEND=brave' >> .env
+echo 'BRAVE_API_KEY=your_token' >> .env
+```
+
+Brave's **Search** plan, not Answers: this needs a retrieval provider returning
+URLs, not a second model returning prose. $5.00 per 1,000 requests with $5 of
+monthly credit, so a personal volume is close to free. Requests are billed with no
+spending cap, which is why `LookupBudget` is enforced per item and per scope
+(`RESELL_LOOKUP_IDENTITY_MAX`, `RESELL_LOOKUP_PRICING_MAX_COST_MICROS`, and so on).
+Search spend is recorded per lookup and appears in `resell item cost`.
+
+With a backend configured, **both research steps are agent-owned**: the
+orchestrator decides when identification research is warranted and runs it, and
+comp research becomes an agent step that searches, reads and proposes comparables.
+Reviewing those comparables stays with the operator — discovering listings is
+work, deciding which are the same sort of thing is judgement. Without a backend,
+comp research falls back to being operator-owned with the paste box, because
+nothing else can do it.
+
+**Comp research is slow and synchronous.** A round is several searches, a fetch
+and extraction per readable page, and a judging call — minutes, not seconds. The
+UI runs it in the request, so pressing "carry on" on an item at that step holds
+the browser until it finishes. Acceptable for one operator and one item at a time;
+it is the first thing that will need a job queue if this ever runs unattended over
+a batch.
+
+**Both exits from a spent budget are in the UI.** "Let it look again" grants that
+one item another round's allowance as an append-only event — per item, so it cannot
+become a global raise, and no `.env` edit or restart. "Price it and carry on" takes
+your own number: it still becomes a real proposal and approval, because
+`propose_listing` refuses a price with no matching approval and routing around that
+would put an unapproved price on eBay. What it carries instead of evidence is the
+`operator_judgement` qualifier and empty band/basis/comp-set fields, so a price
+nobody computed never looks like one that was.
+
+**Block misleading claims, not normal listing language.** The rule is unchanged --
+a listing may only assert what the evidence supports -- but "assert" is read more
+carefully. Three kinds of text, and only one of them is a factual claim:
+
+- **factual assertions** — "rare", "mint", "authentic", "handmade". Regulated,
+  because a buyer can rely on them. They still need their evidence.
+- **metadata and proper nouns from the record** — a publisher called Vintage
+  Contemporaries, a colour called Mint Green, a material called Genuine Leather.
+  These collide with regulated words and assert nothing; each one used to refuse a
+  listing that said nothing misleading.
+- **subjective marketing copy** — "versatile", "effortless", "perfect for". Never
+  needed evidence and still does not.
+
+A use is excused only where the words around it reproduce a phrase the record
+holds. One bare use anywhere spoils it for the draft, so naming the publisher
+cannot license "a lovely vintage find" two sentences later.
+
+**A refusal costs a phrase, not the listing.** The agent now gets two repair
+attempts, each told exactly what the last was refused for. If both miss, the draft
+is still not stored — nothing re-checks claims at publish, so `store_draft` is the
+only gate there is — but the copy and the complaint are kept and offered back
+through the correction form. Editing the line the reviewer named is the job;
+writing a listing from nothing was never meant to be.
+
+**A regulated word inside a name is not a claim.** `vintage`, `mint`, `rare` and
+the rest are policed because they assert things a buyer can rely on. The same
+letters inside a proper name assert nothing — MP-000018 is a paperback whose
+*publisher* is Vintage Contemporaries, and the guard read the imprint as an age
+claim, refused the draft, refused the repair, and left the operator to write the
+listing by hand.
+
+A use is excused only when the word sits beside a neighbour and that two-word
+phrase is present verbatim in the record. One bare use anywhere spoils the excuse
+for the whole draft, so a name cannot become a looser second route to the
+permission `available_support` exists to grant.
+
+**A missing condition list must not cost the listing copy.** MP-000015 was routed
+to eBay category 12 — whose aspect form loads and whose condition list is empty.
+Grading raised, the run died, and because drafting comes after grading the item
+reached the operator with no title, no description and a request to write them, over
+a missing condition list they never saw.
+
+Two independent faults, both fixed rather than one covering for the other. Category
+choice verifies that a candidate can supply **both** an aspect form and a condition
+list, having previously checked only the first; a category that can answer neither
+is skipped, and one that can answer only the first is used if nothing better exists.
+And grading no longer raises on an empty list — it falls back to eBay's general
+conditions, drawn from `pricing/condition.py` so there is no second table to drift,
+and records that the grade was not category-validated. Nothing unsafe ships:
+`_check_condition` re-validates against the category at publish time, which is where
+that question actually has to be answered.
+
+**Pricing waits when the agent does not know what the thing is.** Identification
+has one operator seam and only one: when `identity_resolution` is anything short of
+`resolved`, `confirm_identity` stops the item before a pricing budget is spent on a
+guess. An item the agent resolved to a catalogue product never stops — asking for a
+rubber stamp on every item is how a seam stops being read. There is no runner for
+that step, so no route can execute it on the operator's behalf.
+
+MP-000013 is why. It went from three photographs to `pricing` in sixty-two seconds
+with `identity_resolution=unattempted`, and the operator who pressed Run afterwards
+reasonably concluded Run had skipped something. It had not: the upload chain had
+already carried it through, because every identification step is the agent's.
+
+**A refused plan is not a sufficient one.** That item's planner proposed two
+well-motivated lookups; both omitted `evidence_ids`, the parser refused both — the
+guard is right, a lookup with nothing behind it is browsing — and the empty list
+left behind was reported as *"the planner proposed no lookups"* and written to the
+item as a deliberate decision that the evidence was already sufficient. Nobody made
+that decision. Identity stayed `unattempted`, which capped the comparability ladder
+for the rest of the item's life. The two facts are now distinct, a rejected plan
+records nothing, and one repair attempt re-asks with the parser's own complaint fed
+back.
+
+**A licence keeps a comp out of a prompt, not out of the workflow.** Unregistered
+sources resolve to `derived_only`, which was meant to mean "statistics only" and in
+practice meant invisible: never judged, so never a candidate, so contributing
+nothing. MP-000013's one genuinely comparable listing — a $399.99 pair of the right
+dumbbells — was found, priced and lost that way, while eBay's replacement weight
+plates reached the judge and were correctly excluded. Withheld comps are now offered
+to the operator at the identity ceiling, marked as unassessed. The rows still never
+enter a prompt.
+
+**Starting a run and watching one are different requests.** `/run` used to do the
+work and answer afterwards, holding a browser request for as long as the stages
+took — measured at **67 seconds** on a real comp round, with an unchanged page and
+no way to tell whether the click had registered. It now starts a thread and
+redirects at once with a run id; the page polls `/runs/<id>` and shows the agent's
+own progress messages. A thread and one table rather than a job queue: this is one
+operator working one item at a time, and the failure modes a queue exists to
+handle are not present.
+
+Where that 67 seconds went, measured rather than guessed:
+
+| phase | seconds | share |
+|---|---|---|
+| fetching pages | 41.2 | 62% |
+| model calls | 25.1 | 38% |
+| everything else | 0.5 | <1% |
+
+**38 of those 67 seconds were one host.** `bestbuy.com` timed out after 20s, then
+was fetched *again* at a different path and failed after 18 more. A host that has
+demonstrated it will not answer is now skipped for the rest of the run, which is
+the only part of that wall clock that was avoidable — the model calls are the work
+and the other fetches were fast.
+
+**Setting an item aside is a stop, not a delete.** `abandoned` was already a state
+every unfinished stage could reach, and the agent already treated it as nobody's
+work. What was missing was reaching it from anywhere except one card, keeping such
+items out of a list of work, and any way back.
+
+Every unfinished card now offers it, behind a collapsed block. Nothing is removed —
+photos, evidence, research, model spend and proposals all stay — which is exactly
+why it has to be reversible. Inventory hides abandoned items and says how many it
+is hiding; `?abandoned=1` shows them with a way back.
+
+`Gateway.restore` reads the target **out of the event log** rather than taking one:
+`_transition` has always recorded both ends of every state change, so the state an
+item was in when it was set aside is a fact the database already held. A caller
+cannot use restore to move an item somewhere it never was. `approved` is the one
+state nothing returns to — abandoning voids live approvals, so an item comes back
+to `proposed`, one re-approval away.
+
+**Marketplace observations are the primary pricing evidence.** What people are
+asking on marketplaces sets the number; manufacturer and retailer prices bound it
+and never join the sample. That ordering holds however thin the marketplace
+evidence is — two asks beat an MSRP, because a list price is not a market.
+
+Unknown condition **reduces weight, it does not remove data**. A search-index ask
+with no condition attached is still an observation of the market, and twelve of
+them describe it better than one labelled comp does. So a condition-matched pool
+too thin to be a distribution (fewer than `THIN_SAMPLE_N`) is *widened* by
+unstated-condition asks rather than speaking over them — a single matched ask at
+$110 used to displace twelve observations saying $50–$95 and collapse the band to
+a point. No price kind is crossed doing it: both pools are marketplace asks,
+differing only in whether anyone said what condition the goods were in, and
+`pooled_unknown_condition` records that the sample is mixed. Three or more matched
+observations are a distribution and stand on their own.
+
+Nothing is dressed up as something it is not. Asking is never reported as
+realized, unknown condition never as condition-matched, and a search engine's
+structured summary never as a page whose bytes were loaded — each contribution
+line carries its count, range, median and origin:
+
+```
+asks, condition unstated:  n = 12  range $50.00-$95.00  median $76.50
+                           source: search index         counted: set the band
+retail context:            n = 1   $149.99              counted: ceiling check
+```
+
+**Condition is eBay's vocabulary.** `pricing/condition.py` resolves a seller's
+wording to an eBay condition id, and the pricing ladder is derived from the id
+rather than from a flat phrase list. That list is what failed on the Canon T6i:
+it had `new with tags`, `brand new` and `new other` but not bare `New`, so the
+commonest condition string on any marketplace landed at `unknown` — no rung, no
+comparison, no price.
+
+Ids are canonical because no name is stable. 1000 is "New with tags" in clothing
+and plain "New" for a camera; 1500 is "New (other)" nearly everywhere and "New
+without tags" in apparel; 3000's Sell API enum is `USED_EXCELLENT` while its label
+in almost every category is "Used". Where a seller's own words are finer than the
+id — "New without tags" against "Open box", both 1500 — the wording keeps the
+better rung.
+
+Which conditions a category actually permits is a **separate question**, asked
+only about our own item: `allowed_in()` against eBay's `getItemConditionPolicies`,
+which `_grade_condition` and the publish check already fetch per category.
+Reading a stranger's comp never asks it — refusing to understand "Open box"
+because our category will not let us list one would be nonsense.
+
+**A budget stop never discards what a round already retrieved.** Observations used
+to be written only after every query finished, so a `BudgetExceeded` from a later
+extraction propagated out and took the earlier ones with it — three rounds against
+a Canon T6i extracted real listings at $465–$1097 and recorded zero comps. The
+round now keeps what it has, stops searching for pages it can no longer read, and
+judges what it collected.
+
+**A spent budget ends the stage.** It is not a failure to retry: `next_step`
+routes an item whose comp allowance is gone to `price_without_comps`, an operator
+decision with three real exits — paste a listing, raise the allowance, or set the
+item aside. Before that, the item deadlocked: no contributing comps meant
+`comp_research`, the runner refused because the budget was gone, nothing changed,
+and the only button was "carry on", which re-entered the same step forever. The
+conclusion is recorded as a `comp_research_concluded` event carrying what was
+collected and whether it was sufficient, so "searched and found nothing" is
+distinguishable from "never tried". Raising the allowance resumes research; the
+marker records history, it is not a ban.
+
+Two budgets bound a run and they are different things: `RESELL_LOOKUP_*` caps
+searches, `RESELL_BUDGET_COMP_RESEARCH_MAX_CALLS` caps the model calls that read
+what the searches returned. Either one stopping is an ordinary outcome reported on
+the card as a stop, not as an error — `advance` keeps them in `halts` rather than
+`errors`, because flashing a working guard in red teaches an operator to ignore
+the red lines that are real.
+
+**eBay is still never fetched.** Their agreement forbids it and the refusal lives
+in `PageFetcher.allowed`, below every adapter. What changed is that eBay prices
+returned *by the search index* are now recorded as comps — because they are the
+best asking evidence available for most items — under three constraints that come
+from inspecting real responses rather than from policy:
+
+- **never realized.** Five live queries returned 69 eBay results and zero sold or
+  completed listings; search engines do not index those pages. `price_kind` is a
+  constant here, not a judgement.
+- **never a condition band.** Every `offers` object Brave returned carried exactly
+  `url`, `priceCurrency` and `price`. Condition words appear only in catalogue
+  boilerplate present whatever is listed, so the band is `unknown` and the source
+  is `unstated`.
+- **never a fetch.** `retrieval_method` is `search_index`, so an index's summary
+  stays distinguishable from a page whose bytes were loaded.
+
+The estimator uses such a pool as an approximate asking market and labels it
+`asking_condition_unstated` rather than `condition_mismatch` — nothing was
+compared, so claiming a mismatch would invent the comparison. Condition-matched
+and realized evidence keep their precedence over it. Retail and manufacturer
+prices remain ceiling context and never join a sample.
+
 **It is a local operator interface, not a service.** It binds 127.0.0.1, has no
 authentication and none is planned. The process holds a read-write handle on the
 item database, and an eBay refresh token lives in the same file.
@@ -606,12 +865,42 @@ may still be the most reliable route available, but it must never be
 indistinguishable from a fetch. `ManualResearchAdapter` says so before you type, the
 record stores `operator_transcribed`, and the matcher sees it.
 
-No eBay adapter exists. Their agreement restricts ingesting Restricted API data into
+eBay is never fetched. Their agreement restricts ingesting Restricted API data into
 a third-party AI without written consent, and their user agreement prohibits
-LLM-driven scraping of the site. A Catalog adapter can be added once that is answered
-in writing; nothing depends on it.
+LLM-driven scraping of the site. `PageFetcher.allowed` refuses eBay hosts below
+every adapter — not overridable by `--respect-robots`, because that flag exists so
+an operator can name a page they chose to read, not to opt out of an agreement.
+
+## eBay as a comp source
+
+`ebay/comps.py` is an adapter onto eBay's own APIs, kept separate from the generic
+research fetcher: official data arrives structured, so no model reads it and there
+is no page to quote.
+
+| API | gives | access |
+|---|---|---|
+| Browse | active listings — asking prices only | sandbox open; production needs Buy API approval via eBay Partner Network |
+| Marketplace Insights | 90 days of realised sales | Limited Release: business approval, category whitelisting, effectively closed |
+
+`findCompletedItems` was the old route to sold comps and was decommissioned with the
+rest of the Finding API in February 2025.
+
+The binding constraint is the licence rather than the access. eBay defines Restricted
+APIs to cover pricing and sales-volume data — which is what a comp is — so those rows
+must not reach a model. `source_policy` records that decision per source and
+`model_visibility` enforces it: `derived_only` means the estimator reads the rows and
+the judging prompt never sees them. Because pricing is arithmetic, that costs nothing
+but the model's view of the raw listings.
+
+Two consequences worth knowing. A source with no recorded policy defaults to
+`derived_only` everywhere except the eBay adapter, which refuses to call at all —
+there, the absence means nobody has read the licence, and defaulting would make that
+decision by omission. And comparability for eBay comps is computed from catalogue
+ePIDs rather than judged by a model reading titles, which is both the compliant route
+and the more rigorous one.
 
 ## Next
 
-Comps and pricing — under the same licence constraint, which may mean eBay data
-informs the floor deterministically without ever entering a prompt.
+An eBay Partner Network application, if automated comps are wanted. Until then
+`price comp-add` records an eBay listing the operator read themselves, and
+`price research` automates everything that is not eBay.

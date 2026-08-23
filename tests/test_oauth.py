@@ -600,12 +600,48 @@ def test_sku_is_sequential_zero_padded_and_sortable():
         parse_sku("2026-08-19-0001")
 
 
-def test_terminal_states_have_no_exits():
-    from resell.domain import TERMINAL_STATES, TRANSITIONS, ItemState
+def test_irreversible_states_have_no_exits():
+    """`listed` is the end. Nothing walks an item back out of a live listing."""
+    from resell.domain import IRREVERSIBLE_STATES, TRANSITIONS, ItemState
 
-    for state in TERMINAL_STATES:
+    for state in IRREVERSIBLE_STATES:
         assert TRANSITIONS[state] == frozenset()
-    assert ItemState.LISTED in TERMINAL_STATES
+    assert ItemState.LISTED in IRREVERSIBLE_STATES
+
+
+def test_abandoned_is_terminal_for_work_but_not_for_good():
+    """The two facts are not in tension: no work happens in `abandoned`, and an
+    operator can still bring the item back. Deleting nothing is the whole point of
+    having the state rather than a DELETE."""
+    from resell.domain import (
+        IRREVERSIBLE_STATES, TERMINAL_STATES, TRANSITIONS, ItemState,
+    )
+
+    assert ItemState.ABANDONED in TERMINAL_STATES
+    assert ItemState.ABANDONED not in IRREVERSIBLE_STATES
+    assert TRANSITIONS[ItemState.ABANDONED]
+
+
+def test_an_abandoned_item_cannot_return_to_approved():
+    """Abandoning voids live approvals, so `approved` -- whose entire meaning is
+    "a live approval covers this" -- is not somewhere history can send it back to."""
+    from resell.domain import TRANSITIONS, ItemState
+
+    assert ItemState.APPROVED not in TRANSITIONS[ItemState.ABANDONED]
+    assert ItemState.LISTED not in TRANSITIONS[ItemState.ABANDONED]
+
+
+def test_every_state_that_can_be_abandoned_can_be_restored():
+    """Otherwise an item could be abandoned into a corner it can never leave."""
+    from resell.domain import TRANSITIONS, ItemState
+
+    can_abandon = {
+        state for state, targets in TRANSITIONS.items()
+        if ItemState.ABANDONED in targets
+    }
+    unreachable = can_abandon - TRANSITIONS[ItemState.ABANDONED]
+    # `approved` is the one deliberate exception; it restores to `proposed`.
+    assert unreachable == {ItemState.APPROVED}
 
 
 def test_every_state_appears_in_the_transition_table():
@@ -6380,3 +6416,125 @@ def test_prompt_prefers_indicators_over_narrative():
 
     assert "describe the indicators rather than asserting the history" in DRAFT_SYSTEM_PROMPT
     assert "prefer the evidence to the narrative" in DRAFT_SYSTEM_PROMPT
+
+
+# --- a figure matches exactly, or it does not match ---------------------------------
+
+
+_DIAL = (
+    "The selector dial is marked with settings including 17.5, 20, 22.5, 25, 30, 35, "
+    "40 and 45. The maximum weight setting visible on the dial is 45."
+)
+
+
+def _dial_review(title):
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    return review_draft(
+        ListingDraft(title=title, description="Adjustable dumbbells."),
+        supported_text=_DIAL, valid_evidence_ids={1}, available_support=frozenset(),
+    )
+
+
+def test_a_figure_cannot_be_supported_by_hiding_inside_a_larger_one():
+    """MP-000009 shipped a title reading "(5-45 lb)". The record contains no 5 --
+    only a 45 maximum and dial markings from 17.5 up. It passed because the
+    substring fallback found "5" inside "17.5", and every one- or two-digit
+    invention can find a host like that somewhere."""
+    review = _dial_review("Bowflex Adjustable Dumbbells, Pair (5-45 lb)")
+    assert not review.ok
+    assert "5-45" in " ".join(review.problems)
+
+
+def test_a_typographic_dash_is_not_a_way_around_it():
+    """The refusal above was already in place for "5-45" when the repair returned
+    "5–45", and it was accepted -- the same claim in nicer punctuation."""
+    review = _dial_review("Bowflex Adjustable Dumbbells, Pair (5–45 lb)")
+    assert not review.ok
+    assert "5-45" in " ".join(review.problems)
+
+
+def test_a_figure_the_record_does_contain_still_passes():
+    """The guard above must not start refusing accurate numbers."""
+    assert _dial_review("Bowflex Adjustable Dumbbells, 45 lb Max").ok
+
+
+def test_a_range_whose_both_ends_are_recorded_still_passes():
+    assert _dial_review("Bowflex Adjustable Dumbbells, 20-45 lb").ok
+
+
+def test_an_em_dash_between_words_does_not_invent_a_compound():
+    """Folding dashes must only touch the ones with no space either side."""
+    from resell.reasoning.listing import _tokens
+
+    assert "lifts-ideal" not in _tokens("heavy compound lifts — ideal for a home gym")
+
+
+# --- a regulated word inside a name is not a claim ---------------------------------
+
+
+_BOOK_RECORD = (
+    "Author Sandra Cisneros Book Title The House on Mango Street "
+    "Publisher Vintage Contemporaries Format Paperback"
+)
+
+
+def _book_review(title, description, support=frozenset({"condition"})):
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    return review_draft(
+        ListingDraft(title=title, description=description),
+        supported_text=_BOOK_RECORD, valid_evidence_ids={1},
+        available_support=support,
+    )
+
+
+def test_a_publisher_called_vintage_is_not_an_age_claim():
+    """MP-000018 died on this. "Vintage Contemporaries" is the imprint, and it sits
+    in the book's own Publisher aspect -- but the guard matched the bare word,
+    refused the draft, refused the repair, and left the operator to write the
+    listing by hand."""
+    review = _book_review(
+        "The House on Mango Street - Sandra Cisneros - Vintage Contemporaries",
+        "Published by Vintage Contemporaries in paperback.",
+    )
+    assert review.ok, review.problems
+    assert any("inside a name the record holds" in w for w in review.warnings)
+
+
+def test_a_bare_age_claim_is_still_refused():
+    """The guard exists because "vintage" asserts an age a buyer can rely on. A
+    name must not become a second, looser route to that permission."""
+    review = _book_review("A vintage paperback", "A lovely vintage copy of it.")
+    assert not review.ok
+    assert any("requires age evidence" in p for p in review.problems)
+
+
+def test_one_bare_use_spoils_the_excuse():
+    """The word appears twice: once inside the imprint, once on its own. The
+    second is still an assertion, and letting the first cover it would be exactly
+    the hole this rule has to avoid."""
+    review = _book_review(
+        "The House on Mango Street - Vintage Contemporaries",
+        "Published by Vintage Contemporaries. A lovely vintage find.",
+    )
+    assert not review.ok
+    assert any("requires age evidence" in p for p in review.problems)
+
+
+def test_the_record_must_actually_hold_the_name():
+    """A two-word phrase the record does not contain is not a name, it is a
+    flourish."""
+    review = _book_review(
+        "A vintage classic", "This vintage edition is lovely.",
+    )
+    assert not review.ok
+
+
+def test_real_age_evidence_still_licenses_the_word():
+    """Nothing about the name rule touches the ordinary path."""
+    review = _book_review(
+        "A vintage paperback", "A vintage copy.",
+        support=frozenset({"condition", "age"}),
+    )
+    assert review.ok, review.problems

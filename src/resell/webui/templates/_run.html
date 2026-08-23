@@ -1,0 +1,65 @@
+{# Live progress for a run in flight.
+
+   Rendered when the page is opened with ?run=<id>. The messages come from the
+   backend's own reporting -- the same calls that timed the work -- so what is on
+   the screen is what the agent is actually doing, not a timed sequence of
+   plausible-sounding stages. #}
+<div class="run" id="run" data-run="{{ run.run_id }}"
+     data-running="{{ 'yes' if run.running else 'no' }}">
+  <p class="run-line">
+    <span class="run-spinner" aria-hidden="true"></span>
+    <span class="run-current">{{ run.current }}</span>
+    <span class="run-elapsed tiny quiet"></span>
+  </p>
+  {% if run.problems %}
+    <ul class="run-problems tiny">
+      {% for problem in run.problems %}<li>{{ problem }}</li>{% endfor %}
+    </ul>
+  {% endif %}
+</div>
+<script>
+(function () {
+  var box = document.getElementById("run");
+  if (!box || box.dataset.running !== "yes") return;
+
+  var current = box.querySelector(".run-current");
+  var elapsed = box.querySelector(".run-elapsed");
+  var problems = box.querySelector(".run-problems");
+  var started = Date.now();
+
+  // A ticking clock even between polls, so a slow step still looks alive. This is
+  // the one number that is not backend truth, and it is honest about what it is:
+  // how long you have been waiting, not how far along the work is.
+  setInterval(function () {
+    elapsed.textContent = "(" + Math.round((Date.now() - started) / 1000) + "s)";
+  }, 500);
+
+  function poll() {
+    fetch("/runs/" + box.dataset.run, {headers: {"Accept": "application/json"}})
+      .then(function (r) { return r.json(); })
+      .then(function (run) {
+        current.textContent = run.current;
+        if (run.problems && run.problems.length) {
+          if (!problems) {
+            problems = document.createElement("ul");
+            problems.className = "run-problems tiny";
+            box.appendChild(problems);
+          }
+          problems.innerHTML = "";
+          run.problems.forEach(function (p) {
+            var li = document.createElement("li");
+            li.textContent = p;
+            problems.appendChild(li);
+          });
+        }
+        if (run.running) { setTimeout(poll, 1000); return; }
+        box.dataset.running = "no";
+        box.classList.add(run.status === "failed" ? "run-failed" : "run-done");
+        // The work changed the item, so the page it is on is now stale.
+        window.location = window.location.pathname;
+      })
+      .catch(function () { setTimeout(poll, 2000); });
+  }
+  setTimeout(poll, 400);
+})();
+</script>

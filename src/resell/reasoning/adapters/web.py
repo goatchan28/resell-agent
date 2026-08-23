@@ -248,3 +248,66 @@ class OperatorUrlResearchAdapter:
             facts=outcome.facts,
             retrieval_method=RetrievalMethod.AUTOMATED_FETCH,
         )
+
+
+class SearchedResearchAdapter(OperatorUrlResearchAdapter):
+    """The same fetch-and-extract, with the URLs found rather than typed.
+
+    This is the whole of autonomous identification research: the planner already
+    decided what to look for and the extraction stage already reads what comes
+    back. The only thing missing was a way to turn a query into pages, and the
+    operator was standing in that gap.
+
+    Forbidden hosts are filtered here as well as in the fetcher, because a general
+    web search returns eBay results constantly and a refusal per result would
+    otherwise be the loudest thing in the log. What is dropped is counted and said
+    once.
+    """
+
+    provider = "search"
+
+    def __init__(self, backend, conn=None, sku: str = "", *, max_urls: int = 3, **kwargs):
+        kwargs.pop("prompt", None)
+        super().__init__(conn=conn, sku=sku, max_urls=max_urls, **kwargs)
+        self.backend = backend
+        self.searches = 0
+
+    def cost_micros_per_lookup(self) -> int:
+        """What the search costs. The fetch is free and extraction is charged
+        where the model call is made, so this is the retrieval price and nothing
+        else -- which is what the lookup budget is bounding."""
+        return self.backend.cost_micros_per_search()
+
+    def search(self, query: ResearchQuery) -> list[RetrievedDocument]:
+        from resell.reasoning.authority import fetch_permitted
+
+        if self.conn is None or not self.sku:
+            raise ResearchError(
+                self.provider, "no database handle or sku; extraction is ledgered"
+            )
+        if self._model_adapter is None:
+            raise ResearchError(self.provider, "no model adapter for fact extraction")
+
+        self._say(f"\n  LOOKUP [{query.source_kind}] {query.query}")
+        hits = self.backend.find(query, limit=self.max_urls * 4)
+        self.searches += 1
+
+        allowed, refused = [], 0
+        for hit in hits:
+            permitted, _ = fetch_permitted(hit.url)
+            if permitted:
+                allowed.append(hit)
+            else:
+                refused += 1
+        if refused:
+            self._say(f"    {refused} result(s) skipped: their host must not be fetched")
+            self.notes.append(f"{refused} result(s) on forbidden hosts for: {query.query}")
+
+        documents: list[RetrievedDocument] = []
+        for hit in allowed[: self.max_urls]:
+            document = self._retrieve(hit.url, query)
+            if document is not None:
+                documents.append(document)
+        if not documents:
+            self._say("    nothing usable retrieved for this lookup")
+        return documents

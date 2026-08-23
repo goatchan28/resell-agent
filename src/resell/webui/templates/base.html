@@ -1,15 +1,15 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}resell{% endblock %} — {{ environment }}</title>
+<title>{% block title %}resell{% endblock %}</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 
 <header>
   <nav>
-    <a href="{{ url_for('items') }}">items</a>
-    <a href="{{ url_for('all_questions') }}">questions</a>
+    <a href="{{ url_for('home') }}">today</a>
+    <a href="{{ url_for('inventory') }}">inventory</a>
   </nav>
-  <span class="env env-{{ environment }}">{{ environment }} / {{ marketplace }}</span>
+  <span class="env env-{{ environment }}">{{ environment }}</span>
 </header>
 
 <main>
@@ -22,6 +22,20 @@
       </ul>
     {% endif %}
   {% endwith %}
-
   {% block content %}{% endblock %}
 </main>
+
+<script>
+/* Any form that starts long work disables its buttons on submit, so a click is
+   visibly registered and cannot be repeated. The server refuses a second run on
+   an item already running -- this is the half that answers "did that do
+   anything?" in the moment rather than after the round trip. */
+document.addEventListener("submit", function (event) {
+  var form = event.target;
+  if (!form.matches("[data-long]")) return;
+  Array.prototype.forEach.call(form.querySelectorAll("button"), function (b) {
+    b.disabled = true;
+    if (b.dataset.busy) { b.textContent = b.dataset.busy; }
+  });
+}, true);
+</script>

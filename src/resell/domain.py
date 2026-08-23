@@ -28,7 +28,13 @@ class ItemState(StrEnum):
 
 # States from which no further transition is legal in V1. `listed` is terminal
 # only because sold/ended and relisting are deliberately out of scope for now.
+# States in which no further work happens. Both are terminal for the agent; only
+# `listed` is terminal for good. `abandoned` is reversible by an explicit operator
+# command, which is why it appears here *and* has outgoing transitions -- these
+# two facts are not in tension, they are the difference between "nothing is
+# happening" and "nothing can ever happen".
 TERMINAL_STATES = frozenset({ItemState.LISTED, ItemState.ABANDONED})
+IRREVERSIBLE_STATES = frozenset({ItemState.LISTED})
 
 # The complete set of legal edges. Anything not listed here is rejected by the
 # gateway before preconditions are even evaluated, so an unknown transition fails
@@ -55,7 +61,26 @@ TRANSITIONS: dict[ItemState, frozenset[ItemState]] = {
         {ItemState.PUBLISHING, ItemState.PRICING, ItemState.ABANDONED}
     ),
     ItemState.LISTED: frozenset(),
-    ItemState.ABANDONED: frozenset(),
+    # Abandoning is a decision to stop, not a decision to destroy: every record --
+    # photos, evidence, research, costs, proposals -- survives it, so there has to
+    # be a way back. `Gateway.restore` picks the target from the event log rather
+    # than letting a caller choose, so this set is what history is allowed to say,
+    # not a set of free jumps.
+    #
+    # `approved` is deliberately absent. Abandoning voids live approvals, so an
+    # item cannot legitimately return to a state whose whole meaning is "a live
+    # approval covers this". It returns to `proposed`, one re-approval away.
+    ItemState.ABANDONED: frozenset({
+        ItemState.INTAKE,
+        ItemState.IDENTIFYING,
+        ItemState.NEEDS_INFO,
+        ItemState.PRICING,
+        ItemState.PROPOSED,
+        # A publish that failed is a state an item genuinely sat in and can move on
+        # from. `publishing` is not here because an item mid-publish cannot be
+        # abandoned in the first place -- there is a call in flight.
+        ItemState.PUBLISH_FAILED,
+    }),
 }
 
 
@@ -377,7 +402,14 @@ class Proposal:
             problems.append("category_id is missing")
         if not self.condition_id:
             problems.append("condition_id is missing")
-        if self.price_cents <= 0:
+        if self.price_cents is None:
+            # Not a crash. The pricing approval owns this number and the caller
+            # has to fetch it, so omitting it is an ordinary caller error and
+            # belongs in the same refusal list as a missing category.
+            problems.append(
+                "price is missing; it comes from the pricing approval, not from here"
+            )
+        elif self.price_cents <= 0:
             problems.append("price must be positive")
         if self.seller_shipping_cost_cents < 0:
             problems.append("seller shipping cost cannot be negative")
@@ -414,7 +446,9 @@ class Proposal:
             if not values or not any(str(v).strip() for v in values):
                 problems.append(f"required aspect {aspect!r} is not populated")
 
-        if self.price_cents > 0:
+        # `is not None` as well as `> 0`: the floor check needs a real number, and
+        # a missing price has already been reported above.
+        if self.price_cents is not None and self.price_cents > 0:
             ok, reason = meets_publication_floor(
                 self.price_cents,
                 seller_shipping_cost_cents=self.seller_shipping_cost_cents,

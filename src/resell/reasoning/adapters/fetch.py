@@ -15,10 +15,13 @@ a parser library to strip tags off a product page is not worth the supply chain.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
+
+from resell import progress
 
 __all__ = [
     "FetchError", "FetchedPage", "PageFetcher", "html_to_text", "USER_AGENT",
@@ -30,7 +33,16 @@ USER_AGENT = (
     "resell-agent/0.1 (personal reselling tool; one operator, one item at a time)"
 )
 
+# Per socket operation: how long a single connect or read may stall.
 DEFAULT_TIMEOUT_SECONDS = 20.0
+# Wall clock for the whole retrieval, redirects and body included. The per-operation
+# timeout does not bound this: a server that trickles one byte every 19 seconds
+# resets the read timer forever, which is exactly how a comp round came to sit on
+# one page indefinitely. A deadline is the only thing that actually ends it.
+DEFAULT_DEADLINE_SECONDS = 45.0
+# robots.txt is fetched before the page and had no timeout of any kind, so the
+# stall happened before the bounded call was ever reached.
+DEFAULT_ROBOTS_TIMEOUT_SECONDS = 10.0
 # Enough for any product page's markup, and small enough that a surprise is cheap.
 DEFAULT_MAX_BYTES = 2_000_000
 TEXTUAL_TYPES = ("text/html", "application/xhtml+xml", "text/plain")
@@ -52,6 +64,10 @@ class FetchedPage:
     @property
     def redirected(self) -> bool:
         return _normalise(self.requested_url) != _normalise(self.final_url)
+
+
+def _host(url: str) -> str:
+    return (urlsplit(url).hostname or url).removeprefix("www.")
 
 
 def _normalise(url: str) -> str:
@@ -143,15 +159,25 @@ class PageFetcher:
         self,
         *,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+        robots_timeout_seconds: float = DEFAULT_ROBOTS_TIMEOUT_SECONDS,
         max_bytes: int = DEFAULT_MAX_BYTES,
         respect_robots: bool = True,
         client=None,
     ):
         self.timeout_seconds = timeout_seconds
+        self.deadline_seconds = deadline_seconds
+        self.robots_timeout_seconds = robots_timeout_seconds
         self.max_bytes = max_bytes
         self.respect_robots = respect_robots
         self._client = client
         self._robots: dict[str, RobotFileParser | None] = {}
+        # Hosts that have already cost us a timeout. A measured run spent 38 of
+        # its 67 seconds on bestbuy.com: twenty seconds to a read timeout, then
+        # eighteen more to a protocol error on a second URL at the same host. The
+        # second one was pure waste -- the host had already demonstrated it would
+        # not answer, and nothing about a different path changes that.
+        self._dead_hosts: dict[str, str] = {}
 
     # --- robots ---------------------------------------------------------------
 
@@ -164,13 +190,47 @@ class PageFetcher:
         parser = RobotFileParser()
         parser.set_url(f"{origin}/robots.txt")
         try:
-            parser.read()
+            # `parser.read()` goes through urllib with no timeout argument and no
+            # way to pass one. That is where a fetch actually hung -- blocked in
+            # http.client's readline on a host that accepted the connection and
+            # never finished the response -- and it happens before the bounded
+            # page GET is reached. Fetching the bytes ourselves is the only way to
+            # put a clock on it.
+            parser.parse(self._robots_text(origin).splitlines())
         except Exception:  # noqa: BLE001 - unreadable is not permission
             parser = None
         self._robots[origin] = parser
         return parser
 
+    def _robots_text(self, origin: str) -> str:
+        import httpx
+
+        progress.report(progress.Phase.FETCHING, f"checking {_host(origin)} robots.txt")
+
+        response = httpx.get(
+            f"{origin}/robots.txt",
+            timeout=httpx.Timeout(self.robots_timeout_seconds),
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+        )
+        if response.status_code >= 400:
+            # A 404 is a real answer: nothing is disallowed. Anything else is not,
+            # and the empty string would read as permission.
+            if response.status_code == 404:
+                return ""
+            raise FetchError(f"HTTP {response.status_code} for robots.txt")
+        return response.text[:DEFAULT_MAX_BYTES]
+
     def allowed(self, url: str) -> tuple[bool, str]:
+        # Licensing first, and it is not subject to `respect_robots`. That flag
+        # exists so an operator can name a page they have decided to read; it is
+        # not a way to opt out of an agreement we are bound by.
+        from resell.reasoning.authority import fetch_permitted
+
+        permitted, why = fetch_permitted(url)
+        if not permitted:
+            return False, why
+
         if not self.respect_robots:
             return True, "robots checking is off for this fetch"
         parser = self._robots_for(url)
@@ -181,6 +241,44 @@ class PageFetcher:
         return False, "robots.txt disallows this path for our user agent"
 
     # --- fetching -------------------------------------------------------------
+
+    def _read_bounded(self, client, url: str, elapsed):
+        """Stream the body, stopping at the byte cap or the deadline.
+
+        `client.get()` reads the whole response before returning, so neither the
+        byte cap nor any wall clock applied to it: `max_bytes` was measured on
+        something already fully downloaded, and the read timeout restarts on every
+        chunk that arrives. Reading chunk by chunk is what makes both real, and it
+        is the only shape in which a stalled transfer can be abandoned.
+        """
+        import httpx
+
+        chunks: list[bytes] = []
+        size = 0
+        with client.stream("GET", url) as response:
+            if response.status_code >= 400 or not self._is_textual(response):
+                response.close()
+                return b"", response
+            for chunk in response.iter_bytes():
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= self.max_bytes:
+                    break
+                if elapsed() > self.deadline_seconds:
+                    raise FetchError(
+                        f"gave up after {elapsed():.1f}s (deadline "
+                        f"{self.deadline_seconds:.0f}s) with {size} bytes read from "
+                        f"{url}: the server accepted the connection and kept the "
+                        f"response open"
+                    )
+        return b"".join(chunks), response
+
+    @staticmethod
+    def _is_textual(response) -> bool:
+        content_type = (response.headers.get("content-type") or "").split(";")[0].strip()
+        return not content_type or any(
+            content_type.startswith(t) for t in TEXTUAL_TYPES
+        )
 
     def fetch(self, url: str) -> FetchedPage:
         import httpx
@@ -195,16 +293,55 @@ class PageFetcher:
         if not permitted:
             raise FetchError(f"not fetched: {why}")
 
+        host = _host(url)
+        if host in self._dead_hosts:
+            progress.report(
+                progress.Phase.FETCHING,
+                f"skipping {host}: it already {self._dead_hosts[host]}",
+            )
+            raise FetchError(
+                f"not fetched: {host} already {self._dead_hosts[host]} in this run"
+            )
+
         client = self._client or httpx.Client(
-            timeout=httpx.Timeout(self.timeout_seconds),
+            # Named rather than positional: one number for everything hides which
+            # phase is slow, and the error should be able to say.
+            timeout=httpx.Timeout(
+                connect=self.timeout_seconds, read=self.timeout_seconds,
+                write=self.timeout_seconds, pool=self.timeout_seconds,
+            ),
             follow_redirects=True,
             headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8"},
         )
         close_after = self._client is None
+        started = time.monotonic()
+        progress.report(progress.Phase.FETCHING, f"reading {_host(url)}")
+
+        def elapsed() -> float:
+            return time.monotonic() - started
+
         try:
-            response = client.get(url)
+            raw, response = self._read_bounded(client, url, elapsed)
+        except FetchError as exc:
+            self._dead_hosts[host] = f"timed out after {elapsed():.0f}s"
+            progress.report(
+                progress.Phase.FETCHING,
+                f"{host} timed out after {elapsed():.0f}s; skipping it for the "
+                f"rest of this run",
+                ok=False,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001 - httpx has many; none should escape
-            raise FetchError(f"{type(exc).__name__}: {exc}") from exc
+            self._dead_hosts[host] = f"failed after {elapsed():.0f}s ({type(exc).__name__})"
+            progress.report(
+                progress.Phase.FETCHING,
+                f"{host} failed after {elapsed():.0f}s "
+                f"({type(exc).__name__}); skipping it for the rest of this run",
+                ok=False,
+            )
+            raise FetchError(
+                f"{type(exc).__name__} after {elapsed():.1f}s on {url}: {exc}"
+            ) from exc
         finally:
             if close_after:
                 client.close()
@@ -218,8 +355,7 @@ class PageFetcher:
                 f"content-type {content_type} is not a page; nothing was read"
             )
 
-        raw = response.content
-        truncated = len(raw) > self.max_bytes
+        truncated = len(raw) >= self.max_bytes
         body = raw[: self.max_bytes].decode(response.encoding or "utf-8", errors="replace")
         text, _title = html_to_text(body)
         final_url = str(response.url)

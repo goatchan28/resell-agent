@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}inventory{% endblock %}
+{% block content %}
+<h1>inventory</h1>
+{% if abandoned_count %}
+  <p class="tiny">
+    {% if show_abandoned %}
+      Showing {{ abandoned_count }} set-aside item(s).
+      <a href="{{ url_for('inventory') }}">hide them</a>
+    {% else %}
+      {{ abandoned_count }} item(s) set aside and hidden.
+      <a href="{{ url_for('inventory', abandoned=1) }}">show them</a>
+    {% endif %}
+  </p>
+{% endif %}
+<table>
+  <thead>
+    <tr><th>sku<th>title<th>state<th>waiting on<th>next
+        <th class="n">paid<th class="n">price<th class="n">margin<th class="n">to&nbsp;run
+        <th class="n">photos<th class="n">comps<th>listing
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td><a href="{{ url_for('item', sku=row.sku) }}">{{ row.sku }}</a>
+      <td>{{ row.title | shorten(40) }}
+      <td><span class="state state-{{ row.state }}">{{ row.state }}</span>
+      <td><span class="actor actor-{{ row.actor }}">{{ row.actor }}</span>
+      <td class="tiny">{{ row.summary }}
+      <td class="n">{{ row.purchase_cost_cents | money }}
+      <td class="n">{{ (row.approved_price_cents or row.listing_price_cents) | money }}
+      <td class="n {{ 'neg' if row.margin_cents is not none and row.margin_cents < 0 }}">
+        {{ row.margin_cents | money }}
+      <td class="n tiny">{{ row.ai_cost_micros | micros }}
+      <td class="n">{{ row.photo_count }}
+      <td class="n">{{ row.comps }}{% if row.pending_candidates %}
+        <span class="badge">+{{ row.pending_candidates }}</span>{% endif %}
+      <td class="tiny">
+        {% if row.state == 'abandoned' %}
+          <form method="post" action="{{ url_for('restore', sku=row.sku) }}">
+            <button type="submit" class="tiny">bring it back</button>
+          </form>
+        {% else %}{{ row.listing_id or '—' }}{% endif %}
+  {% endfor %}
+</table>
+<p class="tiny">{{ rows | length }} item(s) in {{ environment }} ·
+  {{ rows | sum(attribute='ai_cost_micros') | micros }} of AI spend in total ·
+  breakdown per item: <code>resell item cost SKU</code></p>
+{% endblock %}

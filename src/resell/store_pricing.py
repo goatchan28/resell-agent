@@ -71,8 +71,8 @@ def record_comp_observation(conn: sqlite3.Connection, obs: CompObservation) -> s
             days_on_market, condition_declared_raw, condition_band, condition_source,
             listing_format, quantity, seller_type, retail_kind, source_authority,
             retrieval_method, adapter, query_text, raw_payload_hash,
-            model_visibility, retention_expires_at, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            source_excerpt, model_visibility, retention_expires_at, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             obs.comp_id, obs.marketplace, obs.external_id, obs.url, obs.title,
@@ -83,7 +83,8 @@ def record_comp_observation(conn: sqlite3.Connection, obs: CompObservation) -> s
             str(obs.condition_source), obs.listing_format, obs.quantity,
             obs.seller_type, str(obs.retail_kind) if obs.retail_kind else None,
             obs.source_authority, str(obs.retrieval_method), obs.adapter,
-            obs.query_text, obs.raw_payload_hash, str(obs.model_visibility),
+            obs.query_text, obs.raw_payload_hash, obs.source_excerpt,
+            str(obs.model_visibility),
             obs.retention_expires_at.isoformat() if obs.retention_expires_at else None,
             _now(),
         ),
@@ -283,6 +284,37 @@ def list_fee_schedules(conn: sqlite3.Connection) -> list[dict]:
            ORDER BY marketplace, category_id IS NULL, category_id, effective_from"""
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def recorded_schedule(
+    conn: sqlite3.Connection, *, marketplace: str, category_id: str | None
+):
+    """The active schedule and the version to record against it.
+
+    Two values because they answer different questions. `PROVISIONAL_DEFAULT` gives
+    numbers to compute with, but it is a placeholder rather than a stored schedule,
+    and `price_proposal.fee_schedule_version` is a foreign key -- so recording its
+    name broke the insert on any database with no schedule for the category.
+
+    The version is therefore empty when nothing was consulted, and that is the
+    truthful record. What the estimate rests on travels in `fee_basis`, which stays
+    `provisional_estimate` and is what the production gate reads.
+
+    Empty string rather than None, and the difference is load-bearing: it is the
+    dataclass's own default, `record_proposal` stores it as SQL NULL, and
+    `load_proposal` reads NULL back as empty. A proposal has to hash identically
+    before and after a round trip or the approval bound to it stops covering it --
+    which is what a None here produced, silently and only at approval time.
+
+    Returned rather than fixed up at insert time on purpose, for the same reason:
+    rewriting the field underneath the caller changes the hash it was given.
+    """
+    from .pricing.proceeds import PROVISIONAL_DEFAULT
+
+    found = active_fee_schedule(conn, marketplace=marketplace, category_id=category_id)
+    if found is not None:
+        return found, found.version
+    return PROVISIONAL_DEFAULT, ""
 
 
 def active_fee_schedule(
@@ -748,4 +780,295 @@ def _set_state(conn, sku, state, *, proposal_id, price_cents) -> None:
          _now() if state is PriceState.LIVE else (
              existing["last_change_at"] if existing and "last_change_at" in existing.keys()
              else None)),
+    )
+
+
+# --- source policy -----------------------------------------------------------
+
+
+def set_source_policy(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    model_visibility: str,
+    policy_version: str,
+    licence_ref: str | None = None,
+    note: str = "",
+) -> None:
+    """Record what a data source's licence permits. One row per source.
+
+    The `source_policy` table shipped with the pricing schema and nothing wrote to
+    it, which meant `model_visibility` was whatever a caller happened to pass --
+    a licence term enforced by remembering to. It is now read at the point comps
+    are recorded and again before anything reaches a prompt.
+    """
+    if model_visibility not in ("full", "derived_only", "none"):
+        raise ValueError(f"unknown model_visibility {model_visibility!r}")
+    conn.execute(
+        "INSERT INTO source_policy (source, policy_version, model_visibility, "
+        "licence_ref, decided_at, note) VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(source) DO UPDATE SET policy_version=excluded.policy_version, "
+        "model_visibility=excluded.model_visibility, licence_ref=excluded.licence_ref, "
+        "decided_at=excluded.decided_at, note=excluded.note",
+        (source, policy_version, model_visibility, licence_ref, _now(), note),
+    )
+    conn.commit()
+
+
+def source_policy(conn: sqlite3.Connection, source: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM source_policy WHERE source = ?", (source,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_source_policies(conn: sqlite3.Connection) -> list[dict]:
+    return [
+        dict(r) for r in conn.execute("SELECT * FROM source_policy ORDER BY source")
+    ]
+
+
+def visibility_for_source(conn: sqlite3.Connection, source: str) -> ModelVisibility:
+    """What a source's rows may be shown to, defaulting to the strictest answer.
+
+    An unregistered source resolves to `derived_only`: code may compute statistics
+    from its rows and a model may see the statistics, but the rows never enter a
+    prompt. That is the conservative direction, and because the central estimate is
+    computed deterministically it costs nothing but the model's view of the raw
+    listings.
+    """
+    row = source_policy(conn, source)
+    if row is None:
+        return ModelVisibility.DERIVED_ONLY
+    try:
+        return ModelVisibility(row["model_visibility"])
+    except ValueError:
+        return ModelVisibility.DERIVED_ONLY
+
+
+def promptable_comps(conn: sqlite3.Connection, sku: str) -> tuple[list, list]:
+    """Split this item's comps into those a prompt may contain and those it may not.
+
+    The licence question this exists for: eBay's API agreement forbids ingesting
+    Restricted API data -- which it defines to include pricing and sales-volume
+    data -- into a third-party AI without written consent. A comp obtained that way
+    can still price the item, because `estimate.py` is arithmetic; what it cannot do
+    is appear in a model's context.
+
+    Returns (promptable, withheld), both as ScoredComp.
+    """
+    promptable, withheld = [], []
+    for entry in load_scored_comps(conn, sku):
+        if entry.observation.model_visibility is ModelVisibility.FULL:
+            promptable.append(entry)
+        else:
+            withheld.append(entry)
+    return promptable, withheld
+
+
+def unclaimed_observations(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    """Comp observations that no claim connects to any SKU.
+
+    `comp-add` records an observation and `claim` attaches it to an item; the join
+    in `load_scored_comps` means an observation without a claim is invisible to
+    pricing. That is the right data model -- the same listing can be a comp for
+    several items, at different rungs -- but it makes "recorded" and "counted" two
+    different states, and nothing said so. Two eBay comps were added and the band
+    did not move.
+    """
+    return [
+        dict(r) for r in conn.execute(
+            """
+            SELECT o.comp_id, o.price_kind, o.price_cents, o.condition_band,
+                   o.title, o.created_at
+              FROM comp_observation o
+             WHERE o.purged_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM comp_claim c WHERE c.comp_id = o.comp_id)
+             ORDER BY o.created_at DESC LIMIT ?
+            """,
+            (limit,),
+        )
+    ]
+
+
+# --- comp candidates ---------------------------------------------------------
+#
+# The third state between "recorded" and "counted". Everything here exists so an
+# operator performs one action -- accept or reject -- and never learns that an
+# observation and a claim are different rows.
+
+
+def record_comp_candidate(
+    conn: sqlite3.Connection,
+    *,
+    sku: str,
+    comp_id: str,
+    proposed_comparability: str,
+    item_citations: tuple[str, ...] = (),
+    comp_citations: tuple[str, ...] = (),
+    rationale: str = "",
+) -> str:
+    """Offer a discovered comp for a decision. Idempotent per (sku, comp_id).
+
+    Re-proposing a comp already decided does nothing: a rejected comp stays
+    rejected until someone changes their mind explicitly, and re-running research
+    must not resurrect it.
+    """
+    candidate_id = _uid("cand")
+    conn.execute(
+        "INSERT OR IGNORE INTO comp_candidate (candidate_id, sku, comp_id, "
+        "proposed_comparability, item_citations_json, comp_citations_json, "
+        "rationale, status, created_at) VALUES (?,?,?,?,?,?,?,'pending',?)",
+        (candidate_id, sku, comp_id, proposed_comparability,
+         json.dumps(list(item_citations)), json.dumps(list(comp_citations)),
+         rationale, _now()),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT candidate_id FROM comp_candidate WHERE sku = ? AND comp_id = ?",
+        (sku, comp_id),
+    ).fetchone()
+    return row["candidate_id"]
+
+
+def pending_comp_candidates(conn: sqlite3.Connection, sku: str) -> list[dict]:
+    """What the operator is being asked about, with the listing beside it."""
+    return [
+        dict(r) for r in conn.execute(
+            """
+            SELECT k.candidate_id, k.comp_id, k.proposed_comparability, k.rationale,
+                   k.item_citations_json, k.comp_citations_json,
+                   o.price_cents, o.shipping_cents, o.price_kind, o.condition_band,
+                   o.condition_declared_raw, o.title, o.url, o.marketplace,
+                   o.days_on_market, o.source_excerpt
+              FROM comp_candidate k JOIN comp_observation o ON o.comp_id = k.comp_id
+             WHERE k.sku = ? AND k.status = 'pending' AND o.purged_at IS NULL
+             ORDER BY o.price_cents
+            """,
+            (sku,),
+        )
+    ]
+
+
+def accept_comp_candidate(
+    conn: sqlite3.Connection, candidate_id: str, *, identity_resolution: str
+) -> str:
+    """Turn a candidate into a comp claim. One action, both rows.
+
+    The ladder ceiling still applies: `record_comp_claim` refuses a rung above what
+    the item's identity resolution supports, and the refusal surfaces rather than
+    being demoted quietly. A candidate that cannot be accepted at its proposed rung
+    stays pending, so the operator sees why instead of finding it silently gone.
+    """
+    row = conn.execute(
+        "SELECT * FROM comp_candidate WHERE candidate_id = ?", (candidate_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no comp candidate {candidate_id}")
+    if row["status"] != "pending":
+        raise ValueError(f"candidate {candidate_id} is already {row['status']}")
+
+    item_citations = tuple(json.loads(row["item_citations_json"]))
+    rationale = row["rationale"]
+    if not item_citations:
+        # A candidate the agent was not allowed to assess arrives with nothing on
+        # the item side, because the agent made no match to cite. Accepting it is
+        # the operator making that match, so the claim cites what describes this
+        # item and records whose assertion it is. Without this the accept button
+        # produced a claim the validator refused -- correctly, since a claim with
+        # no item citation is untraceable.
+        item_citations = _item_observation_ids(conn, row["sku"])
+        rationale = (
+            f"accepted by the operator, who assessed this listing themselves. "
+            f"{rationale}"
+        ).strip()
+        if not item_citations:
+            raise ValueError(
+                f"{row['sku']} has no observations to cite, so no comp claim about "
+                f"it can be traced back to anything"
+            )
+
+    claim = CompClaim(
+        claim_id=_uid("claim"),
+        sku=row["sku"],
+        comp_id=row["comp_id"],
+        comparability=Comparability(row["proposed_comparability"]),
+        item_citations=item_citations,
+        comp_citations=tuple(json.loads(row["comp_citations_json"])),
+        rationale=rationale,
+    )
+    record_comp_claim(conn, claim, identity_resolution=identity_resolution)
+    conn.execute(
+        "UPDATE comp_candidate SET status = 'accepted', decided_at = ? "
+        "WHERE candidate_id = ?",
+        (_now(), candidate_id),
+    )
+    conn.commit()
+    return claim.claim_id
+
+
+def reject_comp_candidate(
+    conn: sqlite3.Connection, candidate_id: str, *, reason: str
+) -> str:
+    """Reject a candidate, which records an excluded claim rather than a deletion.
+
+    An exclusion with a reason is evidence; a deletion is a silent assumption. The
+    excluded claim is what stops the same listing being proposed again and what
+    lets `price recommend` account for it under "excluded by the operator".
+    """
+    row = conn.execute(
+        "SELECT * FROM comp_candidate WHERE candidate_id = ?", (candidate_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no comp candidate {candidate_id}")
+    if row["status"] != "pending":
+        raise ValueError(f"candidate {candidate_id} is already {row['status']}")
+    if not reason.strip():
+        raise ValueError("a rejected comp must record why")
+
+    claim = CompClaim(
+        claim_id=_uid("claim"),
+        sku=row["sku"],
+        comp_id=row["comp_id"],
+        comparability=Comparability.EXCLUDED,
+        item_citations=tuple(json.loads(row["item_citations_json"])),
+        comp_citations=tuple(json.loads(row["comp_citations_json"])),
+        rationale=row["rationale"],
+        excluded_reason=reason,
+    )
+    # Exclusion is legal at any identity resolution; validate_claim short-circuits
+    # on it, so the ceiling never blocks a rejection.
+    record_comp_claim(conn, claim, identity_resolution="resolved")
+    conn.execute(
+        "UPDATE comp_candidate SET status = 'rejected', decided_at = ?, "
+        "decided_reason = ? WHERE candidate_id = ?",
+        (_now(), reason, candidate_id),
+    )
+    conn.commit()
+    return claim.claim_id
+
+
+def already_offered(conn: sqlite3.Connection, sku: str) -> set[str]:
+    """Comp ids this item has already been offered or claimed, at any status."""
+    return {
+        r["comp_id"] for r in conn.execute(
+            "SELECT comp_id FROM comp_candidate WHERE sku = ? "
+            "UNION SELECT comp_id FROM comp_claim WHERE sku = ?",
+            (sku, sku),
+        )
+    }
+
+
+def _item_observation_ids(conn: sqlite3.Connection, sku: str) -> tuple[str, ...]:
+    """The observations that describe this item, as claim citations.
+
+    The same pool the judging stage draws its citations from, so an
+    operator-accepted claim is traceable exactly the way an agent-judged one is.
+    """
+    return tuple(
+        str(row["id"])
+        for row in conn.execute(
+            "SELECT id FROM evidence WHERE sku = ? AND send_to_model = 1 "
+            "AND subject = 'this_item' ORDER BY id", (sku,),
+        )
     )

@@ -110,27 +110,73 @@ class FakeResponse:
         self.content = body
         self.encoding = "utf-8"
         self.url = url or "https://beatsbydre.com/p"
+        self._chunks = None
+        self._clock = None
 
+    def set_chunks(self, chunks, clock=None):
+        self._chunks = chunks
+        self._clock = clock
 
-class FakeClient:
-    def __init__(self, response=None, error=None):
-        self._response = response or FakeResponse()
-        self._error = error
-        self.requested = []
-
-    def get(self, url):
-        self.requested.append(url)
-        if self._error:
-            raise self._error
-        return self._response
+    def iter_bytes(self):
+        if self._chunks is None:
+            yield self.content
+            return
+        for item in self._chunks:
+            if isinstance(item, (int, float)):
+                # A gap in the transfer. The connection is fine; the page is not.
+                if self._clock is not None:
+                    self._clock.advance(item)
+                continue
+            yield item
 
     def close(self):
         pass
 
 
-def fetcher(response=None, error=None, **kw):
+class FakeStream:
+    """A streamed response, because that is what the fetcher now asks for.
+
+    `chunks` is a list of byte strings, optionally interleaved with floats: a
+    float is how long that gap in the transfer lasts. That is what a stalled
+    server looks like from here, and it is the case the byte cap could never
+    catch -- the bytes arrive, just never enough of them and never an end.
+    """
+
+    def __init__(self, response, chunks=None, clock=None):
+        self._response = response
+        self._chunks = chunks
+        self._clock = clock
+
+    def __enter__(self):
+        return self._response
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeClient:
+    def __init__(self, response=None, error=None, chunks=None, clock=None):
+        self._response = response or FakeResponse()
+        self._error = error
+        self._chunks = chunks
+        self._clock = clock
+        self.requested = []
+
+    def stream(self, method, url):
+        self.requested.append(url)
+        if self._error:
+            raise self._error
+        if self._chunks is not None:
+            self._response.set_chunks(self._chunks, self._clock)
+        return FakeStream(self._response)
+
+    def close(self):
+        pass
+
+
+def fetcher(response=None, error=None, chunks=None, clock=None, **kw):
     return PageFetcher(
-        client=FakeClient(response, error), respect_robots=False, **kw
+        client=FakeClient(response, error, chunks, clock), respect_robots=False, **kw
     )
 
 
@@ -668,3 +714,92 @@ def test_a_quotation_beyond_the_truncation_point_is_rejected(tmp_path):
     )
     assert adapter.search(ResearchQuery("q", "manufacturer", "m")) == []
     assert any("does not appear" in note for note in adapter.notes)
+
+
+# --- a stalled transfer must end -------------------------------------------------
+
+
+class Clock:
+    """Advances only when a fake transfer stalls, so the test is instant."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def __call__(self):
+        return self.now
+
+
+def test_a_server_that_trickles_forever_is_abandoned(monkeypatch):
+    """The failure this fixes. A comp round sat on one page indefinitely: the
+    connection was fine and bytes kept arriving, so the per-read timeout reset on
+    every chunk and never fired. Only a deadline ends that."""
+    from resell.reasoning.adapters import fetch as fetch_module
+
+    clock = Clock()
+    monkeypatch.setattr(fetch_module.time, "monotonic", clock)
+    # a byte, a 30-second gap, a byte, another gap -- never an end
+    chunks = [b"<html>", 30.0, b"<p>a</p>", 30.0, b"<p>b</p>", 30.0, b"</html>"]
+
+    with pytest.raises(FetchError, match="gave up after"):
+        fetcher(FakeResponse(b""), chunks=chunks, clock=clock,
+                deadline_seconds=45.0).fetch("https://slow.example/p")
+
+
+def test_the_abandoned_url_is_named_in_the_error():
+    """So a host that reliably stalls can be identified later rather than just
+    felt as slowness."""
+    from resell.reasoning.adapters import fetch as fetch_module
+
+    clock = Clock()
+    original = fetch_module.time.monotonic
+    fetch_module.time.monotonic = clock
+    try:
+        with pytest.raises(FetchError) as caught:
+            fetcher(FakeResponse(b""), chunks=[b"x", 60.0, b"y"], clock=clock,
+                    deadline_seconds=45.0).fetch("https://slow.example/page")
+    finally:
+        fetch_module.time.monotonic = original
+    assert "slow.example/page" in str(caught.value)
+    assert "bytes read" in str(caught.value)
+
+
+def test_a_prompt_page_is_unaffected_by_the_deadline():
+    page = fetcher(
+        FakeResponse(b"<html><body><p>Colourway: Navy</p></body></html>"),
+        deadline_seconds=45.0,
+    ).fetch("https://beatsbydre.com/p")
+    assert "Colourway: Navy" in page.text
+
+
+def test_the_byte_cap_stops_the_download_rather_than_the_keeping():
+    """`response.content` had already read the whole body before `max_bytes` was
+    consulted, so the cap bounded what was retained and not what was transferred."""
+    huge = [b"x" * 1000 for _ in range(100)]
+    page = fetcher(
+        FakeResponse(b""), chunks=huge, max_bytes=5000,
+    ).fetch("https://big.example/p")
+    assert page.truncated
+    assert page.bytes_read <= 5000
+
+
+def test_robots_is_fetched_with_a_timeout(monkeypatch):
+    """`RobotFileParser.read()` takes no timeout and cannot be given one. It runs
+    before the page GET, so the bounded call was never even reached."""
+    import httpx
+
+    seen = {}
+
+    def fake_get(url, **kwargs):
+        seen["url"] = url
+        seen["timeout"] = kwargs.get("timeout")
+        raise httpx.ConnectTimeout("too slow")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    allowed, why = PageFetcher(respect_robots=True).allowed("https://slow.example/p")
+    assert not allowed
+    assert "robots.txt" in why
+    assert seen["url"] == "https://slow.example/robots.txt"
+    assert seen["timeout"] is not None

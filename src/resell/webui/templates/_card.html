@@ -1,0 +1,308 @@
+{# One item, one decision. The card shows the photo, what it is, and the single
+   thing outstanding -- never a stage name and never a command. #}
+<article class="card">
+  <div class="shot">
+    {% if card.photo_positions %}
+      <img src="{{ url_for('photo', sku=card.sku, position=card.photo_positions[0]) }}"
+           alt="" loading="lazy">
+    {% else %}
+      <div class="shot-empty">no photo</div>
+    {% endif %}
+  </div>
+
+  <div class="body">
+    <h2><a href="{{ url_for('item', sku=card.sku) }}">{{ card.title | shorten(70) }}</a></h2>
+    <p class="meta">{{ card.sku }}
+      {%- if card.purchase_cost_cents %} · paid {{ card.purchase_cost_cents | money }}{% endif %}
+      {%- if card.approved_price_cents %} · approved {{ card.approved_price_cents | money }}{% endif %}
+      {%- if card.ai_cost_micros %} · {{ card.ai_cost_micros | micros }} to process{% endif %}</p>
+
+    <p class="ask">{{ card.summary }}</p>
+    {% if card.detail %}<p class="why">{{ card.detail }}</p>{% endif %}
+
+    {# --- answer a question ------------------------------------------------ #}
+    {% if card.agent_is_working %}
+      {# The agent owns this step and is on it. Offering "carry on" here invites a
+         second advance through the same state machine: duplicated work, two
+         budgets, and a race nobody can see. The progress panel above is the
+         page's whole content until it finishes. #}
+      <p class="decision working">
+        <span class="run-spinner" aria-hidden="true"></span>
+        the agent is working on this one
+      </p>
+
+    {% elif card.step == 'answer_questions' %}
+      {% for question in card.questions %}
+        <div class="decision">
+          <p class="q">{{ question.question }}</p>
+          <form method="post" action="{{ url_for('answer', question_id=question.id) }}">
+            <input type="hidden" name="sku" value="{{ card.sku }}">
+            {% if question.has_choices %}
+              {# A visible list, not a hidden datalist. eBay offers 204 models for
+                 an action camera and the old text box showed none of them, so the
+                 operator was asked to guess at something two clicks away. #}
+              <select name="choice" class="aspect-choice">
+                <option value="">{% if question.choices_are_binding %}— {{ question.choices | length }} value(s) eBay lists —{% else %}— {{ question.choices | length }} value(s) eBay lists, or type your own below —{% endif %}</option>
+                {% for value in question.choices %}
+                  <option value="{{ value }}"
+                    {{ 'selected' if value == question.suggested_answer }}>{{ value }}</option>
+                {% endfor %}
+              </select>
+            {% endif %}
+            <input type="text" name="answer" autocomplete="off"
+                   value="{{ question.suggested_answer or '' }}"
+                   {% if question.has_choices %}list="v{{ question.id }}"{% endif %}
+                   placeholder="{{ 'or type it' if question.has_choices else 'your answer' }}">
+            {% if question.has_choices %}
+              <datalist id="v{{ question.id }}">
+                {% for value in question.choices %}<option value="{{ value }}"></option>{% endfor %}
+              </datalist>
+            {% endif %}
+            <button type="submit">answer</button>
+            {% if question.choices_are_binding %}
+              <label class="tiny"><input type="checkbox" name="value_not_listed" value="1">
+                not one of eBay's values</label>
+            {% elif question.has_choices %}
+              <p class="tiny quiet">eBay suggests these for {{ question.aspect_name }}; any value is accepted.</p>
+            {% endif %}
+          </form>
+        </div>
+      {% endfor %}
+
+    {# --- accept a comparable ---------------------------------------------- #}
+    {% elif card.step == 'review_comps' %}
+      {% for comp in card.candidates %}
+        <div class="decision comp">
+          <div class="comp-head">
+            <strong>{{ comp.price_cents | money }}</strong>
+            <span class="kind kind-{{ comp.price_kind }}">{{
+              'sold' if comp.price_kind == 'realized' else 'asking' }}</span>
+            <span class="tiny">{{ comp.condition }} · {{ comp.marketplace }}
+              {%- if not comp.shipping_known %} · postage not stated{% endif %}</span>
+          </div>
+          <p class="comp-title">
+            {% if comp.url %}<a href="{{ comp.url }}" target="_blank" rel="noopener">{{ comp.title | shorten(80) }}</a>
+            {% else %}{{ comp.title | shorten(80) }}{% endif %}</p>
+          {% if comp.rationale %}<p class="why">{{ comp.rationale | shorten(120) }}</p>{% endif %}
+          <div class="choices">
+            <form method="post" action="{{ url_for('accept_candidate', candidate_id=comp.candidate_id) }}">
+              <input type="hidden" name="sku" value="{{ card.sku }}">
+              <button type="submit">same sort of thing</button>
+            </form>
+            <form method="post" action="{{ url_for('reject_candidate', candidate_id=comp.candidate_id) }}">
+              <input type="hidden" name="sku" value="{{ card.sku }}">
+              <input type="text" name="reason" placeholder="why not" required>
+              <button type="submit" class="secondary">not comparable</button>
+            </form>
+          </div>
+        </div>
+      {% endfor %}
+
+    {# --- is this really what it is? ---------------------------------------- #}
+    {% elif card.step == 'confirm_identity' %}
+      <div class="decision">
+        <p class="why">{{ card.detail }}. Read the title and details below; if they
+          are right, pricing can start. If not, correct them first — a pricing
+          budget spent on the wrong product buys the wrong comparables.</p>
+        <p class="band">{{ card.title }}</p>
+        <form method="post" action="{{ url_for('confirm_identity', sku=card.sku) }}"
+              data-long>
+          <input type="text" name="note" placeholder="anything worth recording (optional)">
+          <button type="submit" class="primary" data-busy="working…">
+            yes, that is what it is
+          </button>
+        </form>
+      </div>
+
+    {# --- find comparables --------------------------------------------------- #}
+    {# Only shown when finding the listings is genuinely the operator's job, which
+       is when nothing can search. With a backend this step belongs to the agent
+       and falls through to "carry on" like every other agent step. #}
+    {% elif card.step == 'comp_research' and card.waiting_on_operator %}
+      <div class="decision">
+        <p class="limitation">No search backend is configured, so the agent cannot
+          find listings on its own. Set RESELL_SEARCH_BACKEND=brave and
+          BRAVE_API_KEY in .env, or paste links below.</p>
+        <p class="why">Search a marketplace and paste the results pages, one link
+          per line. Each is fetched and read for you. eBay cannot be fetched —
+          their agreement forbids it.</p>
+        <form method="post" action="{{ url_for('find_comps', sku=card.sku) }}">
+          <textarea name="urls" rows="3" required
+                    placeholder="https://poshmark.com/search?q=…&#10;https://www.mercari.com/search/?keyword=…"></textarea>
+          <button type="submit" class="primary">read these listings</button>
+        </form>
+      </div>
+
+    {# --- comp research is over and found nothing usable -------------------- #}
+    {% elif card.step == 'price_without_comps' %}
+      <div class="decision">
+        <p class="limitation">{{ card.detail }}. Nothing it found was usable as a
+          comparable.</p>
+
+        <p class="why">Set the price yourself. It goes on the record as your
+          judgement with no market evidence behind it, which is what it is.</p>
+        <form method="post" action="{{ url_for('set_price', sku=card.sku) }}"
+              class="price-entry" data-fees="{{ card.fee_rate }}"
+              data-costs="{{ card.fixed_costs_cents }}"
+              data-floor="{{ card.floor_cents }}"
+              data-paid="{{ card.purchase_cost_cents if card.purchase_cost_cents is not none else '' }}">
+          <label>$<input type="text" name="price" inputmode="decimal"
+                         placeholder="450.00" required autocomplete="off"></label>
+          <input type="text" name="why" placeholder="why this number (optional)">
+          <p class="proceeds" aria-live="polite">
+            {% if card.purchase_cost_cents is none %}
+              No purchase cost recorded, so this shows net proceeds, not profit.
+            {% else %}
+              Paid {{ card.purchase_cost_cents | money }}.
+            {% endif %}
+            Least worth listing at {{ card.floor_cents | money }}.
+          </p>
+          <label class="below-floor">
+            <input type="checkbox" name="confirm_below_floor"> price it anyway
+          </label>
+          <button type="submit" class="primary">price it and carry on</button>
+        </form>
+
+        <p class="why">Or give this item another round of searching:
+          {{ card.grant_calls }} more research calls and {{ card.grant_lookups }} more
+          searches, for this item only.</p>
+        <form method="post" action="{{ url_for('more_research', sku=card.sku) }}">
+          <button type="submit">let it look again</button>
+        </form>
+
+        <form method="post" action="{{ url_for('abandon', sku=card.sku) }}">
+          <button type="submit">set this one aside</button>
+        </form>
+      </div>
+
+    {# --- approve a price --------------------------------------------------- #}
+    {% elif card.step == 'approve_price' and card.has_price %}
+      <div class="decision">
+        <p class="band">{{ card.price_low_cents | money }} – {{ card.price_high_cents | money }}
+          <span class="tiny">from the accepted comparables</span></p>
+        {% if card.price_confidence_note %}
+          <p class="why">{{ card.price_confidence_note }}</p>
+        {% endif %}
+        <div class="choices">
+          {% for option in card.price_options %}
+            <form method="post" action="{{ url_for('approve_price', sku=card.sku) }}">
+              <input type="hidden" name="objective" value="{{ option.objective }}">
+              <button type="submit" class="{{ 'primary' if option.is_default else 'secondary' }}">
+                {{ option.price_cents | money }}
+                <span class="tiny">{{ option.objective.replace('_', ' ') }} ·
+                  keep {{ option.net_proceeds_cents | money }}</span>
+              </button>
+            </form>
+          {% endfor %}
+        </div>
+      </div>
+
+    {# --- approve the listing ------------------------------------------------ #}
+    {% elif card.step == 'approve_listing' %}
+      <div class="decision">
+        <p class="draft-title">{{ card.title }}</p>
+        <pre>{{ card.listing_description | shorten(700) }}</pre>
+        <form method="post" action="{{ url_for('approve_listing', sku=card.sku) }}">
+          <button type="submit" class="primary">approve this listing</button>
+        </form>
+      </div>
+
+    {# --- publish, the one action that leaves this machine ------------------- #}
+    {% elif card.step == 'publish' %}
+      <div class="decision">
+        <p class="why">This puts it up for sale on {{ environment }}
+          {%- if environment == 'production' %} — a real listing under your account{% endif %}.</p>
+        <form method="post" action="{{ url_for('publish', sku=card.sku) }}">
+          <button type="submit" class="primary">publish to {{ environment }}</button>
+        </form>
+      </div>
+
+    {# --- needs photos -------------------------------------------------------- #}
+    {% elif card.step == 'attach_photos' %}
+      <form method="post" action="{{ url_for('add_photos', sku=card.sku) }}"
+            enctype="multipart/form-data" class="decision">
+        <input type="file" name="photos" multiple accept="image/*" required>
+        <button type="submit">add photos</button>
+      </form>
+
+    {% else %}
+      <form method="post" action="{{ url_for('run', sku=card.sku) }}" class="decision"
+            data-long>
+        <button type="submit" class="primary" data-busy="working…">carry on</button>
+      </form>
+        {% if card.step == 'comp_research' %}
+          <details class="fix">
+            <summary>search from a page I already found</summary>
+            <form method="post" action="{{ url_for('find_comps', sku=card.sku) }}">
+              <textarea name="urls" rows="2"
+                        placeholder="https://poshmark.com/search?q=…"></textarea>
+              <button type="submit">read these instead</button>
+            </form>
+          </details>
+        {% endif %}
+    {% endif %}
+    {# --- stop work on this one, without losing it ------------------------ #}
+    {# Not while the agent works either. Setting aside is a state transition, and
+       one racing the worker thread's transitions is the same hazard as advancing
+       twice -- it just looks like stopping rather than starting. #}
+    {% if not card.is_done and not card.agent_is_working
+          and card.step != 'price_without_comps' %}
+      <details class="fix set-aside">
+        <summary>set this one aside</summary>
+        <p class="tiny quiet">Nothing is deleted — the photos, research and costs
+          stay. It leaves the work queue and the agent stops touching it. You can
+          bring it back to {{ card.state }} from Inventory.</p>
+        <form method="post" action="{{ url_for('abandon', sku=card.sku) }}">
+          <input type="text" name="reason" placeholder="why (optional)">
+          <button type="submit">set aside</button>
+        </form>
+      </details>
+    {% endif %}
+
+    {# --- correcting what the record got wrong ---------------------------- #}
+    {% set form = forms.get(card.sku) if forms else None %}
+    {% if form and form.fields %}
+      <details class="fix" {{ 'open' if form.has_problem }}>
+        <summary>
+          {% if form.has_problem %}
+            <span class="fix-problem">{{ form.problems | length }} thing(s) will stop
+              this publishing</span>
+          {% else %}
+            change the details
+          {% endif %}
+        </summary>
+        <form method="post" action="{{ url_for('fix', sku=card.sku) }}">
+          {% for field in form.fields %}
+            <label class="fix-field {{ 'wrong' if field.problem }}">
+              <span>{{ field.label }}</span>
+              {% if field.is_choice %}
+                <select name="{{ field.name }}">
+                  {% if not field.value_is_allowed %}
+                    <option value="{{ field.value }}" selected>
+                      {{ field.value or '(not set)' }} — not accepted here</option>
+                  {% endif %}
+                  {% for value, label in field.allowed %}
+                    <option value="{{ value }}"
+                      {{ 'selected' if value == field.value }}>{{ label }}</option>
+                  {% endfor %}
+                </select>
+              {% elif field.name == 'description' %}
+                <textarea name="description" rows="5">{{ field.value }}</textarea>
+              {% else %}
+                <input type="text" name="{{ field.name }}" value="{{ field.value }}">
+              {% endif %}
+              {% if field.problem %}
+                <span class="fix-why">{{ field.problem }}</span>
+              {% elif field.help_text %}
+                <span class="tiny">{{ field.help_text }}</span>
+              {% endif %}
+            </label>
+          {% endfor %}
+          <button type="submit" class="{{ 'primary' if form.has_problem else 'secondary' }}">
+            save the changes</button>
+        </form>
+        {% if form.error %}<p class="why">{{ form.error }}</p>{% endif %}
+      </details>
+    {% endif %}
+  </div>
+</article>

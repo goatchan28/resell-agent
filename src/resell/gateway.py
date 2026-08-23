@@ -83,14 +83,101 @@ def validated_photos(conn: sqlite3.Connection, sku: str) -> list[sqlite3.Row]:
     )
 
 
-def unresolved_blocking_questions(conn: sqlite3.Connection, sku: str) -> list[sqlite3.Row]:
-    return list(
+def settle_answered_aspect_questions(conn: sqlite3.Connection, sku: str) -> list[int]:
+    """Close blocking questions about aspects the item already has a value for.
+
+    A question is a request for something missing. Once the value is on the
+    identification the request is met, whoever met it -- so leaving it open holds
+    the item in `needs_info` over a thing that is no longer absent, and shows the
+    operator a prompt they have already answered.
+
+    MP-000016 is the case: publish computes what is missing from the *frozen*
+    listing, so an aspect supplied after the proposal was made looked missing for
+    ever, and each answer was followed by a fresh pair of questions.
+    """
+    import json as _json
+
+    row = conn.execute(
+        "SELECT aspects FROM identification WHERE sku = ? AND superseded_at IS NULL",
+        (sku,),
+    ).fetchone()
+    if row is None or not row["aspects"]:
+        return []
+    try:
+        aspects = _json.loads(row["aspects"])
+    except (TypeError, ValueError):
+        return []
+    known = {
+        name for name, vals in aspects.items()
+        if vals and any(str(v).strip() for v in vals)
+    }
+    if not known:
+        return []
+
+    settled = []
+    for question in conn.execute(
+        "SELECT id, aspect_name FROM open_question "
+        "WHERE sku = ? AND answered_at IS NULL AND aspect_name IS NOT NULL",
+        (sku,),
+    ).fetchall():
+        if question["aspect_name"] not in known:
+            continue
+        value = ", ".join(str(v) for v in aspects[question["aspect_name"]])
         conn.execute(
-            "SELECT * FROM open_question WHERE sku = ? AND blocking = 1 "
-            "AND answered_at IS NULL ORDER BY asked_at",
-            (sku,),
-        ).fetchall()
-    )
+            "UPDATE open_question SET answer = ?, answered_at = ? WHERE id = ?",
+            (value, now_iso(), question["id"]),
+        )
+        settled.append(question["id"])
+    if settled:
+        conn.commit()
+    return settled
+
+
+def _populated_aspects(conn: sqlite3.Connection, sku: str) -> set[str]:
+    """Aspect names the live identification has a usable value for."""
+    import json as _json
+
+    row = conn.execute(
+        "SELECT aspects FROM identification WHERE sku = ? AND superseded_at IS NULL",
+        (sku,),
+    ).fetchone()
+    if row is None or not row["aspects"]:
+        return set()
+    try:
+        aspects = _json.loads(row["aspects"])
+    except (TypeError, ValueError):
+        return set()
+    return {
+        name for name, values in aspects.items()
+        if values and any(str(v).strip() for v in values)
+    }
+
+
+def unresolved_blocking_questions(conn: sqlite3.Connection, sku: str) -> list[sqlite3.Row]:
+    """Blocking questions still genuinely outstanding.
+
+    A question is a request for something missing, so one about an aspect the
+    item now has a value for is met -- whoever met it. Filtered on read rather
+    than settled on write, because the callers that matter (`next_step`, the
+    inventory table, the card) must not write, and because the value can arrive
+    from any direction: an answer, a mapping run, a correction.
+
+    MP-000016 is why. Publish computes what is missing from the *frozen* proposal,
+    so an aspect supplied afterwards looked missing for ever: every answer was
+    followed by a fresh pair of questions, and the item collected twelve.
+    """
+    rows = conn.execute(
+        "SELECT * FROM open_question WHERE sku = ? AND blocking = 1 "
+        "AND answered_at IS NULL ORDER BY asked_at",
+        (sku,),
+    ).fetchall()
+    if not rows:
+        return []
+    populated = _populated_aspects(conn, sku)
+    return [
+        row for row in rows
+        if not (row["aspect_name"] and row["aspect_name"] in populated)
+    ]
 
 
 def observations_in_scope(conn: sqlite3.Connection, sku: str) -> list[sqlite3.Row]:
@@ -896,13 +983,19 @@ class Gateway:
     def record_lookup(
         self, sku: str, *, provider: str, query: str, motivation: str,
         evidence_ids: list[int], result_count: int, scope: str = "identity",
+        cost_micros: int | None = None,
     ) -> None:
+        """What was searched, and what it cost.
+
+        `cost_micros` is None for a retrieval that was genuinely free -- an
+        operator pasting a URL -- and zero is not the same answer.
+        """
         self.conn.execute(
             "INSERT OR REPLACE INTO research_lookup (sku, scope, provider, query, "
-            "motivation, evidence_ids, result_count, performed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "motivation, evidence_ids, result_count, performed_at, cost_micros) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (sku, scope, provider, query, motivation, json.dumps(evidence_ids),
-             result_count, now_iso()),
+             result_count, now_iso(), cost_micros),
         )
 
     def record_research_negative(self, sku: str, *, summary: str, detail: dict) -> Accepted:
@@ -1202,6 +1295,38 @@ class Gateway:
                 sku, ItemState.ABANDONED, command="Abandon", detail=reason
             )
 
+    def restore(self, sku: str, reason: str = "") -> Accepted:
+        """Bring an abandoned item back to where it was, from the event log.
+
+        The target is read out of history rather than supplied, which is what keeps
+        this from being an arbitrary jump: `_transition` records every state change
+        with its `from`, so the state an item was in when it was abandoned is a
+        fact the database already holds. A caller cannot use restore to move an
+        item somewhere it never was.
+
+        Nothing is undone. Abandoning voided approvals and deactivated listings,
+        and both stay that way -- an item restored to `proposed` needs approving
+        again, which is correct, because the approval that existed was voided for a
+        stated reason and is part of the record.
+        """
+        item = get_item(self.conn, sku)
+        state = ItemState(item["state"])
+        if state is not ItemState.ABANDONED:
+            raise Rejected("Restore", [f"item is {state}, not abandoned"])
+
+        previous = state_before_abandonment(self.conn, sku)
+        if previous is None:
+            raise Rejected(
+                "Restore",
+                ["no recorded state to return to; the abandonment predates the "
+                 "event log or was never recorded"],
+            )
+        with transaction(self.conn):
+            return self._transition(
+                sku, previous, command="Restore",
+                detail=reason or f"restored to {previous}",
+            )
+
     # --- operator-only commands ---------------------------------------------
 
     def answer_question(
@@ -1290,6 +1415,14 @@ class Gateway:
         if aspect_name:
             identification = current_identification(self.conn, sku)
             if identification is not None:
+                # Applied first, then cited. The candidate belongs to whichever
+                # identification version ends up holding the value -- writing it
+                # against the old one and then superseding that version leaves the
+                # citation on a version nothing reads, and a second question about
+                # the same aspect lands on a different row instead of adding its
+                # citation to the first.
+                self._apply_operator_aspect(sku, identification, aspect_name, value)
+                identification = current_identification(self.conn, sku)
                 candidate_id = self._upsert_aspect_candidate(
                     identification["id"], aspect_name, value
                 )
@@ -1317,6 +1450,49 @@ class Gateway:
         if siblings:
             accepted.data["duplicates_settled"] = siblings
         return accepted
+
+    def _apply_operator_aspect(
+        self, sku: str, identification, aspect_name: str, value: str
+    ) -> None:
+        """Put the operator's answer onto the identification, if it changes it.
+
+        A candidate was recorded and nothing promoted it, so answering changed
+        nothing anyone could see: publishing still refused for want of the aspect
+        just supplied, and the next mapping run asked again. MP-000016 answered
+        the same two questions three times, and by then the item had been priced
+        and approved -- past the point where any mapping run would ever happen, so
+        waiting for one was waiting for nothing.
+
+        The operator is the authority. `basis='operator'` on the evidence row
+        above is what adjudicates a contradiction, so the answer does not need a
+        model to ratify it.
+
+        Only when it changes something. Restating a value already recorded must
+        not mint an identification version -- versions are how this item's history
+        reads, and one per keystroke would bury it. That also keeps two questions
+        about one aspect converging on one candidate, which is what carries the
+        citations.
+        """
+        import json as _json
+
+        try:
+            current = _json.loads(identification["aspects"] or "{}")
+        except (TypeError, ValueError):
+            current = {}
+        if [str(v) for v in current.get(aspect_name, [])] == [value]:
+            return
+
+        from resell.cli_item import merged_identification
+
+        fields, _ = merged_identification(
+            self.conn, sku, aspects={aspect_name: [value]}
+        )
+        try:
+            self.propose_identification(sku, **fields)
+        except Rejected:
+            # A terminal item cannot take a new identification. The answer stays
+            # recorded as evidence, which is still true and still the record.
+            return
 
     def _settle_duplicate_questions(
         self, sku: str, aspect_name: str | None, answered_id: int, answer: str
@@ -1530,3 +1706,33 @@ class Gateway:
                 for q in unresolved_blocking_questions(self.conn, sku)
             ],
         }
+
+
+def state_before_abandonment(conn: sqlite3.Connection, sku: str) -> ItemState | None:
+    """The state this item was in when it was last abandoned.
+
+    Read from `item.state_changed` events, which `_transition` has always written
+    with both ends of the move. Nothing new is stored to make restore possible --
+    the history was already sufficient, it was simply never read.
+
+    The *last* abandonment, not the first: an item can be abandoned, restored and
+    abandoned again, and the relevant question is where it came from this time.
+    """
+    row = conn.execute(
+        "SELECT payload FROM events WHERE item_id = ? AND kind = 'item.state_changed' "
+        "ORDER BY id DESC", (sku,),
+    )
+    for record in row:
+        try:
+            payload = json.loads(record["payload"])
+        except (TypeError, ValueError):
+            continue
+        if payload.get("to") != str(ItemState.ABANDONED):
+            continue
+        origin = payload.get("from")
+        try:
+            state = ItemState(origin)
+        except ValueError:
+            return None
+        return state if is_legal_transition(ItemState.ABANDONED, state) else None
+    return None

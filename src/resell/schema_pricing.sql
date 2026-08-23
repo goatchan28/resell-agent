@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS comp_observation (
     query_text             TEXT,
     request_id             TEXT,
     raw_payload_hash       TEXT,
+    -- The page text this listing's price was read from. NULL for a comp the
+    -- operator transcribed: they are the witness to what the page said, and an
+    -- extraction from fetched HTML is not.
+    source_excerpt         TEXT,
     -- licensing
     license_class          TEXT,
     model_visibility       TEXT NOT NULL DEFAULT 'full'
@@ -76,6 +80,35 @@ CREATE TABLE IF NOT EXISTS comp_claim (
     CHECK (comparability <> 'excluded' OR excluded_reason IS NOT NULL),
     UNIQUE (sku, comp_id)
 );
+
+-- A comp the agent found and proposed, waiting on a person.
+--
+-- The observation/claim split is right -- one listing can be a comp for several
+-- items at different rungs -- but it makes "recorded" and "counted" two states,
+-- and an operator should never have to know that. This table is the third state
+-- between them: found, judged, not yet accepted.
+--
+-- Accepting writes the comp_claim. Rejecting writes an excluded claim with the
+-- reason, so a rejected comp is auditable and is not proposed again. Either way
+-- the operator performs one action and the split stays out of the interface.
+CREATE TABLE IF NOT EXISTS comp_candidate (
+    candidate_id        TEXT PRIMARY KEY,
+    sku                 TEXT NOT NULL REFERENCES item (sku),
+    comp_id             TEXT NOT NULL REFERENCES comp_observation (comp_id),
+    proposed_comparability TEXT NOT NULL,
+    item_citations_json TEXT NOT NULL DEFAULT '[]',
+    comp_citations_json TEXT NOT NULL DEFAULT '[]',
+    rationale           TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending','accepted','rejected')),
+    decided_at          TEXT,
+    decided_reason      TEXT,
+    created_at          TEXT NOT NULL,
+    UNIQUE (sku, comp_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_comp_candidate_pending
+    ON comp_candidate (sku) WHERE status = 'pending';
 
 -- A frozen bundle. Rebuilding research makes a new set; sets are never edited.
 CREATE TABLE IF NOT EXISTS comp_set (

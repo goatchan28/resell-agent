@@ -551,6 +551,144 @@ def drafting_stage(
     )
 
 
+CONDITION_SYSTEM_PROMPT = """You are choosing which of a marketplace's condition \
+grades best describes a second-hand item, from observations someone else recorded of \
+its photographs.
+
+Rules:
+
+- Choose from the list you are given and nothing else. The grades differ by category \
+and the list is this category's; a value outside it is refused when the listing is \
+published.
+- Grade what was observed, not what is likely. "No visible damage in these photos" is \
+not the same as "no damage" -- photographs miss things, and the honest grade reflects \
+what somebody could actually see.
+- Cite the observations behind the choice. A grade is a claim about the object and \
+carries the same burden as any other.
+- Prefer the lower grade when two fit. A buyer who receives something better than \
+described is pleased; the reverse is a return, a refund and a defect on the account.
+- Say when the photographs do not settle it. If wear cannot be assessed from what was \
+recorded -- no close-ups, key surfaces not shown -- say so in `uncertain_because` and \
+still give your best grade. Somebody may then look at the object.
+
+Call the choose_condition tool exactly once."""
+
+
+def condition_stage(
+    observations: str,
+    allowed: str,
+    category_id: str,
+    max_output_tokens: int = 1000,
+) -> StageRequest:
+    """Build the condition-grading request.
+
+    The allowed grades come from eBay's condition policy for the category, in
+    eBay's own wording -- 1000 is "New with tags" in clothing and "Brand New"
+    elsewhere, and offering our own vocabulary instead would invite a value the
+    marketplace does not accept.
+    """
+    from resell.reasoning.tools import CONDITION_TOOL_NAME, CONDITION_TOOL_SCHEMA
+
+    instruction = (
+        f"Category {category_id} accepts exactly these grades:\n\n{allowed}\n\n"
+        f"Recorded observations of the item:\n\n{observations}\n\n"
+        "Choose the grade that describes it."
+    )
+    return StageRequest(
+        system_prompt=CONDITION_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=CONDITION_TOOL_NAME,
+            description=CONDITION_TOOL_SCHEMA["description"],
+            json_schema=CONDITION_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
+REPAIR_SYSTEM_PROMPT = """You are repairing one listing draft that a deterministic \
+review refused. You are not rewriting it.
+
+A draft that fails review is not worthless: usually one phrase or one uncited \
+sentence is wrong and the rest is accurate copy that took real evidence to produce. \
+Throwing it away and starting again loses that, and tends to reintroduce the same \
+error in a new place.
+
+Rules:
+
+- Change only what was named. Every problem you were given identifies a specific \
+title, sentence or claim. Leave every other word exactly as it is, including \
+punctuation and paragraph breaks. If a sentence was not challenged, return it \
+character for character.
+- Return the whole draft, not a patch. Title, description, claims and marketing copy \
+all come back, with the untouched parts unchanged.
+- Prefer deletion to invention. If a phrase asserts something the record does not \
+support, the fix is almost always to remove that phrase or narrow it to what the \
+record does say -- not to find a different unsupported thing to say instead. A \
+title that says less and is true is a good title.
+- A value the record does not contain must not reappear anywhere, in any form. \
+Rewriting "5-45 lb" as "5 to 45 lb" or "up to 45 lb from 5" is the same claim in \
+different words, and will be refused again.
+- An uncited claim is repaired by citing the observation that supports it, or by \
+deleting the sentence. Do not attach a citation that does not actually support what \
+the sentence says -- that is a worse failure than the one you were asked to fix.
+- If the only honest repair is to say less, say less. A shorter accurate listing \
+beats a longer one that gets refused again.
+
+Call the draft_listing tool exactly once, with the repaired draft."""
+
+
+def repair_stage(
+    previous_title: str,
+    previous_description: str,
+    previous_claims: str,
+    previous_marketing: str,
+    problems: str,
+    aspects: str,
+    observations: str,
+    condition: str,
+    max_output_tokens: int = 2000,
+) -> StageRequest:
+    """Build a targeted repair request for a draft the review refused.
+
+    The previous draft is given back verbatim alongside the exact complaints, so
+    the model is editing rather than starting over. That is the difference the
+    operator asked for: an unsupported claim must never reach a stored draft, but
+    one bad phrase should not discard copy that was fine.
+
+    The record is included again because a repair still has to be checkable
+    against it -- the reviewer runs unchanged on the result, and a repair that
+    invents a *new* unsupported claim is refused exactly as the first draft was.
+    """
+    from resell.reasoning.tools import DRAFT_TOOL_NAME, DRAFT_TOOL_SCHEMA
+
+    instruction = (
+        f"The review refused this draft for these reasons:\n\n{problems}\n\n"
+        f"--- the draft, to repair ---\n\n"
+        f"TITLE:\n{previous_title}\n\n"
+        f"DESCRIPTION:\n{previous_description}\n\n"
+        f"CLAIMS AND THEIR CITATIONS:\n{previous_claims or '(none)'}\n\n"
+        f"MARKETING COPY:\n{previous_marketing or '(none)'}\n\n"
+        f"--- the record, unchanged ---\n\n"
+        f"Resolved aspects:\n\n{aspects or '(none)'}\n\n"
+        f"Item condition: {condition or '(not set)'}\n\n"
+        f"Recorded observations:\n\n{observations}\n\n"
+        "Repair only what was named. Return the rest unchanged."
+    )
+    return StageRequest(
+        system_prompt=REPAIR_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=DRAFT_TOOL_NAME,
+            description=DRAFT_TOOL_SCHEMA["description"],
+            json_schema=DRAFT_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
 EXTRACT_SYSTEM_PROMPT = """You are reading one web page and listing what it says about \
 the product it describes. You are not identifying anything and not judging anything: \
 another stage decides whether this product is the item on the table, and it needs a \
@@ -639,6 +777,209 @@ def extraction_stage(
             name=EXTRACT_TOOL_NAME,
             description=EXTRACT_TOOL_SCHEMA["description"],
             json_schema=EXTRACT_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
+# --- comp research -----------------------------------------------------------
+
+COMP_PLAN_SYSTEM_PROMPT = """You are deciding what to search for in order to learn what \
+a second-hand item sells for. You are planning searches, not pricing anything: \
+nothing you write here sets or suggests a price, and a later stage decides the number \
+from the evidence you help gather.
+
+Rules:
+
+- Search for the object, not for a price you have in mind. "Beats Pill A3211 sold" is \
+a search. "Beats Pill cheap" is a way to find the answer you expected.
+- Every search cites the observations that motivate it. A query with nothing behind \
+it is browsing.
+- Prefer realised sales. What somebody paid is worth far more than what somebody is \
+asking, and `seeking: sold` says which you are after. Ask for both where the item is \
+uncommon and sales will be thin.
+- Search at the level the identification supports. If the exact product was never \
+resolved, searching for an exact model number will either find nothing or find \
+something that is not this item; search the family instead.
+- Vary the wording across lookups rather than repeating one phrasing. Sellers describe \
+the same object differently, and one phrasing finds one seller's vocabulary.
+- Say when enough has been gathered. If the comps already recorded cover the range, \
+set `sufficient` and return no lookups.
+
+Call the plan_comp_research tool exactly once."""
+
+
+COMP_EXTRACT_SYSTEM_PROMPT = """You are reading one marketplace page and listing the \
+individual listings it shows. You are not deciding whether any of them is comparable \
+to anything, and you are not pricing anything.
+
+Rules:
+
+- Every listing quotes the page, and the quotation must contain that listing's price. \
+Put the page's own words in `excerpt`. A listing whose price is not in its quotation \
+is discarded.
+- `sold` only where the page says so. "Sold", "Sold for", a sale date, an ended \
+auction with a winning bid. A price on an open offer is `asking`, however likely it \
+looks to sell. This distinction is the most consequential thing you report: a sample \
+of asking prices recorded as sales reads as a firm market that does not exist.
+- Postage is separate from price, and omitting it is not the same as zero. If the page \
+does not state postage, leave `shipping_cents` out entirely rather than writing 0.
+- Condition wording is the seller's, transcribed verbatim into `condition_text`. Do \
+not translate it, tidy it or judge it.
+- One entry per listing. A page showing twelve results is twelve entries.
+- Do not invent fields. No id shown means no `external_id`; no date shown means no \
+`sale_date`.
+- A page with no listings on it yields an empty array, which is a correct answer.
+
+Call the extract_comps tool exactly once."""
+
+
+COMP_JUDGE_SYSTEM_PROMPT = """You are judging how comparable each retrieved listing is \
+to one second-hand item. You are not pricing anything and you are not choosing which \
+comps to keep: every judgement you make is recorded, including the ones that rule a \
+listing out.
+
+Rules:
+
+- Cite both sides. Which observation of the item corresponds to which field of the \
+listing. A judgement citing only the listing is a description of a web page.
+- Choose the rung honestly.
+  `same_product` -- the identical product. Only available when the item's identity \
+was actually resolved; if it was not, this claim is refused downstream and your \
+judgement is discarded with it.
+  `same_family_variant` -- same product line, different variant, colour or year.
+  `category_attribute` -- the same kind of thing with comparable attributes.
+  `superficial` -- it merely resembles it. Retained, contributes nothing.
+  `excluded` -- must not count at all. Say why: a bundle, a broken unit sold for \
+parts, a wholesale lot, an obvious misdescription.
+- Resemblance is not sameness. Mass-produced goods have many near-twins, and the \
+differences that matter -- generation, colourway, capacity -- are often invisible in a \
+listing photograph. When in doubt, drop a rung.
+- A listing in a different condition is still comparable. Condition is recorded \
+separately and the pricing layer stratifies by it; do not exclude a listing for being \
+worn, and do not silently treat it as equivalent either.
+- Ruling everything out is a valid answer. So is ruling nothing out. Judge each \
+listing on what it is.
+
+Call the judge_comps tool exactly once."""
+
+
+def comp_planning_stage(
+    identification: str,
+    observations: str,
+    identity_resolution: str,
+    existing_comps: str,
+    prior_lookups: str,
+    max_output_tokens: int = 2000,
+) -> StageRequest:
+    """Build the comp search planning request.
+
+    `identity_resolution` is stated rather than implied: it caps the comparability
+    ladder downstream, so a planner that does not know identity was never resolved
+    will propose exact-model searches whose results cannot legally be claimed as
+    `same_product` anyway.
+    """
+    from resell.reasoning.tools import COMP_PLAN_TOOL_NAME, COMP_PLAN_TOOL_SCHEMA
+
+    instruction = (
+        f"The item, as currently identified:\n\n{identification}\n\n"
+        f"Identity resolution: {identity_resolution}\n\n"
+        f"Recorded observations:\n\n{observations}\n\n"
+        f"Comps already recorded for this item:\n\n{existing_comps or '(none)'}\n\n"
+        f"Searches already performed:\n\n{prior_lookups or '(none)'}\n\n"
+        "Decide what to search for to establish what this sells for."
+    )
+    return StageRequest(
+        system_prompt=COMP_PLAN_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=COMP_PLAN_TOOL_NAME,
+            description=COMP_PLAN_TOOL_SCHEMA["description"],
+            json_schema=COMP_PLAN_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
+def comp_extraction_stage(
+    page_text: str,
+    url: str,
+    query: str,
+    seeking: str,
+    max_output_tokens: int = 4000,
+    max_page_chars: int = MAX_PAGE_CHARS,
+) -> StageRequest:
+    """Build the listing-extraction request for one fetched marketplace page.
+
+    `seeking` is passed as context, not as an instruction to find it. A search
+    intended to turn up sales does not make the listings on the page sold, and the
+    prompt says so -- telling the extractor what we were hoping for is precisely
+    how a page of open offers becomes a page of recorded sales.
+    """
+    from resell.reasoning.tools import COMP_EXTRACT_TOOL_NAME, COMP_EXTRACT_TOOL_SCHEMA
+
+    body = page_body_for_extraction(page_text, max_page_chars)
+    truncated = len(page_text) > max_page_chars
+    instruction = (
+        f"Page URL: {url}\n"
+        f"Retrieved by searching: {query}\n"
+        f"That search was looking for {seeking} prices, which tells you nothing "
+        f"about what this page actually shows. Report what is on it.\n\n"
+        f"Page text{' (truncated)' if truncated else ''}:\n\n{body}\n\n"
+    )
+    if truncated:
+        instruction += (
+            f"The text above is the first {max_page_chars} characters of "
+            f"{len(page_text)}. Quote only from what you were given.\n\n"
+        )
+    instruction += "List the listings this page shows."
+    return StageRequest(
+        system_prompt=COMP_EXTRACT_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=COMP_EXTRACT_TOOL_NAME,
+            description=COMP_EXTRACT_TOOL_SCHEMA["description"],
+            json_schema=COMP_EXTRACT_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
+def comp_judging_stage(
+    identification: str,
+    observations: str,
+    comps: str,
+    identity_ceiling: str,
+    max_output_tokens: int = 4000,
+) -> StageRequest:
+    """Build the comparability judging request.
+
+    The ceiling is stated so a refusal downstream is not a surprise, but stating it
+    is not what enforces it: `record_comp_claim` checks every claim against the
+    item's stored identity resolution, so a `same_product` judgement on an
+    unresolved item is refused whatever this prompt said.
+    """
+    from resell.reasoning.tools import COMP_JUDGE_TOOL_NAME, COMP_JUDGE_TOOL_SCHEMA
+
+    instruction = (
+        f"The item, as currently identified:\n\n{identification}\n\n"
+        f"Observations of the item:\n\n{observations}\n\n"
+        f"Retrieved listings:\n\n{comps}\n\n"
+        f"The strongest rung available for this item is {identity_ceiling}, because "
+        f"of how far its identity was resolved. A stronger claim will be refused "
+        f"when it is recorded.\n\n"
+        "Judge each listing."
+    )
+    return StageRequest(
+        system_prompt=COMP_JUDGE_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=COMP_JUDGE_TOOL_NAME,
+            description=COMP_JUDGE_TOOL_SCHEMA["description"],
+            json_schema=COMP_JUDGE_TOOL_SCHEMA["input_schema"],
         ),
         max_tokens=max_output_tokens,
     )

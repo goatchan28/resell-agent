@@ -1,158 +1,169 @@
-/* Plain CSS, no build step, no framework. This is a single-operator tool on
-   localhost; a toolchain would cost more than it returns. */
+/* Plain CSS, no build step. Two screens, so it stays short. */
 
 :root {
-  --ink: #1c1c1e;
-  --muted: #6b6b70;
-  --line: #d8d8dc;
-  --bg: #fbfbfa;
-  --panel: #fff;
-  --warn: #8a4b00;
-  --warn-bg: #fff4e2;
-  --ok: #1f6b3a;
-  --ok-bg: #eaf6ee;
-  --err: #8a1c1c;
-  --err-bg: #fdecec;
-  --link: #0b4f9c;
+  --ink: #1c1c1e; --muted: #6b6b70; --line: #dcdcdf; --bg: #f7f7f5;
+  --panel: #fff; --warn: #8a4b00; --warn-bg: #fff4e2;
+  --ok: #1f6b3a; --ok-bg: #eaf6ee; --err: #8a1c1c; --err-bg: #fdecec;
+  --ask: #0b4f9c; --ask-bg: #e8f1fb;
 }
-
 * { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+       font: 15px/1.55 ui-sans-serif, -apple-system, "Helvetica Neue", sans-serif; }
+a { color: var(--ask); }
+code, pre, .n { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+pre { white-space: pre-wrap; margin: .5rem 0 0; font-size: .85em; color: var(--muted); }
 
-body {
-  margin: 0;
-  font: 15px/1.5 ui-sans-serif, -apple-system, "Helvetica Neue", sans-serif;
-  color: var(--ink);
-  background: var(--bg);
-}
-
-code, pre, .n, table td.n { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
-code { font-size: 0.88em; background: #f0f0ee; padding: 1px 4px; border-radius: 3px; }
-pre { white-space: pre-wrap; margin: 0; font-size: 0.88em; }
-
-a { color: var(--link); }
-
-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 1rem;
-  padding: 0.6rem 1.5rem;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
-}
-header nav a { margin-right: 1rem; font-weight: 600; text-decoration: none; }
-
-/* Which environment is open is never a detail: sandbox and production are two
-   databases with two sets of real listings. */
-.env { font: 600 12px/1 ui-monospace, monospace; padding: 4px 8px; border-radius: 3px; }
-.env-sandbox { background: var(--ok-bg); color: var(--ok); }
+header { display: flex; justify-content: space-between; align-items: center;
+         padding: .7rem 1.5rem; background: var(--panel); border-bottom: 1px solid var(--line); }
+header nav a { margin-right: 1.2rem; font-weight: 600; text-decoration: none; }
+.env { font: 600 11px/1 ui-monospace, monospace; padding: 4px 8px; border-radius: 3px;
+       background: var(--ok-bg); color: var(--ok); }
 .env-production { background: var(--err-bg); color: var(--err); }
 
-main { max-width: 1180px; margin: 0 auto; padding: 1.5rem; }
+main { max-width: 940px; margin: 0 auto; padding: 1.5rem; }
+h1 { font-size: 1.3rem; margin: 0 0 1rem; }
+h3 { font-size: .95rem; margin: 2rem 0 .5rem; color: var(--muted); }
 
-h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
-h2 { font-size: 1.05rem; margin: 1.75rem 0 0.5rem; padding-bottom: 0.25rem;
-     border-bottom: 1px solid var(--line); }
-h3 { font-size: 0.95rem; margin: 1rem 0 0.35rem; }
-.subtitle { margin: 0 0 0.75rem; color: var(--muted); }
+/* --- the card, which is the whole product ------------------------------- */
+.card { display: flex; gap: 1.2rem; background: var(--panel); border: 1px solid var(--line);
+        border-radius: 8px; padding: 1.1rem; margin-bottom: 1rem; }
+.shot img, .shot-empty { width: 132px; height: 132px; object-fit: cover; border-radius: 6px;
+                         border: 1px solid var(--line); background: var(--bg); }
+.shot-empty { display: grid; place-items: center; color: var(--muted); font-size: .8rem; }
+.body { flex: 1; min-width: 0; }
+.card h2 { font-size: 1.05rem; margin: 0 0 .15rem; }
+.card h2 a { text-decoration: none; color: var(--ink); }
+.meta, .tiny { color: var(--muted); font-size: .82rem; }
+.meta { margin: 0 0 .6rem; }
+.ask { font-size: 1.05rem; font-weight: 600; margin: 0; }
+.why { color: var(--muted); font-size: .87rem; margin: .2rem 0 0; }
+.q { font-weight: 600; margin: 0 0 .5rem; }
 
-.tabs { display: flex; gap: 0.25rem; flex-wrap: wrap; margin: 0.75rem 0 0; }
-.tabs a {
-  padding: 0.35rem 0.7rem; text-decoration: none; border: 1px solid var(--line);
-  border-radius: 4px; background: var(--panel);
-}
-.tabs a.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+.decision { margin-top: .8rem; padding-top: .8rem; border-top: 1px solid var(--line); }
+.choices { display: flex; gap: .5rem; flex-wrap: wrap; align-items: start; margin-top: .6rem; }
+.choices form { display: flex; gap: .4rem; }
 
-.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
-@media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+input, button, select { font: inherit; padding: .45rem .6rem; border: 1px solid var(--line);
+                        border-radius: 5px; background: #fff; color: var(--ink); }
+input[type=text], input[type=number] { min-width: 11rem; }
+button { cursor: pointer; font-weight: 600; }
+button.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
+button.secondary { background: var(--panel); }
+/* Deliberately recessive. Setting an item aside is reversible and low-stakes, but
+   it sits next to the button an operator presses repeatedly, so it should not
+   read as the obvious thing to hit. */
+button.quiet-action { background: transparent; border-color: transparent;
+                      color: var(--muted); font-size: .82rem; padding: .3rem .5rem; }
+button.quiet-action:hover { color: var(--ink); border-color: var(--line); }
+.row-actions { display: flex; gap: .4rem; align-items: center; justify-self: end; }
+button .tiny { display: block; font-weight: 400; color: inherit; opacity: .72; }
+label.tiny { display: inline-flex; gap: .3rem; align-items: center; }
 
-table { width: 100%; border-collapse: collapse; margin: 0.5rem 0; }
-th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line);
+/* --- comparables -------------------------------------------------------- */
+.comp { border-top: 1px solid var(--line); }
+.comp-head { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
+.comp-head strong { font-size: 1.1rem; }
+.comp-title { margin: .2rem 0 0; font-size: .9rem; }
+.kind { font: 600 10px/1.6 ui-monospace, monospace; padding: 1px 6px; border-radius: 3px;
+        text-transform: uppercase; background: var(--line); }
+.kind-realized { background: var(--ok-bg); color: var(--ok); }
+.kind-asking { background: var(--warn-bg); color: var(--warn); }
+.band { font-size: 1.25rem; font-weight: 600; margin: 0; }
+.draft-title { font-weight: 600; margin: 0; }
+
+/* --- lists and the table ------------------------------------------------ */
+.row { display: grid; grid-template-columns: 6rem 1fr 12rem auto; gap: .8rem;
+       align-items: center; padding: .4rem 0; border-bottom: 1px solid var(--line); }
+.intake { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+          padding: 1.1rem; margin-top: 2rem; }
+.intake form { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+.empty { color: var(--muted); font-style: italic; padding: 2rem 0; text-align: center; }
+.quiet { color: var(--muted); }
+
+table { width: 100%; border-collapse: collapse; background: var(--panel);
+        table-layout: fixed; font-size: .88rem; }
+/* Fixed layout, so a long title cannot squeeze every number into one character
+   per line -- which is what auto layout did to the inventory table. The numeric
+   columns are given room explicitly: adding the processing-cost column pushed
+   them into each other, and money columns that touch are unreadable. */
+table { min-width: 62rem; }
+table th:nth-child(1) { width: 5.5rem; }   /* sku */
+table th:nth-child(2) { width: auto; }     /* title takes what is left */
+table th:nth-child(3) { width: 5.5rem; }   /* state */
+table th:nth-child(4) { width: 5rem; }     /* waiting on */
+table th:nth-child(5) { width: 9rem; }     /* next */
+table th:nth-child(n+6):nth-child(-n+9) { width: 5.5rem; }  /* the money columns */
+table th:nth-child(10), table th:nth-child(11) { width: 3.5rem; }
+td:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+td.n { white-space: nowrap; }
+main:has(table) { max-width: 100%; }
+th, td { text-align: left; padding: 6px 9px; border-bottom: 1px solid var(--line);
          vertical-align: top; }
-thead th { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em;
-           color: var(--muted); border-bottom: 1px solid var(--ink); }
+thead th { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em;
+           color: var(--muted); }
 td.n, th.n { text-align: right; }
-tbody tr.default { background: var(--ok-bg); }
-table.kv th { width: 34%; font-weight: 600; }
-table.aspects tr.status-missing { background: var(--warn-bg); }
+td.neg { color: var(--err); }
 
-dl { margin: 0.5rem 0; display: grid; grid-template-columns: max-content 1fr;
-     gap: 2px 1rem; }
-dl.wide { grid-template-columns: 14rem 1fr; }
-dt { color: var(--muted); }
-dd { margin: 0; }
-
-.muted, .why, figcaption .muted { color: var(--muted); font-size: 0.9em; }
-.count, .filters { color: var(--muted); font-size: 0.9em; }
-.empty { color: var(--muted); font-style: italic; }
-.summary { font-size: 1.05rem; }
-.note, .flags { background: var(--panel); border-left: 3px solid var(--line);
-                padding: 0.4rem 0.7rem; margin: 0.4rem 0; }
-
-.warn, .ok, .warn-inline {
-  padding: 0.5rem 0.7rem; border-radius: 4px; margin: 0.5rem 0;
-}
-.warn { background: var(--warn-bg); color: var(--warn); }
-.ok { background: var(--ok-bg); color: var(--ok); }
-.warn-inline { display: inline-block; padding: 0 4px; background: var(--warn-bg);
-               color: var(--warn); font-size: 0.85em; }
-.resolved { background: var(--ok-bg); color: var(--ok); padding: 0.5rem 0.7rem;
-            border-radius: 4px; }
-
-.flashes { list-style: none; padding: 0; margin: 0 0 1rem; }
-.flash { padding: 0.5rem 0.8rem; border-radius: 4px; margin-bottom: 3px; }
-.flash-ok { background: var(--ok-bg); color: var(--ok); }
-.flash-error { background: var(--err-bg); color: var(--err); font-weight: 600; }
-/* The gateway's individual reasons, indented under their refusal. They are the
-   most useful output the system produces; they do not get collapsed. */
-.flash-reason { background: var(--err-bg); color: var(--err); margin-left: 1.5rem;
-                font-size: 0.92em; }
-
-.badge {
-  display: inline-block; font: 600 11px/1.6 ui-monospace, monospace;
-  padding: 0 6px; border-radius: 3px; background: var(--line); color: var(--ink);
-  text-decoration: none;
-}
-.badge.blocking { background: var(--warn-bg); color: var(--warn); }
-.req { font: 600 11px/1.6 ui-monospace, monospace; color: var(--warn); }
-
-.state { font: 600 11px/1.6 ui-monospace, monospace; padding: 1px 6px;
-         border-radius: 3px; background: var(--line); }
+.state, .actor, .badge { font: 600 10px/1.7 ui-monospace, monospace; padding: 1px 6px;
+                         border-radius: 3px; background: var(--line); }
 .state-listed { background: var(--ok-bg); color: var(--ok); }
 .state-needs_info, .state-publish_failed { background: var(--warn-bg); color: var(--warn); }
 .state-abandoned { background: #eee; color: var(--muted); }
+.actor-operator { background: var(--ask-bg); color: var(--ask); }
+.actor-agent { background: var(--warn-bg); color: var(--warn); }
+.actor-nobody { background: #eee; color: var(--muted); }
 
-.thumbs { display: flex; gap: 0.75rem; flex-wrap: wrap; }
-.thumbs figure { margin: 0; width: 150px; }
-.thumbs img { width: 150px; height: 150px; object-fit: cover; border-radius: 4px;
-              border: 1px solid var(--line); background: var(--panel); }
-.thumbs figcaption { font-size: 0.78rem; word-break: break-all; }
+.flashes { list-style: none; padding: 0; margin: 0 0 1rem; }
+.flash { padding: .5rem .8rem; border-radius: 5px; margin-bottom: 3px; font-size: .9rem; }
+.flash-ok { background: var(--ok-bg); color: var(--ok); }
+.flash-ask { background: var(--ask-bg); color: var(--ask); font-weight: 600; }
+.flash-error { background: var(--err-bg); color: var(--err); font-weight: 600; }
+.flash-reason { background: var(--err-bg); color: var(--err); margin-left: 1.4rem; }
 
-form.stack { display: grid; gap: 0.5rem; max-width: 30rem;
-             background: var(--panel); padding: 1rem; border: 1px solid var(--line);
-             border-radius: 5px; }
-form.inline { display: flex; gap: 0.6rem; align-items: end; margin: 0.75rem 0; }
-form.inline.wrap { flex-wrap: wrap; }
-label { display: grid; gap: 2px; font-size: 0.85rem; color: var(--muted); }
-input, select, button { font: inherit; padding: 5px 7px; border: 1px solid var(--line);
-                        border-radius: 4px; background: #fff; color: var(--ink); }
-button { background: var(--ink); color: #fff; border-color: var(--ink);
-         cursor: pointer; font-weight: 600; }
-label.override { display: flex; gap: 0.4rem; align-items: center; }
-label.override input { width: auto; }
+/* --- correcting the record ------------------------------------------------ */
+.fix { margin-top: .9rem; padding-top: .7rem; border-top: 1px solid var(--line); }
+.fix summary { cursor: pointer; color: var(--muted); font-size: .87rem; }
+.fix[open] summary { margin-bottom: .7rem; }
+.fix-problem { color: var(--warn); font-weight: 600; }
+.fix form { display: grid; gap: .7rem; max-width: 34rem; }
+.fix-field { display: grid; gap: .2rem; }
+.fix-field > span:first-child { font-size: .8rem; color: var(--muted); }
+.fix-field input, .fix-field select, .fix-field textarea { width: 100%; min-width: 0; }
+.fix-field textarea { font: inherit; padding: .45rem .6rem; border: 1px solid var(--line);
+                      border-radius: 5px; resize: vertical; }
+.fix-field.wrong input, .fix-field.wrong select { border-color: var(--warn); }
+.fix-why { font-size: .8rem; color: var(--warn); }
+.fix button { justify-self: start; }
 
-.question { background: var(--panel); border: 1px solid var(--line);
-            border-radius: 5px; padding: 0.9rem 1.1rem; margin-bottom: 0.75rem; }
-.question.blocking { border-left: 4px solid var(--warn); }
-.question h3 { margin-top: 0; }
-form.answer { display: flex; gap: 0.75rem; align-items: end; flex-wrap: wrap;
-              margin-top: 0.6rem; }
-form.answer input[type=text] { min-width: 20rem; }
-.allowed { flex-basis: 100%; margin: 0; font-size: 0.85em; color: var(--muted); }
-ul.questions { padding-left: 1.1rem; }
+.decision textarea { width: 100%; max-width: 34rem; font: inherit; padding: .5rem .6rem;
+                     border: 1px solid var(--line); border-radius: 5px; resize: vertical;
+                     display: block; margin-bottom: .6rem; }
 
-.draft { background: var(--panel); border: 1px solid var(--line);
-         border-radius: 5px; padding: 1rem; }
-.draft-title { font-weight: 600; font-size: 1.05rem; margin: 0 0 0.25rem; }
-td.values details summary { cursor: pointer; color: var(--link); }
-td.values { max-width: 26rem; font-size: 0.85em; }
+/* A gap in the tool, said plainly. Distinct from a decision the operator owns:
+   pasting links is a stopgap, and dressing it up as a feature would make the
+   missing search backend invisible. */
+.limitation { background: var(--warn-bg); color: var(--warn); font-size: .85rem;
+              padding: .5rem .7rem; border-radius: 5px; margin: 0 0 .6rem; }
+
+/* --- a run in flight ------------------------------------------------------ */
+/* Pressing Run used to leave the page unchanged for as long as two minutes. The
+   point of everything below is that the click is visible in the same frame. */
+.run { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+       padding: .8rem 1rem; margin-bottom: 1.2rem; }
+.run-line { display: flex; align-items: center; gap: .6rem; margin: 0; }
+.run-spinner { width: .7rem; height: .7rem; border-radius: 50%;
+               border: 2px solid var(--line); border-top-color: var(--muted);
+               animation: run-spin 0.8s linear infinite; flex: none; }
+.run-done .run-spinner, .run-failed .run-spinner { animation: none;
+               border-top-color: var(--line); }
+.run-failed { border-color: #c0392b; }
+.run-problems { margin: .5rem 0 0 1.2rem; color: var(--muted); }
+@keyframes run-spin { to { transform: rotate(360deg); } }
+/* Respect a stated preference for less motion; the text still updates. */
+@media (prefers-reduced-motion: reduce) { .run-spinner { animation: none; } }
+button[disabled] { opacity: .55; cursor: progress; }
+
+/* A question about an aspect eBay has values for. The list has to be visible --
+   a datalist only appears once you already know what to type, which is exactly
+   what the operator did not know. */
+.aspect-choice { max-width: 22rem; margin-right: .4rem; }

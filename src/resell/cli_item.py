@@ -15,7 +15,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from resell import db, views
+from resell import db, store_pricing as sp, views
 from resell.config import load_config
 from resell.domain import (
     FeeBasis,
@@ -293,7 +293,13 @@ def cmd_item_propose(args: argparse.Namespace) -> int:
         category_id=args.category or identification["category_id"] or "",
         condition_id=args.condition or identification["condition_id"] or "",
         aspects=json.loads(identification["aspects"]) if identification["aspects"] else {},
-        price_cents=args.price_cents,
+        # `--price-cents` is documented as defaulting to the approved price, and
+        # did not: None went through to a `<=` comparison and raised a TypeError
+        # instead of the refusal the operator should have seen.
+        price_cents=(
+            args.price_cents if args.price_cents is not None
+            else sp.approved_price_cents(conn, args.sku)
+        ),
         currency="USD",
         shipping_terms=ShippingTerms(args.shipping_terms),
         seller_shipping_cost_cents=args.seller_shipping_cents,
@@ -1106,10 +1112,30 @@ def _apply_mapping(conn, gateway, sku: str, outcome, required: set[str],
         (Resolution.RESOLVED, Resolution.RESOLVED_BY_OPERATOR,
          Resolution.RESOLVED_UNVERIFIED)
     }
+    # What the operator has already answered, laid over the model's proposal.
+    #
+    # An answer recorded an `aspect_candidate` and nothing ever promoted it, so
+    # `resolved` was built from the model's view alone: the operator supplied
+    # Model, publishing still refused for want of Model, and the next mapping run
+    # asked again. MP-000016 answered the same two questions three times.
+    #
+    # The operator wins where they have spoken. That is the hierarchy the whole
+    # design rests on -- `basis='operator'` is what adjudicates a contradiction --
+    # and it is the reason the overlay is applied after the model's, not before.
+    answered = operator_answers(conn, sku)
+    resolved.update(answered)
     # The category is stored alongside the aspects it produced. Aspects without the
     # category whose form defines them are uninterpretable.
+    #
+    # Brand and Model are copied into their own columns as well. They were left in
+    # the aspects blob only, which meant `identification.brand` stayed NULL on an
+    # item whose brand was resolved and cited -- so identification research, which
+    # looks for a brand-and-line pair to search on, skipped items it should have
+    # pursued. Nothing new is asserted: these are the same resolved values, in the
+    # column that reads them.
+    columns = _brand_and_model_from(resolved)
     fields, carried = merged_identification(
-        conn, sku, aspects=resolved or None, category_id=category_id
+        conn, sku, aspects=resolved or None, category_id=category_id, **columns
     )
     try:
         gateway.propose_identification(sku, **fields)
@@ -1135,6 +1161,10 @@ def _apply_mapping(conn, gateway, sku: str, outcome, required: set[str],
     for gap in outcome.gaps:
         if not gap.blocking:
             continue
+        if gap.aspect_name in answered:
+            # Already supplied. Asking a third time about something the operator
+            # answered twice is how a prompt stops being read.
+            continue
         try:
             accepted = gateway.ask_operator(
                 sku, question=gap.question,
@@ -1157,6 +1187,26 @@ def _apply_mapping(conn, gateway, sku: str, outcome, required: set[str],
         print(f"  {aspect_name}: still waiting on question {question_id}, "
               f"asked earlier and not answered")
     return 0
+
+
+def _brand_and_model_from(resolved: dict[str, list]) -> dict[str, str]:
+    """Brand and model from the aspects the mapper resolved, where it found them.
+
+    eBay names these differently by category -- Model, Model Number, Product Line,
+    Series -- so several names map onto one column. First match wins, in the order
+    listed, because the more specific name is the more useful value.
+    """
+    out: dict[str, str] = {}
+    for column, names in (
+        ("brand", ("Brand", "Brand Name", "Manufacturer")),
+        ("model", ("Model", "Model Number", "Product Line", "Series")),
+    ):
+        for name in names:
+            values = [str(v).strip() for v in (resolved.get(name) or []) if str(v).strip()]
+            if values:
+                out[column] = values[0]
+                break
+    return out
 
 
 def cmd_item_aspects(args: argparse.Namespace) -> int:
@@ -1595,6 +1645,80 @@ def cmd_item_show(args: argparse.Namespace) -> int:
             flag = "" if row.send_to_model else "  [withheld from model]"
             print(f"    {row.kind} from {row.source}{flag}")
     return 0
+
+
+def cmd_item_cost(args: argparse.Namespace) -> int:
+    """What one item cost to process, stage by stage.
+
+    Reads the model_call ledger, which has recorded every paid call since the
+    vision stage landed. Nothing new is measured here -- this is the same rows the
+    budget guard reads, grouped by stage instead of filtered to one.
+    """
+    from resell.reasoning.ledger import (
+        UNPRICED_WORK, lookup_costs, stage_costs, total_cost_micros,
+        unpriced_call_count,
+    )
+
+    _, conn, _ = _open()
+    try:
+        get_item(conn, args.sku)
+    except Rejected as exc:
+        return _rejected(exc)
+
+    rows = stage_costs(conn, args.sku)
+    lookups = lookup_costs(conn, args.sku)
+    total = total_cost_micros(conn, args.sku)
+    estimated = unpriced_call_count(conn, args.sku)
+
+    if not rows and not lookups:
+        print(f"\n{args.sku}: no model calls or lookups recorded")
+        return 0
+
+    searches = sum(row["lookups"] for row in lookups)
+    print(f"\n{args.sku}: {_dollars(total)} across "
+          f"{sum(r['calls'] for r in rows)} model call(s)"
+          + (f" and {searches} search(es)" if searches else "") + "\n")
+    print(f"  {'stage':<42} {'cost':>9} {'calls':>6} {'in':>8} {'out':>7}")
+    for row in rows:
+        print(f"  {row['label']:<42} {_dollars(row['micros']):>9} "
+              f"{row['calls']:>6} {row['input_tokens']:>8} {row['output_tokens']:>7}")
+    # Retrieval, priced per request rather than per token, so it gets its own
+    # rows rather than columns that would be blank.
+    for row in lookups:
+        label = f"searching ({row['scope']}, {row['provider']})"
+        unpriced = f"  {row['unpriced']} unpriced" if row["unpriced"] else ""
+        print(f"  {label:<42} {_dollars(row['micros']):>9} "
+              f"{row['lookups']:>6} {'':>8} {'':>7}{unpriced}")
+    print(f"  {'':<42} {_dollars(total):>9}")
+
+    bases = {b for row in rows for b in row["bases"].split(",") if b}
+    models = {m for row in rows for m in row["models"].split(",") if m}
+    print(f"\n  models: {', '.join(sorted(models))}")
+    print(f"  rate basis: {', '.join(sorted(bases))}")
+    if "provisional_estimate" in bases:
+        print("  WARNING: some rows were priced with placeholder rates, which are "
+              "not a\n           price list. Those figures are indicative only.")
+    if estimated:
+        print(f"  {estimated} call(s) had no recorded cost, so the pre-call estimate "
+              f"was charged")
+    for note in UNPRICED_WORK:
+        print(f"  note: {note}")
+    if args.calls:
+        print(f"\n  {'when':<21} {'stage':<18} {'status':<15} {'cost':>9}")
+        for row in conn.execute(
+            "SELECT called_at, purpose, status, cost_micros, estimated_cost_micros "
+            "FROM model_call WHERE sku = ? ORDER BY id", (args.sku,),
+        ):
+            charged = row["cost_micros"]
+            mark = "" if charged is not None else "~"
+            figure = charged if charged is not None else (row["estimated_cost_micros"] or 0)
+            print(f"  {row['called_at'][:19]:<21} {row['purpose']:<18} "
+                  f"{row['status']:<15} {mark + _dollars(figure):>9}")
+    return 0
+
+
+def _dollars(micros: int | None) -> str:
+    return "-" if micros is None else f"${(micros or 0) / 1_000_000:.4f}"
 
 
 def cmd_item_verify_safeguards(args: argparse.Namespace) -> int:
@@ -2043,6 +2167,12 @@ def register(subparsers) -> None:
     questions.add_argument("--blocking", action="store_true", help="blocking only")
     questions.set_defaults(func=cmd_item_questions)
 
+    cost = sub.add_parser("cost", help="what this item cost to process, by stage")
+    cost.add_argument("sku")
+    cost.add_argument("--calls", action="store_true",
+                      help="every call, in order, rather than the stage totals")
+    cost.set_defaults(func=cmd_item_cost)
+
     show = sub.add_parser("show", help="full item state")
     show.add_argument("sku")
     show.set_defaults(func=cmd_item_show)
@@ -2052,3 +2182,20 @@ def register(subparsers) -> None:
         help="attempt forbidden operations against a throwaway fixture; all must be refused",
     )
     verify.set_defaults(func=cmd_item_verify_safeguards)
+
+
+def operator_answers(conn, sku: str) -> dict[str, list[str]]:
+    """Aspect values the operator has answered a question with.
+
+    The latest answer per aspect wins: an operator who answered Model twice meant
+    the second one, and the first is still on the record as evidence.
+    """
+    values: dict[str, list[str]] = {}
+    for row in conn.execute(
+        "SELECT aspect_name, answer FROM open_question "
+        "WHERE sku = ? AND aspect_name IS NOT NULL AND answer IS NOT NULL "
+        "AND TRIM(answer) != '' ORDER BY id",
+        (sku,),
+    ):
+        values[row["aspect_name"]] = [row["answer"].strip()]
+    return values

@@ -356,10 +356,23 @@ class Publisher:
             )
         }
 
+        # What the item actually knows now, which is not what the frozen proposal
+        # says. `missing` is computed against the listing, so an aspect supplied
+        # after the proposal was made stays missing there for ever -- and asking
+        # about it again produced a question no answer could ever settle.
+        # MP-000016 accumulated twelve of them: six pairs, each answered, each
+        # replaced by a new pair on the next publish attempt.
+        known = self._live_aspects(sku)
+
         opened: list[str] = []
         for name in missing:
             if name in existing:
                 opened.append(f"{name} (already asked)")
+                continue
+            if known.get(name):
+                # The operator has already supplied this. The proposal predates
+                # them, which is a staleness problem and not a question.
+                opened.append(f"{name} (already answered; the proposal predates it)")
                 continue
             spec = next(
                 (s for s in (self._last_schema or ()) if s.name == name), None
@@ -388,6 +401,23 @@ class Publisher:
                 # not hide the others.
                 opened.append(f"{name} (could not ask: {exc.reasons[0]})")
         return opened
+
+    def _live_aspects(self, sku: str) -> dict:
+        """The current identification's aspects. Never raises."""
+        row = self.gateway.conn.execute(
+            "SELECT aspects FROM identification WHERE sku = ? AND superseded_at IS NULL",
+            (sku,),
+        ).fetchone()
+        if row is None or not row["aspects"]:
+            return {}
+        try:
+            values = json.loads(row["aspects"])
+        except (TypeError, ValueError):
+            return {}
+        return {
+            name: vals for name, vals in values.items()
+            if vals and any(str(v).strip() for v in vals)
+        }
 
     def _missing_aspects_message(
         self, listing: sqlite3.Row, missing: list[str], opened: list[str]

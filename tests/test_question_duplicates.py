@@ -276,3 +276,73 @@ def test_a_free_form_answer_settles_nothing_else(tmp_path):
     accepted = gateway.answer_question(first, "yes", operator=True)
     assert accepted.data.get("duplicates_settled") is None
     assert len(open_ids(conn, sku)) == 1
+
+
+# --- an answer has to change something ---------------------------------------------
+
+
+def test_an_answered_aspect_reaches_the_identification(tmp_path):
+    """MP-000016's complaint. Answering recorded an `aspect_candidate` and nothing
+    promoted it, so publishing still refused for want of the aspect the operator
+    had just supplied."""
+    from resell.cli_item import operator_answers
+
+    conn, gateway, sku = fixture(tmp_path)
+    gateway.ask_operator(
+        sku, question="Nothing observed supports a value for Model.",
+        aspect_name="Model",
+    )
+    qid = open_ids(conn, sku)[0]
+    gateway.answer_question(qid, "DJI Osmo Action 5 Pro", operator=True)
+
+    assert operator_answers(conn, sku) == {"Model": ["DJI Osmo Action 5 Pro"]}
+
+
+def test_the_operator_overlays_the_model(tmp_path):
+    """Where the operator has spoken they win. `basis='operator'` is what
+    adjudicates a contradiction, so the overlay is applied after the model's."""
+    import inspect
+
+    from resell import cli_item
+
+    source = inspect.getsource(cli_item._apply_mapping)
+    assert "resolved.update(answered)" in source
+    at_model = source.index("for item in outcome.outcomes")
+    at_operator = source.index("resolved.update(answered)")
+    assert at_model < at_operator
+
+
+def test_the_latest_answer_wins(tmp_path):
+    """An operator who answered Model twice meant the second one. The first stays
+    on the record as evidence."""
+    from resell.cli_item import operator_answers
+
+    conn, gateway, sku = fixture(tmp_path)
+    gateway.ask_operator(sku, question="Model?", aspect_name="Model")
+    gateway.answer_question(open_ids(conn, sku)[0], "DJI Osmo Action", operator=True)
+    gateway.ask_operator(sku, question="Model, more precisely?", aspect_name="Model")
+    remaining = open_ids(conn, sku)
+    if remaining:
+        gateway.answer_question(remaining[0], "DJI Osmo Action 5 Pro", operator=True)
+
+    assert operator_answers(conn, sku)["Model"] == ["DJI Osmo Action 5 Pro"]
+
+
+def test_an_unanswered_question_contributes_nothing(tmp_path):
+    from resell.cli_item import operator_answers
+
+    conn, gateway, sku = fixture(tmp_path)
+    gateway.ask_operator(sku, question="Model?", aspect_name="Model")
+    assert operator_answers(conn, sku) == {}
+
+
+def test_a_question_is_not_asked_again_once_answered(tmp_path):
+    """The third ask is what made this unbearable: the same two questions,
+    answered twice, opened a third time."""
+    import inspect
+
+    from resell import cli_item
+
+    source = inspect.getsource(cli_item._apply_mapping)
+    assert "if gap.aspect_name in answered:" in source
+    assert "Asking a third time" in source

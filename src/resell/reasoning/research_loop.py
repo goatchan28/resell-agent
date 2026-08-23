@@ -293,6 +293,49 @@ def run_round(
         )
         return outcome
 
+    # Proposing no lookups and having every lookup refused are different facts,
+    # and collapsing them wrote "the evidence is already sufficient" onto an item
+    # whose planner had asked for two searches. Nothing is recorded here: no
+    # negative finding, no declared mode, no lookup spent -- the call is in the
+    # ledger with its reasons and re-running is the whole remedy.
+    if plan.proposed_but_unusable and not dry_run:
+        # One repair, with the exact complaint fed back. The planner asked for
+        # well-motivated searches and omitted a field the schema marks required;
+        # naming the omission is far more likely to fix it than re-asking the same
+        # question, and it is the same shape as the drafting repair.
+        outcome.notes.append(
+            f"plan: {plan.dropped_lookups} lookup(s) refused; asking again with the "
+            f"reason"
+        )
+        repair = _with_complaint(request, plan)
+        try:
+            retry_result, _ = _run_stage(
+                conn, sku, model_adapter, repair, purpose="research_plan",
+                budget=stage_budget, spent=_stage_spend(conn, sku, "research_plan"),
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed retry is not a crash
+            outcome.notes.append(f"plan: the retry failed ({exc})")
+        else:
+            retried = parse_plan_tool_input(
+                retry_result.tool_input,
+                valid_evidence_ids={row["id"] for row in observations},
+                already_searched=set(_prior_lookups(conn, sku)),
+            )
+            outcome.notes.extend(f"plan retry: {n}" for n in retried.malformed)
+            if retried.lookups:
+                plan = retried
+                outcome.plan = plan
+
+    if plan.proposed_but_unusable:
+        outcome.stopped = "plan_rejected"
+        outcome.stop_reason = (
+            f"the planner proposed {plan.dropped_lookups} lookup(s) and every one "
+            f"was refused: " + "; ".join(
+                n for n in plan.malformed if n.startswith("lookup ")
+            )[:260]
+        )
+        return outcome
+
     if plan.sufficient or not plan.lookups:
         outcome.stopped = "sufficient"
         outcome.stop_reason = plan.rationale or "the planner proposed no lookups"
@@ -365,12 +408,25 @@ def run_round(
 
     candidates = candidate_evidence(conn, sku)
     if not candidates:
-        outcome.stopped = "searched_not_found"
-        outcome.stop_reason = f"{len(outcome.performed)} lookup(s) returned no candidates"
-        gateway.record_research_negative(
-            sku, summary=outcome.stop_reason,
-            detail={"queries": outcome.performed},
-        )
+        if outcome.performed:
+            outcome.stopped = "searched_not_found"
+            outcome.stop_reason = (
+                f"{len(outcome.performed)} lookup(s) returned no candidates"
+            )
+            gateway.record_research_negative(
+                sku, summary=outcome.stop_reason,
+                detail={"queries": outcome.performed},
+            )
+        else:
+            # Every lookup failed before it ran -- no backend, or the network was
+            # down. "Searched and found nothing" is a fact about the object;
+            # "could not search" is a fact about us, and recording the first when
+            # the second happened would put a claim in evidence nobody made.
+            outcome.stopped = "not_retrieved"
+            outcome.stop_reason = (
+                f"{len(plan.lookups)} lookup(s) were planned and none could be "
+                f"performed; nothing was recorded"
+            )
         return outcome
 
     # --- R3: judge ------------------------------------------------------------
@@ -653,3 +709,23 @@ def _stage_spend(conn, sku, purpose) -> StageSpend:
     from resell.reasoning.vision import spend_so_far
 
     return spend_so_far(conn, sku, purpose)
+
+
+def _with_complaint(request, plan):
+    """The same planning request, with what was wrong with the last one appended.
+
+    Appended rather than rebuilt so the retry is asking the same question under
+    the same rules, differing only in that it now knows why the first answer was
+    thrown away.
+    """
+    from dataclasses import replace
+
+    refused = "; ".join(n for n in plan.malformed if n.startswith("lookup "))[:600]
+    return replace(request, instruction=(
+        f"{request.instruction}\n\n"
+        f"A previous attempt was refused and none of its lookups could be used:\n"
+        f"{refused}\n\n"
+        f"Every lookup must carry `evidence_ids`: the ids of the observations "
+        f"above that motivate it. A lookup without them is discarded whatever its "
+        f"motivation says, so cite them explicitly."
+    ))

@@ -95,3 +95,157 @@ def finalize_call(
             error, call_id,
         ),
     )
+
+
+# --- reading the ledger back -------------------------------------------------
+#
+# `spend_so_far` in vision.py answers "what has this stage cost on this item",
+# which is what the budget guard needs. These answer the operator's question --
+# what did this item cost in total, and where did it go -- from the same rows and
+# the same billable-status rule. One ledger, two readers.
+
+
+STAGE_LABELS: dict[str, str] = {
+    "observe": "looking at the photographs",
+    "condition": "grading the condition",
+    "draft_repair": "repairing the listing copy",
+    "map_aspects": "filling in the item's details",
+    "draft": "writing the listing",
+    "research_plan": "identification research: planning",
+    "research_extract": "identification research: reading pages",
+    "research_match": "identification research: judging matches",
+    "comp_plan": "comp research: planning",
+    "comp_extract": "comp research: reading listings",
+    "comp_judge": "comp research: judging comparables",
+}
+
+# Stages that reach a marketplace API rather than a model. eBay's Taxonomy,
+# Metadata and Inventory calls are free at our volumes and are not ledgered, so
+# naming them here is how the total says what it does not include rather than
+# leaving the operator to assume it covers everything.
+UNPRICED_WORK: tuple[str, ...] = (
+    "choosing a category, reading the aspect form, and reading the condition list "
+    "are eBay API calls, which are free at this volume and are not counted here",
+)
+
+
+def _billable_clause() -> tuple[str, list[str]]:
+    placeholders = ",".join("?" * len(BILLABLE_STATUSES))
+    return placeholders, [str(s) for s in BILLABLE_STATUSES]
+
+
+def stage_costs(conn: sqlite3.Connection, sku: str) -> list[dict]:
+    """Per-stage spend for one item, most expensive first.
+
+    Counts what the provider may have billed for, including calls that failed to
+    parse and calls left `attempted` by a crash, charging the pre-call estimate
+    where the actual is unknown. Same rule as the budget guard, because a cost
+    report that disagrees with the guard is worse than no report.
+    """
+    placeholders, statuses = _billable_clause()
+    rows = conn.execute(
+        f"""
+        SELECT purpose,
+               COUNT(*) AS calls,
+               COALESCE(SUM(COALESCE(cost_micros, estimated_cost_micros, 0)), 0) AS micros,
+               COALESCE(SUM(input_tokens), 0) AS input_tokens,
+               COALESCE(SUM(output_tokens), 0) AS output_tokens,
+               SUM(cost_micros IS NULL) AS estimated_calls,
+               GROUP_CONCAT(DISTINCT model) AS models,
+               GROUP_CONCAT(DISTINCT rate_basis) AS bases
+          FROM model_call
+         WHERE sku = ? AND status IN ({placeholders})
+         GROUP BY purpose
+         ORDER BY micros DESC
+        """,
+        (sku, *statuses),
+    ).fetchall()
+    return [
+        {
+            "purpose": row["purpose"],
+            "label": STAGE_LABELS.get(row["purpose"], row["purpose"]),
+            "calls": row["calls"],
+            "micros": row["micros"],
+            "input_tokens": row["input_tokens"],
+            "output_tokens": row["output_tokens"],
+            "estimated_calls": row["estimated_calls"] or 0,
+            "models": row["models"] or "",
+            "bases": row["bases"] or "",
+        }
+        for row in rows
+    ]
+
+
+def total_cost_micros(conn: sqlite3.Connection, sku: str) -> int:
+    """One number for one item. The figure the inventory row shows."""
+    placeholders, statuses = _billable_clause()
+    inference = conn.execute(
+        f"SELECT COALESCE(SUM(COALESCE(cost_micros, estimated_cost_micros, 0)), 0) "
+        f"FROM model_call WHERE sku = ? AND status IN ({placeholders})",
+        (sku, *statuses),
+    ).fetchone()[0]
+    # Retrieval is billed per search by the backend and is part of what the item
+    # cost. Leaving it out understated every researched item by whatever search
+    # was spent on it.
+    return inference + total_lookup_micros(conn, sku)
+
+
+def lookup_costs(conn: sqlite3.Connection, sku: str) -> list[dict]:
+    """Per-scope retrieval spend for one item.
+
+    Kept apart from `stage_costs` because a search and a model call are priced on
+    different things -- one per request, one per token -- and averaging them into a
+    single table would make neither legible. They are summed for the total, which
+    is the number that answers "what did this item cost".
+    """
+    rows = conn.execute(
+        "SELECT scope, provider, COUNT(*) AS lookups, "
+        "       COALESCE(SUM(cost_micros), 0) AS micros, "
+        "       SUM(cost_micros IS NULL) AS unpriced, "
+        "       COALESCE(SUM(result_count), 0) AS results "
+        "  FROM research_lookup WHERE sku = ? "
+        " GROUP BY scope, provider ORDER BY micros DESC",
+        (sku,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def total_lookup_micros(conn: sqlite3.Connection, sku: str) -> int:
+    return conn.execute(
+        "SELECT COALESCE(SUM(cost_micros), 0) FROM research_lookup WHERE sku = ?",
+        (sku,),
+    ).fetchone()[0]
+
+
+def total_cost_by_sku(conn: sqlite3.Connection) -> dict[str, int]:
+    """Every item's total in one query, for the inventory table.
+
+    One pass rather than one query per row: the table already does a `next_step`
+    per item, and adding a second per-item round trip for a single integer is the
+    kind of thing that makes a list view quietly quadratic.
+    """
+    placeholders, statuses = _billable_clause()
+    return {
+        row["sku"]: row["micros"]
+        for row in conn.execute(
+            f"SELECT sku, COALESCE(SUM(COALESCE(cost_micros, estimated_cost_micros, 0)), 0) "
+            f"AS micros FROM model_call WHERE sku IS NOT NULL AND status IN ({placeholders}) "
+            f"GROUP BY sku",
+            statuses,
+        )
+    }
+
+
+def unpriced_call_count(conn: sqlite3.Connection, sku: str) -> int:
+    """Billable calls whose actual cost is unknown, so the estimate was charged.
+
+    Worth surfacing separately: a total that is partly estimate is a different
+    claim from one that is entirely measured, and the difference is invisible in
+    the number itself.
+    """
+    placeholders, statuses = _billable_clause()
+    return conn.execute(
+        f"SELECT COUNT(*) FROM model_call WHERE sku = ? AND cost_micros IS NULL "
+        f"AND status IN ({placeholders})",
+        (sku, *statuses),
+    ).fetchone()[0]

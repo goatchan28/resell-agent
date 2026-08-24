@@ -1478,7 +1478,24 @@ def _condition_choices(
 # --- what to match a search result against ----------------------------------------
 
 
-IDENTITY_ASPECTS = ("Brand", "Model", "MPN", "Product Line", "Series", "Type")
+# Aspects that say *which product this is*. Ranked, because they are not equally
+# useful: a brand and a model number distinguish a listing, while a Type of
+# "Adjustable" or "Handheld" or "Paperback" describes a whole shelf.
+#
+# MP-000022 had exactly two terms, "Bowflex" and "Adjustable", and the gate
+# demanded both. Every eBay title reading "Bowflex SelectTech 552 Dumbbells" was
+# thrown away for lacking the word "Adjustable" -- 22 of 31 priced listings on one
+# search, 27 of 30 on the next.
+DISTINCTIVE_ASPECTS = (
+    "Brand", "Model", "MPN", "Product Line", "Series",
+    # Categories that identify by something other than a brand. A book has no
+    # brand and its title is the identifier; without these an item like a
+    # paperback had no terms at all, and no gate.
+    "Book Title", "Title", "Author", "Model Number", "Style Code",
+    "UPC", "EAN", "ISBN",
+)
+GENERIC_ASPECTS = ("Type",)
+IDENTITY_ASPECTS = DISTINCTIVE_ASPECTS + GENERIC_ASPECTS
 
 
 def _active_run(conn, sku: str) -> str | None:
@@ -1535,7 +1552,7 @@ def identity_terms(conn, sku: str) -> tuple[str, ...]:
         aspects = json.loads(row["aspects"] or "{}")
     except (TypeError, ValueError):
         aspects = {}
-    for name in IDENTITY_ASPECTS:
+    for name in DISTINCTIVE_ASPECTS:
         for value in aspects.get(name) or []:
             if value:
                 terms.append(str(value))

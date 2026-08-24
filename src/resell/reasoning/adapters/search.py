@@ -310,7 +310,16 @@ def get_search_backend(provider: str | None = None, **kwargs) -> SearchBackend:
 # search can yield two hundred priced entries, most of them accessories for the
 # product rather than the product. The deterministic gate below removes what is
 # certainly off-product; the judging stage removes what is merely not comparable.
-MIN_IDENTITY_TERMS = 2
+# One distinctive term is the gate. It was two, which with exactly two terms meant
+# *both* -- the strictest point on the curve, and where MP-000022 sat: "Bowflex"
+# and "Adjustable", so every "Bowflex SelectTech 552 Dumbbells" was discarded for
+# lacking the second word.
+#
+# Deliberately permissive now, because it is not the quality filter. It removes
+# what is certainly a different product; the judging stage decides what is
+# comparable, and it is much better at telling a dumbbell from a weight plate than
+# a word count ever was.
+MIN_IDENTITY_TERMS = 1
 DEFAULT_MAX_COMPS_PER_SEARCH = 12
 
 

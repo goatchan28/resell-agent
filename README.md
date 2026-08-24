@@ -110,6 +110,28 @@ uv run resell events -n 20  # what actually happened
 uv run pytest               # 22 tests, no network or credentials needed
 ```
 
+## Two front ends, one workflow
+
+`/` is the seller's. `/ops` is the operator's, unchanged and still the place to
+diagnose an item.
+
+The consumer screens are **GET-only projections**. `views_consumer.py` builds
+`TaskView` and `ShelfRow` from the `WorkflowView` and `InventoryRow` the operator
+UI already builds — no queries, no `next_step`, no decisions. Every action on a
+consumer screen posts to the endpoint the operator UI posts to, so there is one
+orchestrator, one set of approval seams, one set of safety checks. Two screens
+showing different words is a product choice; two screens computing different
+answers is a second workflow, and the second one is always subtly wrong.
+
+What the seller does not see: the nineteen orchestrator steps (ten are the agent
+talking to itself and collapse to one line), SKUs, states, evidence, citations,
+comparables, categories, budgets, or what the agent cost to run. What they do see
+is the one thing being asked of them.
+
+Profit on the shelf is the trade — sale price less fees and postage less what was
+paid. Processing cost stays in `/ops`, where it is useful; telling a seller their
+$40 profit is really $39.83 invites them to optimise the wrong thing.
+
 ## Operator UI
 
 A local web interface over the same backend the CLI drives. Start it with:
@@ -263,9 +285,22 @@ sources resolve to `derived_only`, which was meant to mean "statistics only" and
 practice meant invisible: never judged, so never a candidate, so contributing
 nothing. MP-000013's one genuinely comparable listing — a $399.99 pair of the right
 dumbbells — was found, priced and lost that way, while eBay's replacement weight
-plates reached the judge and were correctly excluded. Withheld comps are now offered
-to the operator at the identity ceiling, marked as unassessed. The rows still never
-enter a prompt.
+plates reached the judge and were correctly excluded.
+
+Those comps are recorded and, where a round is still proposing rather than
+claiming, offered at the identity ceiling marked as unassessed. Since the agent
+judges its own comparables they are usually retail anyway, which the estimator
+lifts out of the sample regardless. The rows still never enter a prompt.
+
+**Which listings are comparable is the agent's call.** It was a review queue, and
+the judging stage was already doing the work better than the queue could — its
+exclusions read "Cradle only, no weights included", "Replacement handle part only".
+So the round records claims directly. Two things did not move: the **price** still
+needs approving and so does the **listing**, because those are decisions about what
+to charge and what to say, while comparability is a matter of fact about objects.
+
+A stale review queue still clears — `review_comps` fires whenever candidates are
+pending, so nothing already waiting is stranded.
 
 **Starting a run and watching one are different requests.** `/run` used to do the
 work and answer afterwards, holding a browser request for as long as the stages

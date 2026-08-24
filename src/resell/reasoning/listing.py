@@ -23,6 +23,11 @@ from dataclasses import dataclass, field
 
 TITLE_MAX = 80
 
+# What a buyer will actually read before deciding. The limit is what forces the
+# copy to choose, which is the point of it -- but it is a style rule, so it warns
+# and never refuses.
+DESCRIPTION_MAX_SENTENCES = 3
+
 # The line is between *unsupported fact* and *opinion*, not between plain and
 # persuasive. Copy that sells is the point of a listing; copy that asserts things
 # the record cannot support is the problem. These two lists encode that line.
@@ -51,6 +56,78 @@ PERMITTED_MARKETING_TERMS = frozenset({
     "flattering", "handsome", "striking", "beautiful", "stunning", "gorgeous",
     "perfect for", "ideal for", "great for", "dress up or down",
 })
+
+# Not false, not refusable, and the reason a listing reads as generated rather than
+# written by whoever owns the thing. This list answers a different question from the
+# one above: PERMITTED_MARKETING_TERMS says what cannot be *refused*, and this says
+# what should not have been *written*. Several phrases are in both, which is correct.
+#
+# Warnings only, for the same reason the sentence limit is a warning: this reviewer
+# refuses claims, not prose, and a draft discarded over house style leaves the seller
+# writing the listing by hand -- a far worse outcome than a stale phrase.
+SALES_CLICHES: tuple[str, ...] = (
+    "designed to",
+    "perfect for",
+    "ideal for",
+    "great for",
+    "ready to go",
+    "elevates",
+    "delivers an experience",
+    "whether you",
+    "features that make",
+    "boasts",
+    "features an array of",
+    "look no further",
+    "must-have",
+)
+
+# Ordinary wear, which belongs in `claims` and not in the three sentences a buyer
+# reads. The prompt has said so in increasingly explicit terms across three
+# revisions and drafts still arrive with "some visible scuffing on the plates" in
+# them, so the reviewer measures it rather than trusting the instruction.
+#
+# A warning, like the two rules above: the sentence is *true*, and refusing a
+# truthful draft over emphasis would be the reviewer overreaching. What it buys is
+# that the failure is visible in the ledger instead of only in the listing.
+# "Wear" and "worn" are absent on their own, and deliberately: "formal wear" is a
+# garment category and "unworn" is the opposite claim. Only the compounds that can
+# only mean damage are listed.
+WEAR_LANGUAGE: tuple[str, ...] = (
+    "scuff", "scuffs", "scuffed", "scuffing", "scratch", "scratches", "scratched",
+    "smudge", "smudges", "smudging", "blemish", "blemishes", "chip", "chips",
+    "chipped", "ding", "dings", "crease", "creases", "creased", "stain", "stains",
+    "stained", "well-worn",
+    "signs of use", "signs of wear", "shows use", "shows wear", "shelf wear",
+    "edge wear", "surface wear", "light wear", "normal wear", "visible wear",
+    "wear marks", "wear and tear",
+)
+
+# "No stains, tears, or matting" is the opposite claim and must not be reported as
+# wear language. Nothing here needs to catch "unblemished" or "unworn": a word
+# boundary already does, because the prefix is part of the word.
+_NEGATORS = frozenset({"no", "not", "none", "never", "without", "free", "zero"})
+_NEGATION_WINDOW = 6
+
+
+def _asserted_wear(description: str) -> list[str]:
+    """Wear words the description asserts, as opposed to denies."""
+    words = [w.strip(_EDGE).lower() for w in _TOKEN.findall(_DASH.sub("-", description))]
+    found: list[str] = []
+    for phrase in WEAR_LANGUAGE:
+        head = phrase.split()[0]
+        for index, word in enumerate(words):
+            if word != head:
+                continue
+            if len(phrase.split()) > 1:
+                tail = phrase.split()[1:]
+                if words[index + 1:index + 1 + len(tail)] != tail:
+                    continue
+            window = words[max(0, index - _NEGATION_WINDOW):index]
+            if not _NEGATORS.isdisjoint(window):
+                continue
+            found.append(phrase)
+            break
+    return found
 
 # Terms that read as marketing but assert externally verifiable characteristics, so
 # they are treated as factual and need their evidence. "Rare" sounds like enthusiasm
@@ -121,6 +198,7 @@ _EDGE = "'.-/"
 # separating clauses is punctuation, and joining the words around it would invent a
 # compound that nobody wrote.
 _DASH = re.compile(r"(?<=[A-Za-z0-9])[‐-―](?=[A-Za-z0-9])")
+_APOSTROPHE = re.compile("[‘’ʼ`´]")
 
 
 @dataclass(frozen=True)
@@ -226,6 +304,18 @@ def _phrase_around(words: list[str], index: int, span: int, supported: str) -> b
     return False
 
 
+def _sentence_count(text: str) -> int:
+    """Sentences, counted the way a reader would.
+
+    Abbreviations are the trap: "18-55mm f/3.5-5.6 IS STM." is one sentence and a
+    naive full-stop count reads it as four. So a break needs a following capital
+    or the end of the text, and decimals are not breaks at all.
+    """
+    stripped = re.sub(r"(?<=\d)\.(?=\d)", "", text or "")
+    parts = re.split(r"[.!?]+(?:\s+(?=[A-Z\"'(])|\s*$)", stripped)
+    return len([p for p in parts if p.strip()])
+
+
 def _contains_phrase(text: str, phrase: str) -> bool:
     return re.search(rf"\b{re.escape(phrase)}\b", text.lower()) is not None
 
@@ -255,6 +345,30 @@ def review_draft(
         )
     if not draft.description.strip():
         review.problems.append("description is empty")
+    else:
+        sentences = _sentence_count(draft.description)
+        if sentences > DESCRIPTION_MAX_SENTENCES:
+            # A warning, not a refusal. Length is a matter of style and this
+            # reviewer refuses claims, not prose -- and a draft thrown away for
+            # running long leaves the seller writing the listing themselves,
+            # which is a far worse outcome than four sentences.
+            review.warnings.append(
+                f"description is {sentences} sentences; "
+                f"{DESCRIPTION_MAX_SENTENCES} is the intended maximum"
+            )
+        body = _APOSTROPHE.sub("'", draft.description)
+        stale = [phrase for phrase in SALES_CLICHES if _contains_phrase(body, phrase)]
+        if stale:
+            review.warnings.append(
+                "description uses advertising phrasing a seller would not: "
+                + ", ".join(repr(phrase) for phrase in stale)
+            )
+        wear = _asserted_wear(draft.description)
+        if wear:
+            review.warnings.append(
+                "description dwells on ordinary wear, which belongs in the claims: "
+                + ", ".join(repr(word) for word in wear)
+            )
 
     for term, why in PROHIBITED_TERMS.items():
         if _contains_phrase(combined, term):

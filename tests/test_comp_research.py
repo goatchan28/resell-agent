@@ -1200,3 +1200,97 @@ def test_nothing_is_offered_when_the_round_records_claims_itself(tmp_path):
         conn, sku, [obs], Comparability.SAME_FAMILY_VARIANT, outcome, False
     )
     assert offered == 0
+
+
+# --- the agent judges its own comparables ------------------------------------------
+
+
+def test_the_orchestrator_records_claims_rather_than_offering_them():
+    """The judging stage was already doing the work -- it excluded replacement
+    weight plates and parts listings correctly every time -- and the operator was
+    ratifying a decision made with better information than they had."""
+    import inspect
+
+    from resell.orchestrator import StageRunner
+
+    source = inspect.getsource(StageRunner._comp_research)
+    assert "propose_only=False" in source
+
+
+def test_the_price_and_the_listing_still_need_approving():
+    """What moved is a matter of fact about objects. What did not move are the
+    two decisions about what to charge and what to say."""
+    from resell.orchestrator import Actor, Step, StageRunner
+
+    for step in (Step.APPROVE_PRICE, Step.APPROVE_LISTING, Step.PUBLISH):
+        assert not hasattr(StageRunner, f"_{step}"), step
+
+
+def test_an_existing_review_queue_can_still_be_cleared(tmp_path):
+    """Items that already have candidates must not be stranded by the change."""
+    from resell.orchestrator import Step, next_step
+    from resell.pricing.comps import CompBasis, CompObservation, PriceKind
+
+    conn, gateway, sku = fixture(tmp_path)
+    gateway.attach_photo(
+        sku, source_path="/a.jpg", content_sha256="c" * 64, image_format="jpeg",
+        size_bytes=1000, validation_errors=None,
+    )
+    gateway.begin_identification(sku)
+    observation(conn, sku, gateway)
+    gateway.propose_identification(
+        sku, category_id="137865", condition_id="USED_GOOD",
+        title="A thing", description="A thing.", aspects={"Brand": ["Bowflex"]},
+    )
+    gateway.begin_pricing(sku)
+    sp.record_comp_observation(conn, CompObservation(
+        comp_id="c-old", marketplace="ebay.com", external_id="1",
+        price_kind=PriceKind.ASKING, basis=CompBasis.ACTIVE_SIMILAR,
+        price_cents=25000, observed_at=_NOW,
+    ))
+    sp.record_comp_candidate(
+        conn, sku=sku, comp_id="c-old", proposed_comparability="same_family_variant",
+        item_citations=("1",), comp_citations=("title",), rationale="left over",
+    )
+    assert next_step(conn, sku).step is Step.REVIEW_COMPS
+
+
+# --- the gate that was throwing eBay away ------------------------------------------
+
+
+def test_a_generic_type_word_is_not_an_identifier(tmp_path):
+    """MP-000022 had two terms, "Bowflex" and "Adjustable", and the gate demanded
+    both. Every "Bowflex SelectTech 552 Dumbbells" was discarded for lacking the
+    second word: 22 of 31 priced listings on one search."""
+    from resell import views
+
+    conn, gateway, sku = fixture(tmp_path)
+    gateway.propose_identification(
+        sku, aspects={"Brand": ["Bowflex"], "Type": ["Adjustable"]},
+    )
+    assert views.identity_terms(conn, sku) == ("Bowflex",)
+
+
+def test_an_item_identified_by_title_still_has_terms(tmp_path):
+    """A book has no brand, and without these it had no terms at all -- and so no
+    gate whatsoever."""
+    from resell import views
+
+    conn, gateway, sku = fixture(tmp_path)
+    gateway.propose_identification(
+        sku, aspects={"Book Title": ["The House on Mango Street"],
+                      "Author": ["Sandra Cisneros"], "Format": ["Paperback"]},
+    )
+    terms = views.identity_terms(conn, sku)
+    assert "The House on Mango Street" in terms
+    assert "Paperback" not in terms
+
+
+def test_one_distinctive_term_is_enough():
+    """Deliberately permissive: this removes what is certainly a different
+    product, and the judge decides what is comparable."""
+    from resell.reasoning.adapters.search import MIN_IDENTITY_TERMS, _matches_identity
+
+    assert MIN_IDENTITY_TERMS == 1
+    assert _matches_identity("Bowflex SelectTech 552 Dumbbells", ("Bowflex",))
+    assert not _matches_identity("Nike Air Max 90 Trainers", ("Bowflex",))

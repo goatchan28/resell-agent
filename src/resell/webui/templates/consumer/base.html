@@ -1,18 +1,20 @@
+{# The seller's chrome. No environment badge, no marketplace id, no SKU: those
+   are facts about the system, and this screen is about their things. #}
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}resell{% endblock %}</title>
+<title>{% block title %}Sell{% endblock %}</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-
-<header>
+<link rel="stylesheet" href="{{ url_for('static', filename='consumer.css') }}">
+<header class="c-top">
+  {# The brand is the way home, so a "Next" link beside it went where the word
+     next to it already went. Two controls for one destination is one too many. #}
+  <a class="c-brand" href="{{ url_for('home') }}">Sell</a>
   <nav>
-    <a href="{{ url_for('ops_home') }}">today</a>
-    <a href="{{ url_for('ops_inventory') }}">inventory</a>
+    <a href="{{ url_for('shelf') }}">Your items</a>
   </nav>
-  <span class="env env-{{ environment }}">{{ environment }}</span>
 </header>
-
-<main>
+<main class="c-main">
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
       <ul class="flashes">
@@ -24,12 +26,7 @@
   {% endwith %}
   {% block content %}{% endblock %}
 </main>
-
 <script>
-/* Any form that starts long work disables its buttons on submit, so a click is
-   visibly registered and cannot be repeated. The server refuses a second run on
-   an item already running -- this is the half that answers "did that do
-   anything?" in the moment rather than after the round trip. */
 document.addEventListener("submit", function (event) {
   var form = event.target;
   if (!form.matches("[data-long]")) return;

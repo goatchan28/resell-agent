@@ -87,7 +87,7 @@ def seeded(tmp_path, *, with_photo=True, identified=False):
 
 def test_the_home_screen_renders_with_nothing_to_do(tmp_path):
     app, _, _ = app_for(tmp_path)
-    response = app.test_client().get("/")
+    response = app.test_client().get("/ops")
     assert response.status_code == 200
     assert b"Nothing needs you right now" in response.data
 
@@ -95,14 +95,14 @@ def test_the_home_screen_renders_with_nothing_to_do(tmp_path):
 def test_the_intake_form_asks_for_photographs(tmp_path):
     """Photographs are the input; everything else is worked out."""
     app, _, _ = app_for(tmp_path)
-    body = app.test_client().get("/").data
+    body = app.test_client().get("/ops").data
     assert b'type="file"' in body
     assert b"upload" in body
 
 
 def test_the_inventory_table_renders(tmp_path):
     app, _, _, sku = seeded(tmp_path, identified=True)
-    response = app.test_client().get("/inventory")
+    response = app.test_client().get("/ops/inventory")
     assert response.status_code == 200
     assert sku.encode() in response.data
 
@@ -116,9 +116,18 @@ def test_there_are_only_two_screens(tmp_path):
         if "GET" in rule.methods and "static" not in str(rule)
         and "photo" not in str(rule)
     }
-    # `/runs/<run_id>` is not a screen. It answers JSON to the page already open,
-    # which is what stopped the browser holding one request for two minutes.
-    assert pages == {"/", "/inventory", "/items/<sku>", "/runs/<run_id>"}
+    # Two screens each, and one JSON endpoint that is not a screen -- it answers
+    # the page already open, which is what stopped the browser holding a request
+    # for two minutes.
+    #
+    # The operator UI moved under /ops rather than changing: it is still the
+    # place to diagnose an item, and the consumer screens are a projection of the
+    # same state, not a second workflow.
+    assert pages == {
+        "/", "/items", "/items/<sku>",                      # consumer
+        "/ops", "/ops/inventory", "/ops/items/<sku>",       # operator
+        "/runs/<run_id>",                                   # neither
+    }
 
 
 def test_an_unknown_sku_is_a_404(tmp_path):
@@ -132,14 +141,14 @@ def test_an_unknown_sku_is_a_404(tmp_path):
 def test_an_item_needing_photos_says_so(tmp_path):
     app, _, gateway = app_for(tmp_path)
     gateway.ingest_item(purchase_cost_cents=500)
-    body = app.test_client().get("/").data
+    body = app.test_client().get("/ops").data
     assert b"add photos" in body
 
 
 def test_an_item_the_agent_can_work_on_is_not_a_card(tmp_path):
     """Only decisions get a card. Work in progress is listed quietly."""
     app, _, _, sku = seeded(tmp_path)
-    body = app.test_client().get("/").data.decode()
+    body = app.test_client().get("/ops").data.decode()
     assert "the agent still has work to do" in body
     assert "start work on it" in body
 
@@ -150,7 +159,7 @@ def test_a_blocking_question_becomes_the_card(tmp_path):
         sku, question="What size is it?", why_it_matters="required aspect",
         aspect_name="Size",
     )
-    body = app.test_client().get("/").data
+    body = app.test_client().get("/ops").data
     assert b"What size is it?" in body
     assert b"answer" in body
 
@@ -203,7 +212,7 @@ def priced(tmp_path):
 def test_a_discovered_comp_appears_as_something_to_accept(tmp_path):
     app, conn, _, sku = priced(tmp_path)
     offer(conn, sku, "comp_a", 7995)
-    body = app.test_client().get("/").data
+    body = app.test_client().get("/ops").data
     assert b"same sort of thing" in body
     assert b"$79.95" in body
     # And never the vocabulary underneath it.
@@ -273,7 +282,7 @@ def accepted_comps(conn, sku, prices):
 def test_the_price_card_shows_three_options_and_a_range(tmp_path):
     app, conn, _, sku = priced(tmp_path)
     accepted_comps(conn, sku, [7995, 8995, 9995])
-    body = app.test_client().get("/").data.decode()
+    body = app.test_client().get("/ops").data.decode()
     assert "approve a price" in body
     for objective in ("fast sale", "balanced", "max proceeds"):
         assert objective in body
@@ -335,8 +344,8 @@ def test_every_write_is_a_post(tmp_path):
 def test_the_environment_is_named_on_every_screen(tmp_path):
     app, _, _, sku = seeded(tmp_path, identified=True)
     client = app.test_client()
-    assert b"sandbox" in client.get("/").data
-    assert b"sandbox" in client.get("/inventory").data
+    assert b"sandbox" in client.get("/ops").data
+    assert b"sandbox" in client.get("/ops/inventory").data
 
 
 # --- intake -------------------------------------------------------------------
@@ -367,7 +376,7 @@ def test_an_upload_with_no_photo_says_so(tmp_path):
 
 def test_the_card_offers_the_details_for_editing(tmp_path):
     app, _, _, sku = seeded(tmp_path, identified=True)
-    body = app.test_client().get(f"/items/{sku}").data.decode()
+    body = app.test_client().get(f"/ops/items/{sku}").data.decode()
     assert "change the details" in body
     assert 'name="title"' in body
     assert 'name="condition_id"' in body
@@ -569,7 +578,7 @@ def test_the_orchestrator_owns_no_interactive_adapter():
 def test_pasting_links_is_how_comps_arrive(tmp_path):
     app, conn, gateway, sku = seeded(tmp_path, identified=True)
     gateway.begin_pricing(sku)
-    body = app.test_client().get(f"/items/{sku}").data.decode()
+    body = app.test_client().get(f"/ops/items/{sku}").data.decode()
     assert "paste a few marketplace links" in body
     assert 'name="urls"' in body
 
@@ -885,13 +894,13 @@ def test_setting_aside_from_the_queue_removes_the_row(tmp_path):
             r"MP-\d{6}", re.sub(r'<ul class="flashes">.*?</ul>', "", body, flags=re.S)
         )))
 
-    assert sku in queue(client.get("/").get_data(as_text=True))
+    assert sku in queue(client.get("/ops").get_data(as_text=True))
 
     client.post(f"/items/{sku}/abandon", data={})
-    assert sku not in queue(client.get("/").get_data(as_text=True))
+    assert sku not in queue(client.get("/ops").get_data(as_text=True))
 
     client.post(f"/items/{sku}/restore")
-    assert sku in queue(client.get("/").get_data(as_text=True))
+    assert sku in queue(client.get("/ops").get_data(as_text=True))
 
 
 # --- a run that does not freeze the page -------------------------------------------

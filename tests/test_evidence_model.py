@@ -209,7 +209,7 @@ def test_operator_exclusions_are_accounted_for():
         comp(2000, comparability=Comparability.EXCLUDED, comp_id="x",
              excluded_reason="a lot of five"),
     ])
-    entry = lines(rec)["excluded by the operator"]
+    entry = lines(rec)["ruled out as different"]
     assert entry.role is EvidenceRole.EXCLUDED
     assert entry.n == 1
 

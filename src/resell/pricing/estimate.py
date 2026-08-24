@@ -756,9 +756,10 @@ def build_contributions(
         ))
     if excluded:
         lines.append(EvidenceContribution(
-            source="excluded by the operator", n=len(excluded),
+            source="ruled out as different", n=len(excluded),
             role=EvidenceRole.EXCLUDED,
-            detail="ruled out as comparisons; retained so the exclusion is auditable",
+            detail="not the same sort of thing -- parts, cradles, bundles; retained "
+                   "so the exclusion is auditable",
         ))
     if exclusions:
         lines.append(EvidenceContribution(

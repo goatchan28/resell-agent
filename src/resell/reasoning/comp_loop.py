@@ -409,8 +409,19 @@ def run_comp_round(
         except sqlite3.IntegrityError:
             # Same marketplace, same listing id, same instant: this *is* the row
             # already there, not a second sighting. The table is right to refuse
-            # it; losing the other thirty comps over it is what was wrong.
+            # the insert -- but the comp is still a comp for this item, so it
+            # stays in the round.
+            #
+            # Dropping it was worse than the crash it replaced. A listing found in
+            # an earlier round could never be claimed in a later one: MP-000022
+            # re-found the two real Bowflex pairs at $250 and $499.99, skipped
+            # both as duplicates, judged only the parts listings that happened to
+            # be new, and priced a pair of dumbbells at $50.
             outcome.notes.append(f"already recorded: {obs.comp_id}")
+            stored.append(obs)
+            outcome.kinds[str(obs.price_kind)] = (
+                outcome.kinds.get(str(obs.price_kind), 0) + 1
+            )
             continue
         stored.append(obs)
         outcome.kinds[str(obs.price_kind)] = (

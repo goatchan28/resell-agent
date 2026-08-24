@@ -1,0 +1,51 @@
+{% extends "consumer/base.html" %}
+{% block title %}Sell{% endblock %}
+{% block content %}
+
+{% if run %}{% include "_run.html" %}{% endif %}
+
+{% for task in tasks %}
+  {% include "consumer/_task.html" %}
+{% endfor %}
+
+{% if not tasks %}
+  <p class="c-empty">Nothing needs you right now.</p>
+{% endif %}
+
+{% if working %}
+  <section class="c-working">
+    {% for row in working %}
+      {# A spinner means work is happening. An item that is the agent's turn but
+         has nothing running is not working, it is waiting, and saying otherwise
+         is the difference between a status and a decoration. #}
+      {% if row.running %}
+        <p class="c-working-row">
+          <span class="run-spinner" aria-hidden="true"></span>
+          <span>{{ row.name | shorten(44) }}</span>
+          <span class="tiny quiet">{{ row.status }}</span>
+        </p>
+      {% else %}
+        <form method="post" action="{{ url_for('run', sku=row.sku) }}"
+              class="c-working-row" data-long>
+          <span>{{ row.name | shorten(44) }}</span>
+          <span class="tiny quiet">Ready to carry on</span>
+          <button type="submit" data-busy="Starting…">Continue</button>
+        </form>
+      {% endif %}
+    {% endfor %}
+  </section>
+{% endif %}
+
+<section class="c-add">
+  <h2>Add an item</h2>
+  <form method="post" action="{{ url_for('create_item') }}"
+        enctype="multipart/form-data" data-long>
+    <input type="file" name="photos" multiple accept="image/*" required>
+    <input type="number" name="cost_dollars" step="0.01" min="0"
+           placeholder="what you paid (optional)">
+    <button type="submit" class="primary" data-busy="Uploading…">Add</button>
+  </form>
+  <p class="tiny quiet">Photos are all it needs. You will be asked only when the
+    answer is not in them.</p>
+</section>
+{% endblock %}

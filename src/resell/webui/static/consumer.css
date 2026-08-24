@@ -1,0 +1,67 @@
+/* The seller's screen. Deliberately plain: the operator UI is a dashboard, this
+   is one thing to do at a time. */
+.c-top { display: flex; align-items: baseline; gap: 1.4rem; padding: 1rem 0;
+         border-bottom: 1px solid var(--line); margin-bottom: 1.6rem; }
+.c-brand { font-weight: 600; font-size: 1.1rem; text-decoration: none;
+           color: var(--ink); }
+.c-top nav { display: flex; gap: 1rem; }
+.c-top nav a { color: var(--muted); text-decoration: none; font-size: .92rem; }
+.c-top nav a:hover { color: var(--ink); }
+.c-main { max-width: 46rem; margin: 0 auto; padding: 0 1rem 4rem; }
+
+.c-task { display: flex; gap: 1.2rem; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 10px; padding: 1.2rem;
+          margin-bottom: 1.2rem; }
+.c-photo img, .c-photo-empty { width: 7rem; height: 7rem; object-fit: cover;
+          border-radius: 8px; background: var(--line); display: block; }
+.c-body { flex: 1; min-width: 0; }
+.c-body h2 { font-size: 1rem; font-weight: 500; margin: 0 0 .3rem;
+             color: var(--muted); }
+.c-headline { font-size: 1.25rem; font-weight: 600; margin: 0 0 .3rem; }
+.c-hint { color: var(--muted); margin: 0 0 .8rem; font-size: .92rem; }
+.c-progress { display: flex; align-items: center; gap: .5rem; color: var(--muted); }
+.c-quote { font-size: 1.05rem; margin: .4rem 0 .8rem; }
+.c-band { font-size: 1.5rem; font-weight: 600; margin: .2rem 0 .8rem; }
+.c-copy { color: var(--muted); font-size: .92rem; line-height: 1.5; }
+
+.c-prices { display: flex; gap: .6rem; flex-wrap: wrap; }
+.c-price { display: flex; flex-direction: column; align-items: flex-start;
+           padding: .7rem 1rem; height: auto; }
+.c-price-amount { font-size: 1.15rem; font-weight: 600; }
+.c-price-label { font-size: .8rem; opacity: .75; }
+.c-price-entry { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+
+.c-comp { display: flex; align-items: center; gap: .8rem; padding: .5rem 0;
+          border-bottom: 1px solid var(--line); }
+.c-comp-price { font-weight: 600; min-width: 4.5rem; }
+.c-comp-title { flex: 1; min-width: 0; font-size: .9rem; }
+.c-comp-buttons { display: flex; gap: .4rem; }
+
+.c-working { margin: 1.4rem 0; }
+.c-working-row { display: flex; align-items: center; gap: .6rem; margin: .3rem 0;
+                 color: var(--muted); font-size: .92rem; }
+.c-add { border-top: 1px solid var(--line); padding-top: 1.4rem; margin-top: 2rem; }
+.c-add h2 { font-size: .95rem; font-weight: 600; margin: 0 0 .7rem; }
+.c-add form { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+.c-empty { color: var(--muted); font-style: italic; padding: 2.5rem 0;
+           text-align: center; }
+
+.c-fix { margin-top: 1rem; }
+.c-fix summary { cursor: pointer; color: var(--muted); font-size: .88rem; }
+.c-field { display: block; margin: .7rem 0; }
+.c-field span { display: block; font-size: .82rem; color: var(--muted);
+                margin-bottom: .2rem; }
+.c-field input, .c-field select, .c-field textarea { width: 100%; }
+.c-field.wrong input, .c-field.wrong select { border-color: #c0392b; }
+
+.c-shelf { width: 100%; border-collapse: collapse; }
+.c-shelf th { text-align: left; font-size: .8rem; color: var(--muted);
+              font-weight: 500; padding: .4rem .6rem; }
+.c-shelf td { padding: .5rem .6rem; border-top: 1px solid var(--line);
+              font-size: .92rem; }
+.c-shelf .n { text-align: right; }
+.c-thumb img { width: 2.6rem; height: 2.6rem; object-fit: cover;
+               border-radius: 5px; display: block; }
+.c-needs { background: #fffbf0; }
+.c-flag { font-size: .72rem; background: var(--ink); color: var(--bg);
+          border-radius: 3px; padding: .1rem .35rem; margin-left: .4rem; }

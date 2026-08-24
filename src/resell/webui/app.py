@@ -36,7 +36,7 @@ from flask import (
     url_for,
 )
 
-from resell import db, runs, store_pricing as sp, views
+from resell import db, runs, store_pricing as sp, views, views_consumer
 from resell.config import ConfigError, load_config
 from resell.domain import FeeModel
 from resell.gateway import Gateway, Rejected
@@ -106,8 +106,62 @@ def _register_routes(app: Flask) -> None:
 
     # --- the two screens ------------------------------------------------------
 
+    # --- the consumer's two screens ------------------------------------------
+    #
+    # GET only. Every action on them posts to the same endpoints the operator UI
+    # uses, so there is one workflow, one set of approval seams, and one
+    # orchestrator. These routes choose words; they decide nothing.
+
     @app.get("/")
     def home():
+        """Whatever needs doing next, and nothing else.
+
+        One item at a time is the whole design: a seller with four items in
+        flight wants to know which one wants them, not to read four status
+        reports. Items the agent is still working on appear as a quiet line.
+        """
+        rows = views.inventory(
+            g.conn, marketplace=g.config.marketplace_id,
+            environment=g.config.env.name,
+        )
+        waiting = [r for r in rows if r.actor == "operator"]
+        working = [r for r in rows if r.actor == "agent"]
+        tasks = [views_consumer.task_view(_workflow(r.sku)) for r in waiting]
+        return render_template(
+            "consumer/home.html",
+            tasks=tasks,
+            working=views_consumer.shelf_rows(working, net_of=_net_of),
+            forms={t.sku: _correction_form(t.sku) for t in tasks},
+            run=_run_in_view([r.sku for r in rows]),
+        )
+
+    @app.get("/items/<sku>")
+    def item(sku: str):
+        """One item's task, on its own."""
+        _require_item(sku)
+        task = views_consumer.task_view(_workflow(sku))
+        return render_template(
+            "consumer/home.html", tasks=[task], working=[],
+            forms={sku: _correction_form(sku)}, run=_run_in_view([sku]),
+        )
+
+    @app.get("/items")
+    def shelf():
+        """Everything the seller has, as a list they would recognise."""
+        rows = views.inventory(
+            g.conn, marketplace=g.config.marketplace_id,
+            environment=g.config.env.name,
+            include_abandoned=request.args.get("aside") == "1",
+        )
+        return render_template(
+            "consumer/shelf.html",
+            rows=views_consumer.shelf_rows(rows, net_of=_net_of),
+            showing_aside=request.args.get("aside") == "1",
+            aside_count=views.abandoned_count(g.conn),
+        )
+
+    @app.get("/ops")
+    def ops_home():
         """Everything that wants a decision, and nothing that does not.
 
         Items the agent can still work on are listed separately and quietly: an
@@ -124,11 +178,11 @@ def _register_routes(app: Flask) -> None:
             "home.html", cards=cards, working=working,
             done=[r for r in rows if r.actor == "nobody"],
             forms={card.sku: _correction_form(card.sku) for card in cards},
-            run=_run_in_view(),
+            run=_run_in_view([r.sku for r in rows]),
         )
 
-    @app.get("/inventory")
-    def inventory():
+    @app.get("/ops/inventory")
+    def ops_inventory():
         # Abandoned items are hidden unless asked for. They are kept whole, so the
         # only reason to hide them is that a list of work should be a list of work.
         show_abandoned = request.args.get("abandoned") == "1"
@@ -142,12 +196,12 @@ def _register_routes(app: Flask) -> None:
             abandoned_count=views.abandoned_count(g.conn),
         )
 
-    @app.get("/items/<sku>")
-    def item(sku: str):
+    @app.get("/ops/items/<sku>")
+    def ops_item(sku: str):
         """One item's card on its own, for when the home screen is crowded."""
         return render_template(
             "home.html", cards=[_workflow(sku)], working=[], done=[],
-            forms={sku: _correction_form(sku)}, run=_run_in_view(),
+            forms={sku: _correction_form(sku)}, run=_run_in_view([sku]),
         )
 
     @app.get("/items/<sku>/photo/<int:position>")
@@ -307,7 +361,11 @@ def _register_routes(app: Flask) -> None:
         except ValueError as exc:
             flash(str(exc), "error")
             return redirect(url_for("item", sku=sku))
-        return redirect(url_for("item", sku=sku))
+        # Handing back to the agent, like every other decision. Without this the
+        # item sat at an agent-owned step with nothing running: the screen said
+        # "Finding a price" over a spinner and no work was happening.
+        run_id, _ = _start_agent(sku)
+        return redirect(url_for("item", sku=sku, run=run_id))
 
     @app.post("/candidates/<candidate_id>/reject")
     def reject_candidate(candidate_id: str):
@@ -317,7 +375,11 @@ def _register_routes(app: Flask) -> None:
             sp.reject_comp_candidate(g.conn, candidate_id, reason=reason)
         except ValueError as exc:
             flash(str(exc), "error")
-        return redirect(url_for("item", sku=sku))
+        # Handing back to the agent, like every other decision. Without this the
+        # item sat at an agent-owned step with nothing running: the screen said
+        # "Finding a price" over a spinner and no work was happening.
+        run_id, _ = _start_agent(sku)
+        return redirect(url_for("item", sku=sku, run=run_id))
 
     @app.post("/items/<sku>/price")
     def approve_price(sku: str):
@@ -657,7 +719,7 @@ def _register_routes(app: Flask) -> None:
             )
         except Rejected as exc:
             _flash_rejection(exc)
-            return redirect(url_for("inventory", abandoned=1))
+            return redirect(url_for("shelf", aside=1))
         flash(f"{sku}: back in {accepted.to_state}, where it was when you set it "
               f"aside", "ok")
         return redirect(url_for("item", sku=sku))
@@ -712,15 +774,49 @@ def _start_agent(sku: str) -> tuple[str, bool]:
     return runs.start_run(config.db_path, sku, work), False
 
 
-def _run_in_view():
-    """The run this page was opened to watch, if any.
+def _net_of(price_cents: int) -> int:
+    """Net proceeds on a price: what is left after eBay and postage.
 
-    From the query string rather than "whatever is running": a page that silently
-    attached itself to someone else's run would report progress on an item the
-    operator is not looking at.
+    The same `net_from_gross` the pricing layer uses, so the shelf and the price
+    screen cannot disagree about what an item earns. Returns the price unchanged
+    if the fee schedule cannot be read -- a shelf without a profit column beats no
+    shelf.
+    """
+    from resell.pricing.proceeds import CostLines, net_from_gross
+
+    try:
+        schedule, _version = sp.recorded_schedule(
+            g.conn, marketplace=g.config.marketplace_id, category_id=None,
+        )
+        return net_from_gross(price_cents, schedule=schedule,
+                              costs=CostLines()).net_cents
+    except Exception:  # noqa: BLE001 - a missing schedule is not a broken page
+        return price_cents
+
+
+def _run_in_view(skus=()):
+    """The run this page should show progress for.
+
+    The query string wins: a page opened by pressing a button watches the run
+    that button started. Failing that, a run in flight on one of the items the
+    page is already showing.
+
+    That second case is what was missing. Progress only appeared if `?run=` was
+    in the URL, so navigating to the home screen while the agent worked showed a
+    line of text and no sign of movement -- the work was happening and the page
+    had no way to say so.
+
+    Still not "whatever is running anywhere": a page reporting progress on an item
+    it is not displaying would be describing something the reader cannot see.
     """
     run_id = request.args.get("run")
-    return runs.read_run(g.conn, run_id) if run_id else None
+    if run_id:
+        return runs.read_run(g.conn, run_id)
+    for sku in skus:
+        active = runs.active_run_for(g.conn, sku)
+        if active:
+            return runs.read_run(g.conn, active)
+    return None
 
 
 def _correction_form(sku: str) -> views.CorrectionForm:

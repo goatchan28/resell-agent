@@ -6,10 +6,10 @@
   <p class="tiny">
     {% if show_abandoned %}
       Showing {{ abandoned_count }} set-aside item(s).
-      <a href="{{ url_for('inventory') }}">hide them</a>
+      <a href="{{ url_for('ops_inventory') }}">hide them</a>
     {% else %}
       {{ abandoned_count }} item(s) set aside and hidden.
-      <a href="{{ url_for('inventory', abandoned=1) }}">show them</a>
+      <a href="{{ url_for('ops_inventory', abandoned=1) }}">show them</a>
     {% endif %}
   </p>
 {% endif %}
@@ -21,7 +21,7 @@
   <tbody>
   {% for row in rows %}
     <tr>
-      <td><a href="{{ url_for('item', sku=row.sku) }}">{{ row.sku }}</a>
+      <td><a href="{{ url_for('ops_item', sku=row.sku) }}">{{ row.sku }}</a>
       <td>{{ row.title | shorten(40) }}
       <td><span class="state state-{{ row.state }}">{{ row.state }}</span>
       <td><span class="actor actor-{{ row.actor }}">{{ row.actor }}</span>

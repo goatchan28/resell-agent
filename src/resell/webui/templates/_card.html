@@ -11,7 +11,7 @@
   </div>
 
   <div class="body">
-    <h2><a href="{{ url_for('item', sku=card.sku) }}">{{ card.title | shorten(70) }}</a></h2>
+    <h2><a href="{{ url_for('ops_item', sku=card.sku) }}">{{ card.title | shorten(70) }}</a></h2>
     <p class="meta">{{ card.sku }}
       {%- if card.purchase_cost_cents %} · paid {{ card.purchase_cost_cents | money }}{% endif %}
       {%- if card.approved_price_cents %} · approved {{ card.approved_price_cents | money }}{% endif %}

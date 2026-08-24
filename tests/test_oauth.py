@@ -5581,15 +5581,172 @@ def test_title_length_is_enforced():
     assert "over eBay's 80 limit" in review.problems[0]
 
 
-def test_drafting_prompt_asks_for_conversion_and_for_flaws():
+def test_drafting_prompt_asks_for_conversion():
+    """Conversion still matters; the theory of it changed. On a second-hand
+    marketplace a concrete sentence from someone who owns the thing outsells an
+    adjective, so the prompt asks for the fact rather than the characterisation."""
     from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
 
-    # Persuasion is asked for, not merely permitted.
-    assert "Write copy that sells" in DRAFT_SYSTEM_PROMPT
+    assert "Write as the person selling it" in DRAFT_SYSTEM_PROMPT
+    assert "Concrete beats promotional" in DRAFT_SYSTEM_PROMPT
+    # The *refusal* line is unchanged, and that separation is the point: what may
+    # not be said is a question about evidence, not about tone.
     assert "opinion and fact, not between plain and persuasive" in DRAFT_SYSTEM_PROMPT
-    # And the expensive omission is named.
-    assert "Say what is wrong with the item" in DRAFT_SYSTEM_PROMPT
     assert "An absent size stays absent" in DRAFT_SYSTEM_PROMPT
+
+
+def test_the_prompt_names_the_advertising_phrases_it_bans():
+    """"Write conversationally" produces the same copy it always did. The named
+    phrases are what actually moves the output."""
+    from resell.reasoning.listing import SALES_CLICHES
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT, REPAIR_SYSTEM_PROMPT
+
+    for phrase in ("designed to", "perfect for", "ideal for", "ready to go",
+                   "elevates", "delivers an experience", "whether you're",
+                   "features that make"):
+        assert phrase in DRAFT_SYSTEM_PROMPT, phrase
+
+    # A repair runs on a draft that is already plain, and must not tidy it back
+    # into advertising on the way past.
+    for phrase in ("designed to", "perfect for", "ready to go", "whether you're"):
+        assert phrase in REPAIR_SYSTEM_PROMPT, phrase
+
+    # The reviewer and the prompt have to name the same phrases, or the warning
+    # reports a rule the model was never given.
+    for phrase in SALES_CLICHES:
+        assert phrase in DRAFT_SYSTEM_PROMPT, phrase
+
+
+def test_the_prompt_prefers_a_fact_to_a_characterisation():
+    """The two examples the operator gave, kept as the worked cases."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "The dual screens make it easier to frame shots" in DRAFT_SYSTEM_PROMPT
+    assert "includes the original accessories shown in the photos" in DRAFT_SYSTEM_PROMPT
+
+
+def test_the_prompt_asks_for_selection_over_specification():
+    """The Osmo draft recited sensor size, aperture and field of view -- all true,
+    all already implied by the model name in the title."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "Do not recite specifications" in DRAFT_SYSTEM_PROMPT
+    assert "product-page filler" in DRAFT_SYSTEM_PROMPT
+    # And the guard against over-correcting into a bare spec sheet.
+    assert "Keep the supported positive details" in DRAFT_SYSTEM_PROMPT
+    assert "not an instruction to write less" in DRAFT_SYSTEM_PROMPT
+
+
+def test_the_prompt_orders_what_the_description_covers():
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert (
+        "what it is; what condition it is in; anything included beyond the item "
+        "itself; and the one reason" in DRAFT_SYSTEM_PROMPT
+    )
+
+
+def test_asserted_wear_is_reported_and_denied_wear_is_not():
+    """The distinction the check turns on. "Some visible scuffing on the plates"
+    is the sentence being legislated against; "no stains, tears, or matting" is
+    the opposite claim, and flagging it would train the operator to ignore the
+    warning."""
+    from resell.reasoning.listing import _asserted_wear
+
+    assert _asserted_wear("Some visible scuffing on the plates.") == ["scuffing"]
+    assert _asserted_wear("Clean, with no stains or creases.") == []
+    assert _asserted_wear("The fur is unblemished and the box is unworn.") == []
+    assert "shelf wear" in _asserted_wear("There's shelf wear at the bottom corner.")
+    # "Wear" alone is not damage language: this jacket is new.
+    assert _asserted_wear("Cut slim, and ready for business or formal wear.") == []
+
+
+def test_wear_language_warns_and_is_not_refused():
+    """Same reasoning as every other style rule here: the sentence is *true*, and
+    refusing a truthful draft over emphasis is the reviewer overreaching."""
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    review = review_draft(
+        ListingDraft(title="A Nike trainer",
+                     description="Nike trainers, used, with scuffs on the toe."),
+        supported_text="Brand Nike", valid_evidence_ids={1},
+        available_support=frozenset(),
+    )
+    assert review.ok
+    assert any("dwells on ordinary wear" in w for w in review.warnings)
+
+
+def test_the_condition_slot_does_not_reopen_the_wear_inventory():
+    """Regression from the first pass: giving the description an explicit
+    "condition" slot invited the model to fill it, and three Bowflex drafts came
+    back listing scuffs and scratches again -- the rule the slot sits above."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "The condition slot is the grade and nothing else" in DRAFT_SYSTEM_PROMPT
+    assert "Naming the slot is not permission to fill it" in DRAFT_SYSTEM_PROMPT
+
+
+def test_an_absence_is_not_written_out():
+    """Regression from the first pass on the new prompt: told to say what is
+    included, the model wrote "no additional accessories or original packaging are
+    noted as included" -- database voice, and the exact thing being rewritten
+    away."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "a sentence whose content is that something is *not* there" in DRAFT_SYSTEM_PROMPT
+    assert "you have invented an absence to fill a slot" in DRAFT_SYSTEM_PROMPT
+    # The slot has to be optional where it is named, not only in the rule below it.
+    assert "skip any the record has nothing for" in DRAFT_SYSTEM_PROMPT
+
+
+def test_the_prompt_asks_for_varied_openings():
+    """Regression from the second pass: told to drop the advertising voice, the
+    model settled on "This is a ..." for sixteen listings out of eighteen. A
+    formula is a tell too."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "Do not open every listing the same way" in DRAFT_SYSTEM_PROMPT
+    assert '"This is a ..." is one opening among' in DRAFT_SYSTEM_PROMPT
+
+
+def test_plain_voice_is_the_goal_not_personality():
+    """The failure mode of "sound more human" is a model that gets chatty. The
+    instruction has to say which direction it is asking for."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "not more personality" in DRAFT_SYSTEM_PROMPT
+    assert "less advertising-copy tone" in DRAFT_SYSTEM_PROMPT
+
+
+def test_cosmetic_wear_is_kept_out_of_the_description():
+    """Three sentences of selling copy is not the place for "the screen has some
+    dust on it". The condition grade already says the item is second-hand."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "The description sells" in DRAFT_SYSTEM_PROMPT
+    # Named as a trailing clause too, because that is how it kept getting in.
+    assert "cosmetically excellent, though the" in DRAFT_SYSTEM_PROMPT
+    for word in ("Scuffs", "dust", "smudges"):
+        assert word in DRAFT_SYSTEM_PROMPT, word
+
+
+def test_wear_is_still_recorded_even_though_it_is_not_advertised():
+    """Emphasis, not concealment. The claims list is what the condition grade and
+    the photographs get checked against."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "Record every one of these in `claims`" in DRAFT_SYSTEM_PROMPT
+
+
+def test_a_defect_is_not_cosmetic_wear_and_still_has_to_be_said():
+    """The line the prompt has to draw: a mark on a used thing, versus a reason it
+    might not do what someone is buying it for. A buyer who receives a dead
+    battery unwarned returns it, and they are right to."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "about emphasis, not concealment" in DRAFT_SYSTEM_PROMPT
+    for defect in ("cracked screen", "dead battery", "not in the box"):
+        assert defect in DRAFT_SYSTEM_PROMPT, defect
 
 
 def test_invented_values_are_refused_while_loose_adjectives_warn():
@@ -5903,11 +6060,136 @@ def test_substitution_is_caught_during_mapping(tmp_path: Path):
 def test_drafting_prompt_asks_for_selection_not_recitation():
     from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
 
-    assert "it is not everything you know" in DRAFT_SYSTEM_PROMPT
+    assert "not everything you know" in DRAFT_SYSTEM_PROMPT
     assert "factory codes, barcodes" in DRAFT_SYSTEM_PROMPT
-    assert "two or three" in DRAFT_SYSTEM_PROMPT
+    # The limit is what forces the choosing, so it is the same instruction.
+    assert "three sentences at most" in DRAFT_SYSTEM_PROMPT
     # The reason, not just the rule.
     assert "buries the two facts that would have sold" in DRAFT_SYSTEM_PROMPT
+
+
+def test_the_drafting_prompt_asks_for_a_contemporary_voice():
+    """Marketing tone, not catalogue tone. The named anti-patterns matter more
+    than the adjective: "write conversationally" produces the same copy, and
+    "no boasts" does not."""
+    from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
+
+    assert "Contractions are fine" in DRAFT_SYSTEM_PROMPT
+    for cliche in ("boasts", "features an array of", "look no further"):
+        assert cliche in DRAFT_SYSTEM_PROMPT, cliche
+
+
+def test_a_repair_may_not_grow_the_description():
+    """Removing a phrase never needs a new sentence to replace it."""
+    from resell.reasoning.stages import REPAIR_SYSTEM_PROMPT
+
+    assert "three sentences or fewer" in REPAIR_SYSTEM_PROMPT
+
+
+def test_a_long_description_warns_and_is_not_refused():
+    """Length is a style rule. A draft thrown away for running long leaves the
+    seller writing the listing themselves, which is far worse than four
+    sentences."""
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    review = review_draft(
+        ListingDraft(title="A Nike trainer", description="One. Two. Three. Four."),
+        supported_text="Brand Nike", valid_evidence_ids={1},
+        available_support=frozenset(),
+    )
+    assert review.ok
+    assert any("4 sentences" in w for w in review.warnings)
+
+
+def test_three_sentences_passes_quietly():
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    review = review_draft(
+        ListingDraft(title="A Nike trainer", description="One. Two. Three."),
+        supported_text="Brand Nike", valid_evidence_ids={1},
+        available_support=frozenset(),
+    )
+    assert not any("sentences" in w for w in review.warnings)
+
+
+def test_advertising_phrasing_warns_and_is_not_refused():
+    """Same reasoning as the sentence limit: house style, not a claim. Refusing a
+    draft over "perfect for" would send it round the repair loop and, twice over,
+    to the seller's own keyboard."""
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    review = review_draft(
+        ListingDraft(
+            title="A Nike trainer",
+            description=(
+                "Designed to take a beating and perfect for daily wear. "
+                "Ready to go whether you're running or not."
+            ),
+        ),
+        supported_text="Brand Nike", valid_evidence_ids={1},
+        available_support=frozenset(),
+    )
+    assert review.ok
+    stale = next(w for w in review.warnings if "advertising phrasing" in w)
+    for phrase in ("designed to", "perfect for", "ready to go", "whether you"):
+        assert phrase in stale, phrase
+
+
+def test_a_curly_apostrophe_does_not_hide_the_phrase():
+    """Models write "you’re", the list says "you're". Without folding, the
+    warning silently never fires -- the worst kind of check."""
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    review = review_draft(
+        ListingDraft(title="A Nike trainer",
+                     description="Great whether you’re running or walking."),
+        supported_text="Brand Nike", valid_evidence_ids={1},
+        available_support=frozenset(),
+    )
+    assert any("advertising phrasing" in w for w in review.warnings)
+
+
+def test_plain_copy_draws_no_style_warning():
+    """The rewritten register, checked against the reviewer that grades it."""
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    review = review_draft(
+        ListingDraft(
+            title="A Nike trainer",
+            description=(
+                "Nike running trainers in used condition. "
+                "The dual laces and original box are included."
+            ),
+        ),
+        supported_text="Brand Nike laces box", valid_evidence_ids={1},
+        available_support=frozenset(),
+    )
+    assert not any("advertising phrasing" in w for w in review.warnings)
+
+
+def test_marketing_copy_may_still_be_salesy():
+    """The buyer never reads that field. Warning on it would be scolding the one
+    place the prompt puts the salesmanship."""
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    review = review_draft(
+        ListingDraft(title="A Nike trainer", description="Nike trainers, used.",
+                     marketing_copy="Perfect for runners; designed to go the distance."),
+        supported_text="Brand Nike", valid_evidence_ids={1},
+        available_support=frozenset(),
+    )
+    assert not any("advertising phrasing" in w for w in review.warnings)
+
+
+def test_a_specification_is_not_four_sentences():
+    """"18-55mm f/3.5-5.6 IS STM." is one sentence, and a naive full-stop count
+    reads it as four -- which would warn on every camera listing."""
+    from resell.reasoning.listing import _sentence_count
+
+    assert _sentence_count(
+        "Canon EOS Rebel T6i with the EF-S 18-55mm f/3.5-5.6 IS STM lens. "
+        "Light wear on the body. Ready to shoot."
+    ) == 3
 
 
 def test_naming_an_optional_aspect_finds_it(tmp_path: Path, monkeypatch, capsys):
@@ -6411,11 +6693,15 @@ def test_history_claims_are_gated_like_condition_claims():
     assert review(indicators, "USED_GOOD").ok
 
 
-def test_prompt_prefers_indicators_over_narrative():
+def test_prompt_refuses_a_history_it_cannot_observe():
+    """"Never worn" is a claim about the item's past that no photograph can
+    establish. That has not changed; what changed is that only *positive*
+    indicators are worth description space."""
     from resell.reasoning.stages import DRAFT_SYSTEM_PROMPT
 
-    assert "describe the indicators rather than asserting the history" in DRAFT_SYSTEM_PROMPT
-    assert "prefer the evidence to the narrative" in DRAFT_SYSTEM_PROMPT
+    assert "Never assert a history" in DRAFT_SYSTEM_PROMPT
+    assert "no photograph can establish" in DRAFT_SYSTEM_PROMPT
+    assert "Negative ones are not" in DRAFT_SYSTEM_PROMPT
 
 
 # --- a figure matches exactly, or it does not match ---------------------------------

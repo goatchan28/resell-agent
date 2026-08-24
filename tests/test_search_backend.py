@@ -231,10 +231,21 @@ def test_the_index_text_is_kept_but_not_offered_as_an_excerpt():
 
 def test_an_off_product_result_is_dropped_before_it_costs_anything():
     """eBay's related-items carousels put charging cables in the same response as
-    the speaker; one real query returned 229 priced entries this way."""
-    comps, notes = priced_comps()
-    assert not any(c.external_id == "257680906175" for c in comps)
-    assert any("off-product" in n for n in notes)
+    the speaker; one real query returned 229 priced entries this way.
+
+    One matching term is enough now -- the gate removes what is certainly a
+    different product and the judging stage decides what is comparable. So a
+    cable whose title carries the brand survives this and dies at the judge; a
+    cable that carries nothing dies here.
+    """
+    comps, notes = priced_comps(identity_terms=("Beats", "Pill", "A3211"))
+    cable = next((c for c in comps if c.external_id == "257680906175"), None)
+    assert cable is None or "CABLE" in (cable.title or "").upper()
+
+
+def test_a_result_sharing_no_identity_term_is_still_dropped():
+    comps, _ = priced_comps(identity_terms=("Bowflex", "SelectTech"))
+    assert comps == []
 
 
 def test_the_cap_is_reported_rather_than_applied_silently():

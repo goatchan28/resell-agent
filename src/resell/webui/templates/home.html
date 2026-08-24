@@ -52,6 +52,6 @@
 
 {% if done %}
   <p class="tiny quiet">{{ done | length }} item(s) finished or abandoned —
-    <a href="{{ url_for('inventory') }}">inventory</a></p>
+    <a href="{{ url_for('ops_inventory') }}">inventory</a></p>
 {% endif %}
 {% endblock %}

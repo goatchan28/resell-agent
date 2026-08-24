@@ -1,0 +1,17 @@
+{# Setting a price by hand, and asking for another look.
+
+   Shared by the two screens that need it: the one where no comparable listings
+   were found, and the one where some were found but none of them was a
+   marketplace price. Same actions, same safety check -- a price below the floor
+   still has to be confirmed. #}
+<form method="post" action="{{ url_for('set_price', sku=task.sku) }}"
+      class="c-price-entry" data-long>
+  <label>$<input type="text" name="price" inputmode="decimal"
+                 placeholder="0.00" required autocomplete="off"></label>
+  <button type="submit" class="primary" data-busy="Working…">Use this price</button>
+  <label class="tiny"><input type="checkbox" name="confirm_below_floor">
+    list it even if it loses money</label>
+</form>
+<form method="post" action="{{ url_for('more_research', sku=task.sku) }}" data-long>
+  <button type="submit" data-busy="Looking…">Let it look again</button>
+</form>

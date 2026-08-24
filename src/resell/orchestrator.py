@@ -33,6 +33,7 @@ from enum import StrEnum
 
 from resell import progress
 from resell.domain import ItemState
+from resell.pricing.comps import PriceKind
 from resell.views import search_is_available
 
 
@@ -322,7 +323,20 @@ def next_step(conn: sqlite3.Connection, sku: str, *, marketplace: str = "EBAY_US
         )
 
     claimed = sp.load_scored_comps(conn, sku)
-    contributing = [c for c in claimed if c.claim.contributes]
+    # Two conditions, because the estimator applies both and this used to apply
+    # only the first. `claim.contributes` is about comparability rank; it knows
+    # nothing about what kind of price the comp is. `recommend` then lifts every
+    # `reference` comp out of the sample -- a retail price is context, never a
+    # marketplace observation -- so an item whose only claim was a retail price
+    # routed to "approve a price" and arrived with nothing to approve.
+    #
+    # MP-000021: one claim, a $6.00 retail price, and a screen headed "Choose a
+    # price" with no prices on it.
+    contributing = [
+        c for c in claimed
+        if c.claim.contributes
+        and c.observation.price_kind is not PriceKind.REFERENCE
+    ]
     # An approved price settles the question comps were being gathered to answer,
     # so it has to be asked before them. Without this an item priced on the
     # operator's judgement stayed on `price_without_comps` for ever -- the same
@@ -1105,8 +1119,21 @@ class StageRunner:
         # same question.
         stage_budget, lookup_budget = comp_budgets_for(conn, sku)
         try:
+            # The agent judges its own comparables and records the claims.
+            #
+            # It was proposing them for a person to accept, which put a review
+            # queue between finding a price and having one. The judging stage was
+            # already doing the work -- it excluded the replacement weight plates
+            # and the parts listings correctly every time -- and the operator was
+            # ratifying a decision that had already been made with better
+            # information than they had.
+            #
+            # What did not move: the *price* still needs approving, and so does
+            # the listing. Those are decisions about what to charge and what to
+            # say. Which listings are comparable is a matter of fact about the
+            # objects, and the judge sees the whole record.
             outcome = run_comp_round(
-                conn, gateway, sku, research_adapter=adapter, propose_only=True,
+                conn, gateway, sku, research_adapter=adapter, propose_only=False,
                 stage_budget=stage_budget, lookup_budget=lookup_budget,
             )
         except BudgetExceeded as exc:

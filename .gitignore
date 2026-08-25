@@ -45,9 +45,10 @@ logs/
 # own listings. `bench/sanitize.py` writes the committed aggregate instead.
 bench/results/
 
-# Generated evaluation dataset. Regenerable from the database by eval/extract.py,
-# and it carries third-party listing titles, URLs and page-derived event
-# payloads -- the same content that keeps bench/results/ out. The hand-written
-# ground truth in eval/items/ IS committed: it is the only place it exists.
+# Generated evaluation output. Regenerable from the database by eval/review.py,
+# and it embeds listing text, comp titles and URLs -- the same content that keeps
+# bench/results/ out. `verdicts.csv` is the exception and IS committed: it holds
+# the human judgements, which exist nowhere else.
+eval/review/*.md
 eval/dataset/
 eval/baseline_snapshot/

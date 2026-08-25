@@ -44,3 +44,10 @@ logs/
 # `excerpt` fields quoting third-party pages and the drafted text of the seller's
 # own listings. `bench/sanitize.py` writes the committed aggregate instead.
 bench/results/
+
+# Generated evaluation dataset. Regenerable from the database by eval/extract.py,
+# and it carries third-party listing titles, URLs and page-derived event
+# payloads -- the same content that keeps bench/results/ out. The hand-written
+# ground truth in eval/items/ IS committed: it is the only place it exists.
+eval/dataset/
+eval/baseline_snapshot/

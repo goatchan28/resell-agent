@@ -1,0 +1,52 @@
+# Copy to MP-0000NN.yaml, one per evaluated item.
+# `truth:` is filled in BEFORE looking at what the agent produced.
+# `verdict:` is filled in AFTER the run. See ../PROTOCOL.md §3.
+sku: MP-0000NN
+evaluated_at:
+baseline_commit: b28e4f4
+
+truth:
+  what_it_is:
+  brand:
+  model_number:
+  condition:                    # new_with_tags | new_other | used_like_new |
+                                # used_excellent | used_very_good | used_good |
+                                # used_acceptable | for_parts
+  condition_note:
+  accessories_present: []
+  purchase_cost_cents:
+  known_market_price_cents:     # OPTIONAL — leave null unless you actually know
+  photos:
+  category_family:
+  traits: []                    # branded, model_number_visible, generic,
+                                # soft_goods, thin_market, active_market,
+                                # bundle_or_accessories, electronics, ...
+  difficulty_expected:          # easy | medium | hard
+  difficulty_reasons: []        # required when difficulty is medium or hard
+
+verdict:
+  outcome:                      # listed | blocked | abandoned | paused_external
+  autonomous:                   # listed AND human_rescues == 0
+
+  identification:               # correct | partly | wrong
+  identification_note:
+  condition:                    # correct | one_rung_off | wrong
+  condition_direction:          # optimistic | pessimistic | null
+
+  price:                        # sensible | too_high | too_low | no_price
+  price_note:
+
+  title:                        # accurate | awkward | wrong
+  description:                  # accurate | awkward | wrong
+
+  questions_asked:              # integer
+  questions_necessary:          # integer, <= questions_asked
+  questions_note:
+
+  human_rescues:                # integer. Approvals and necessary questions are
+                                # NOT rescues. See PROTOCOL.md §2.
+  rescue_note:
+  would_i_list_this:            # yes | no
+
+price_audit:                    # null unless triggered by PROTOCOL.md §4
+findings: []

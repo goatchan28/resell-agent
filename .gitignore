@@ -39,3 +39,8 @@ logs/
 
 # macOS
 .DS_Store
+
+# Benchmark raw results. Every model's tool_input verbatim, which includes
+# `excerpt` fields quoting third-party pages and the drafted text of the seller's
+# own listings. `bench/sanitize.py` writes the committed aggregate instead.
+bench/results/

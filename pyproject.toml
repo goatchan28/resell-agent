@@ -43,5 +43,9 @@ build-backend = "hatchling.build"
 packages = ["src/resell"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "." puts the repository root on sys.path so `tests.` imports resolve.
+# `python -m pytest` adds the working directory implicitly and the console script
+# does not, so without this the documented `uv run pytest` failed collection while
+# `python -m pytest` passed -- two commands, two different answers.
+pythonpath = ["src", "."]
 testpaths = ["tests"]

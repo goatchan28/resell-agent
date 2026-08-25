@@ -10,13 +10,16 @@ not, the SKU and a rough note go in "Run notes" below and the run moves on.
 
 | | |
 |---|---|
-| baseline commit | _(before item #1)_ |
-| snapshot path | _(outside the repo: `~/Backups/resell/eval-baseline-<date>/`)_ |
-| database sha256 | _(before item #1)_ |
-| search backend | _(recorded)_ |
-| eBay env | _(recorded)_ |
+| evaluation window opened | 2026-08-25 |
+| baseline commit | `443030de16dd` |
+| snapshot path | `~/Backups/resell/eval-baseline-2026-08-25/` (outside the repository) |
+| database sha256 | `30302e059d85b045fbcd114c5341674df52edc8e383a471c44ef6f585fc2646f` |
+| photographs snapshotted | 130 files |
+| search backend | `brave` |
+| eBay env | `sandbox` |
 | model | `claude-sonnet-5` |
-| first evaluation SKU | _(recorded)_ |
+| last pre-window item | `MP-000048` (seq 48) |
+| cohort | first 30 qualifying items with seq > 48, **any owner** |
 | HEAD at end of run | _(after item #30)_ |
 
 ## Run notes

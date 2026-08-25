@@ -187,15 +187,48 @@ sources you actually checked), `audit_verdict` ∈
 established is information; inventing one is not. `audit_sources: 0` marks a
 verdict as opinion rather than evidence, visibly.
 
-## 8. Item selection
+## 8. The cohort — who and what counts
 
-Grab a varied set from the cupboard — some branded with model numbers, some
-without, some clothing, some generic, some you expect to go badly. **Do not
-pre-classify anything.** Traits and difficulty are assigned at review time, from
-the photographs and the record.
+**The first 30 qualifying items after the start point, whoever owns them.**
 
-Variety matters because thirty of the same kind of thing measures one kind of
-thing. It is advice, not a checklist to satisfy mid-run.
+Invited testers' items count, and they do nothing differently. A tester's item
+runs through the same orchestrator, the same gateway and the same tables:
+MP-000047, a tester's, recorded 3 runs, 24 model calls, 88 step rows and a price
+proposal — indistinguishable in shape from any of the admin's. There is no
+technical reason to exclude one, and excluding them would measure the operator
+rather than the product.
+
+| | |
+|---|---|
+| start point | `seq > 48` — everything up to `MP-000048` predates the window |
+| qualifying | at least one photograph **and** at least one agent run |
+| owner | irrelevant to selection, preserved in the analysis |
+| outcome | irrelevant — `blocked` and `abandoned` are results |
+
+**Qualifying** excludes an accidental empty creation — there are two in the
+existing data — without excluding anything the agent genuinely attempted.
+Outcome is deliberately not a criterion: dropping the items that went badly
+would measure only the runs that went well. Items that do not qualify are
+listed in the report with the reason, never silently discarded.
+
+**Owner identity is preserved and pseudonymised.** The analysis reports `admin`
+against `tester-a`, `tester-b` … because comparing your usage with invited-user
+usage is one of the things this run is for. The mapping to real addresses stays
+out of anything committed: the per-item pages show the real owner and are
+ignored by git; `verdicts.csv` carries only the label.
+
+**Testers are never asked to fill anything in.** Retrospective judgements about
+their items are made from the same photographs and record as anyone's, and where
+that is not enough — an item whose photographs do not settle what it was —
+`unsure` is the correct entry, not a question to the tester.
+
+### Selection advice
+
+Grab a varied set — some branded with model numbers, some without, some
+clothing, some generic, some you expect to go badly. **Do not pre-classify
+anything.** Traits and difficulty are assigned at review time, from the
+photographs and the record. Variety matters because thirty of the same kind of
+thing measures one kind of thing. Advice, not a checklist to satisfy mid-run.
 
 ## 9. Pre-flight, once, before item #1
 

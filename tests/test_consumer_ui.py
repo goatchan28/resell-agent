@@ -374,13 +374,17 @@ def test_progress_appears_without_a_run_in_the_url(tmp_path):
     started the run had put `?run=` in the URL."""
     config, conn, gateway = fixture(tmp_path)
     sku = with_item(gateway, conn)
+    # The client first: startup reconciliation treats any `running` row it
+    # finds as the wreckage of a dead process, which is the only thing it can
+    # be at startup. A live run belongs to a live app, in that order.
+    live = client(config)
     conn.execute(
         "INSERT INTO agent_run (run_id, sku, status, started_at) VALUES (?,?,?,?)",
         ("run_live", sku, "running", db.now_iso()),
     )
     conn.commit()
 
-    body = client(config).get("/").get_data(as_text=True)
+    body = live.get("/").get_data(as_text=True)
     # The run id reaches the page from the item's own state, not from the URL the
     # button happened to redirect to. It is what the poll asks about.
     assert "/runs/run_live" in body

@@ -405,6 +405,10 @@ class PriceRecommendation:
     # that was present and did nothing is exactly what this record is for.
     retail_anchor: object | None = None
     anchor_weight: float = 0.0
+    # How much of the answer the marketplace sample deserved, 0 to 1. Reported
+    # rather than inferred: it is the number every blend in this module turns on,
+    # and a reader asking "why did retail get a say here" is asking about this.
+    market_confidence: float = 0.0
     diagnostic_confidence: float = 0.0
     # The account of how the number was reached, including the evidence that was
     # present and did nothing.
@@ -707,19 +711,40 @@ def recommend(inp: PricingInput) -> PriceRecommendation:
     if chosen.is_widely_dispersed:
         quals.add(PriceQualifier.WIDE_DISPERSION)
 
-    # Thin marketplace evidence and a shop price for the item itself. Both are
-    # kept: the band spans them, and the centre moves according to how much the
-    # sample deserves. MP-000041 is the case -- one `category_attribute` ask at
-    # $75 for a cheaper sub-line, against a $139 shop price for this exact model,
-    # produced $75 and asked nobody anything.
-    market_weight = _market_weight(chosen_pool)
-    if anchor is not None and market_weight < BLEND_BELOW:
-        anchor_share = 1.0 - market_weight
-        central = round(central * market_weight + anchor.point_cents * anchor_share)
+    # Marketplace evidence and a shop price for the item itself, weighed against
+    # each other continuously. MP-000041 is the case the blending exists for --
+    # one `category_attribute` ask at $75 for a cheaper sub-line, against a $139
+    # shop price for this exact model, produced $75 and asked nobody anything.
+    #
+    # No threshold. `BLEND_BELOW` used to switch retail from "part of the answer"
+    # to "ceiling only" at a cliff, so two items either side of it were priced by
+    # different philosophies over a hair's difference in evidence.
+    confidence = market_confidence(
+        chosen_pool,
+        item_condition=inp.item_condition_band,
+        identity_resolved=(inp.identity_resolution == "resolved"),
+    )
+    base = _replace(base, market_confidence=confidence)
+    share = anchor_share(confidence, anchor_trust(anchor))
+    if anchor is not None and share > 0:
+        blended = round(central * (1 - share) + anchor.point_cents * share)
+        # The anchor may not drag the centre below every observed price. It is a
+        # depreciation estimate; transactions above it falsify the retention rate
+        # rather than the other way round. Two realized sales at $500 against a
+        # $398 shop price mean this thing sells above retail -- averaging that
+        # toward an inference erases the finding and hides the ceiling breach.
+        floor = round(chosen.min_cents * factor)
+        blended = max(blended, floor)
+        # And it may not push the centre above a market that has a real ceiling,
+        # for the mirror-image reason. Same rule and same threshold the three
+        # strategies use, so the band's centre and Balanced cannot disagree.
+        if chosen.n >= ENOUGH_TO_BOUND and chosen.max_cents > chosen.min_cents:
+            blended = min(blended, round(chosen.max_cents * factor))
+        central = blended
         low = min(low, anchor.low_cents)
         high = max(high, anchor.high_cents)
         quals.add(PriceQualifier.ANCHOR_BLENDED)
-        base = _replace(base, anchor_weight=anchor_share)
+        base = _replace(base, anchor_weight=share)
 
     ceiling_ok, _ = retail_ceiling_check(central, inp.retail)
     if not ceiling_ok:
@@ -982,39 +1007,118 @@ RUNG_WEIGHT: dict[Comparability, float] = {
     Comparability.CATEGORY_ATTRIBUTE: 0.50,
 }
 
-# Where a sample stops being thin. At or above this the market speaks for itself
-# and the anchor is recorded as context without touching the band.
-ENOUGH_COMPS = 3
+# What an observation of each kind is worth. An asking price is a real signal --
+# somebody chose that number and put it in front of buyers -- but nobody has
+# accepted it, so it is worth a little less than a sale.
+KIND_WEIGHT: dict[PriceKind, float] = {
+    PriceKind.REALIZED: 1.00,
+    PriceKind.ASKING: 0.85,
+}
 
-# Below this the marketplace sample is worth less than half an answer, and a
-# retail-derived anchor is allowed to speak alongside it. At or above it the
-# market is talking and the anchor is recorded as context and nothing more --
-# two same-family asks clustered above the shop price mean the thing sells above
-# the shop price, and blending that toward a depreciation rate would erase a
-# real finding to make room for a guess.
-BLEND_BELOW = 0.5
+# How much a sample tells you about *this* item's condition. Unknown is not
+# neutral: a price with no condition attached could be for anything on the
+# ladder, and the same is true of one two rungs away.
+CONDITION_MATCHED = 1.00
+CONDITION_ADJACENT = 0.90
+CONDITION_DISTANT_OR_UNKNOWN = 0.70
+
+# An unresolved identity already caps the rung at `same_family_variant`, so this
+# is deliberately mild -- it is the residue of doubt after that cap, not a second
+# full penalty for the same fact.
+IDENTITY_RESOLVED = 1.00
+IDENTITY_UNRESOLVED = 0.85
+
+# Where a sample stops growing in persuasiveness. `ess/(ess+K)`: four effective
+# comps is roughly half an answer, twenty is 0.83. Saturating rather than
+# stepping, because there is no n at which a market suddenly becomes known.
+BREADTH_K = 4.0
+
+# Below this many contributing comps a sample is a handful of points, not a
+# range, and its top cannot bound anything. `strategy._positions` uses the same
+# threshold, so the band's centre and Balanced are never computed differently.
+ENOUGH_TO_BOUND = 3
 
 
-def _market_weight(pool: list[ScoredComp]) -> float:
-    """How much of the answer the marketplace sample deserves.
+def market_confidence(
+    pool: list[ScoredComp],
+    *,
+    item_condition: ConditionBand = ConditionBand.UNKNOWN,
+    identity_resolved: bool = False,
+) -> float:
+    """How much of the answer the marketplace sample deserves, from 0 to 1.
 
-    Two things, multiplied: how comparable the best of it is, and how much of it
-    there is. One weak comp is not half an answer, and pretending otherwise is
-    how a single ask became a three-strategy recommendation.
+    **Quality scales the count, not the result.** Each observation is worth
+    `quality` of an observation, the weighted total is an effective sample size,
+    and confidence saturates in that. The alternative -- multiplying a breadth
+    term by the quality factors -- puts a ceiling on confidence that no amount of
+    data can lift: sibling asks of unknown condition on an unresolved item cap
+    out at 0.38, so twenty real listings would still hand a retail-derived
+    inference 47% of the say. Twenty listings are a market. This says they are
+    worth about 7.6 solid comps, which is the honest version of the same doubt.
+
+    Identical to the simple form when quality is perfect, so nothing about a
+    clean exact-match sample changes.
+
+    Replaces `_market_weight`, which had two faults this does not: a threshold
+    (`BLEND_BELOW`) that switched retail between "blended" and "ignored" at a
+    cliff, and an override making any single `same_product` comp worth a whole
+    market. One listing is a fact about one seller.
     """
     if not pool:
         return 0.0
-    # A listing for the identical product is a fact about this product's market.
-    # An anchor is an inference from a shop price and a retention rate. Facts are
-    # not diluted by inferences, however few of them there are: two same-product
-    # asks above the shop price mean the thing sells above the shop price, and
-    # averaging that toward a depreciation guess would erase the finding.
-    if any(c.claim.comparability is Comparability.SAME_PRODUCT for c in pool):
-        return 1.0
-    best = max(
+    best_rung = max(
         (RUNG_WEIGHT.get(c.claim.comparability, 0.0) for c in pool), default=0.0
     )
-    return best * min(len(pool), ENOUGH_COMPS) / ENOUGH_COMPS
+    if not best_rung:
+        return 0.0
+
+    effective = 0.0
+    for comp in pool:
+        rung = RUNG_WEIGHT.get(comp.claim.comparability, 0.0)
+        if not rung:
+            continue
+        kind = KIND_WEIGHT.get(comp.observation.price_kind, 0.85)
+        steps = ladder_steps(comp.observation.condition_band, item_condition)
+        if steps is None:
+            condition = CONDITION_DISTANT_OR_UNKNOWN
+        elif steps == 0:
+            condition = CONDITION_MATCHED
+        elif steps < MATERIAL_CONDITION_STEPS:
+            condition = CONDITION_ADJACENT
+        else:
+            condition = CONDITION_DISTANT_OR_UNKNOWN
+        identity = IDENTITY_RESOLVED if identity_resolved else IDENTITY_UNRESOLVED
+        effective += rung * kind * condition * identity
+    return effective / (effective + BREADTH_K)
+
+
+def anchor_trust(anchor) -> float:
+    """How much a retail-derived anchor deserves, from 0 to 1.
+
+    Two separable doubts: whether the shop price is for *this* product, and
+    whether the retention rate applied to it was chosen for this kind of thing or
+    fallen back to the default.
+    """
+    if anchor is None:
+        return 0.0
+    match = getattr(anchor, "match", None) or Comparability.SAME_PRODUCT
+    by_match = {
+        Comparability.SAME_PRODUCT: 1.00,
+        Comparability.SAME_FAMILY_VARIANT: 0.60,
+    }.get(match, 0.0)
+    by_category = 0.75 if anchor.is_default_category else 1.00
+    return by_match * by_category
+
+
+def anchor_share(confidence: float, trust: float) -> float:
+    """The anchor's say in the answer. Squared, and that is the whole design.
+
+    Linear in `1 - confidence` gives twenty exact comps a 29% retail share, which
+    pushes a recommendation above every listing anybody can see. Squared it is
+    8.5%, and with realized sales under 3%: a strong market dominates without a
+    threshold saying so, and a weak one lets the anchor speak in proportion.
+    """
+    return trust * (1.0 - confidence) ** 2
 
 
 def median_low(ordered: list, *, key):

@@ -127,7 +127,7 @@ def test_the_test_is_ordered_and_bundles_come_first():
     brand."""
     p = prompt()
     assert "stop at the first line that applies" in p
-    assert p.index("More than one article in the price") < p.index("different material")
+    assert p.index("separately saleable product") < p.index("different material")
     assert p.index("different material") < p.index("step down")
     for kind in ("accessory", "part", "lot"):
         assert kind in p, kind
@@ -137,7 +137,7 @@ def test_an_exclusion_is_told_to_carry_its_reason():
     """13 of 24 judgements were discarded on the way in for want of one, which
     leaves a listing neither counted nor accounted for."""
     p = prompt()
-    assert "naming the extra item" in p
+    assert "naming the extra product" in p
     assert "naming the cloth" in p
     assert "`excluded_reason`, every time" in p
     from resell.reasoning.tools import COMP_JUDGE_TOOL_SCHEMA

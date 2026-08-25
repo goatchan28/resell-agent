@@ -179,6 +179,10 @@ class PriceAnchor:
     # `RetailAnchor.basis`, verbatim, when there is one. Restating the retention
     # arithmetic here would be a second copy of it.
     basis: str = ""
+    # A marketplace position that a retail-derived anchor moved. Still a
+    # marketplace position -- the sample is what it is taken from -- but the
+    # number is not one an observation states, and a reader is owed that.
+    blended_from_retail: bool = False
 
     @property
     def is_observed(self) -> bool:
@@ -262,16 +266,21 @@ def build_strategies(
         minimum_net_proceeds_cents, schedule=sched, costs=c
     )
 
+    positions = _positions(rec, d, strength) if not anchor_only else None
+
     prices: dict[SellerObjective, StrategyPrice] = {}
     for objective in SellerObjective:
         stat = _SELECTION[(objective, strength)]
         if anchor_only:
             raw, anchor = _from_anchor(rec, objective, stat)
         else:
-            raw = round(_stat(d, stat) * rec.adjustment_factor)
+            raw = positions[objective]
             anchor = PriceAnchor(
                 statistic=stat, price_kind=rec.price_kind,
                 band_relation=rec.band_relation, value_cents=raw, n=d.n,
+                blended_from_retail=(
+                    rec.retail_anchor is not None and rec.anchor_weight > 0
+                ),
             )
         price = max(raw, floor_price)
         floor_bound = price > raw
@@ -344,6 +353,64 @@ def _from_anchor(
         statistic=stat, price_kind=None, band_relation="retail_anchored",
         value_cents=raw, n=0, source=AnchorSource.RETAIL_ANCHOR, basis=band.basis,
     )
+
+
+def _positions(rec: PriceRecommendation, d: Distribution, strength: BrandStrength):
+    """The three prices, from the marketplace sample and the retail anchor.
+
+    Three deliberate asymmetries, because these are seller intents and not
+    statistics of one sample:
+
+    **Fast never rises above the market floor.** A "sell quickly" price above
+    every visible competitor does not sell quickly. Retail can lower it -- when
+    there is no market at all it is all there is -- and cannot lift it.
+
+    **Balanced is capped by the market's ceiling**, whenever the sample is big
+    enough to have one. Balanced means the price most likely to actually sell;
+    recommending above every observed seller is the other strategy's job. Under
+    `ENOUGH_TO_BOUND` comps there is no ceiling to speak of: one listing is a
+    fact about one seller, and letting it veto a trustworthy shop price is the
+    MP-000041 mistake in a new place.
+
+    **Aggressive may exceed the market**, in proportion to what the marketplace
+    evidence is missing. MP-000047 is why: three sibling asks, no sales, no exact
+    match, unresolved identity, and a $399 same-product shop price. Its Fast and
+    Balanced were both $45 and $99.99 -- two strategies at one price, because the
+    median and the top of a three-point sample were the same observation.
+
+    No spacing is manufactured. Where the evidence supports one number, the three
+    stay together and the screen shows one price.
+    """
+    from .estimate import ENOUGH_TO_BOUND, anchor_share, anchor_trust
+
+    factor = rec.adjustment_factor
+    m_lo = round(_stat(d, _SELECTION[(SellerObjective.FAST_SALE, strength)]) * factor)
+    m_mid = round(_stat(d, _SELECTION[(SellerObjective.BALANCED, strength)]) * factor)
+    m_hi = round(_stat(d, _SELECTION[(SellerObjective.MAX_PROCEEDS, strength)]) * factor)
+
+    band = rec.retail_anchor
+    share = anchor_share(rec.market_confidence, anchor_trust(band))
+    if band is None or share <= 0:
+        return {SellerObjective.FAST_SALE: m_lo,
+                SellerObjective.BALANCED: m_mid,
+                SellerObjective.MAX_PROCEEDS: m_hi}
+
+    kept = 1.0 - share
+
+    def blend(market: int, retail: int) -> int:
+        return round(market * kept + retail * share)
+
+    low = min(m_lo, blend(m_lo, band.low_cents))
+    high = max(m_hi, blend(m_hi, band.high_cents))
+    centre = blend(m_mid, band.point_cents)
+    # Never below every observed price -- see the matching clamp in `recommend`.
+    centre = max(centre, round(d.min_cents * factor))
+    if d.n >= ENOUGH_TO_BOUND and m_hi > m_lo:
+        centre = min(max(centre, m_lo), m_hi)
+    centre = min(max(centre, low), high)
+    return {SellerObjective.FAST_SALE: low,
+            SellerObjective.BALANCED: centre,
+            SellerObjective.MAX_PROCEEDS: high}
 
 
 def _sold_note(rec: PriceRecommendation) -> str:

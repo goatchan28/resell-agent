@@ -665,6 +665,57 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
     (
         "ALTER TABLE identification ADD COLUMN category_path TEXT",
     ),
+    # Which beta tester's shelf an item belongs on.
+    #
+    # Not user accounts. There is one eBay seller account, one database and one
+    # inventory; this is a label saying whose consumer screens should show a
+    # given item, taken from the email Cloudflare Access authenticated. /ops
+    # ignores it entirely and still sees everything.
+    #
+    # NULL means "no tester owns this", and the consumer scoping is an equality
+    # match -- so a NULL item appears on nobody's shelf rather than everybody's.
+    # That is the safe direction for a column added to a database that already
+    # has items in it: they stay out of the beta until something claims them.
+    (
+        "ALTER TABLE item ADD COLUMN owner_email TEXT",
+        "CREATE INDEX idx_item_owner ON item (owner_email, seq)",
+    ),
+    # `interrupted`: the run did not end, the process did.
+    #
+    # A third thing, and the distinction is the point. `blocked` means a stage
+    # said it could not do this; `failed` means something nobody planned for went
+    # wrong inside the work. Neither is true of a run that was killed by a
+    # restart, a crash or the Mac going to sleep -- nothing was learned about the
+    # item, and recording it as `failed` would have the seller's screen say "We
+    # could not find prices for this" about a market nobody finished looking at.
+    #
+    # They also mean different things to whoever is on call: `failed` and
+    # `blocked` say look at this item, `interrupted` says look at the host.
+    #
+    # Same rebuild as the `blocked` migration above, for the same reason.
+    (
+        NO_TRANSACTION,
+        "PRAGMA foreign_keys = OFF",
+        "BEGIN IMMEDIATE",
+        """
+        CREATE TABLE agent_run_new (
+            run_id      TEXT PRIMARY KEY,
+            sku         TEXT NOT NULL REFERENCES item(sku),
+            status      TEXT NOT NULL
+                CHECK (status IN ('running','done','failed','blocked','interrupted')),
+            started_at  TEXT NOT NULL,
+            finished_at TEXT,
+            detail      TEXT NOT NULL DEFAULT ''
+        )
+        """,
+        "INSERT INTO agent_run_new SELECT run_id, sku, status, started_at, "
+        "finished_at, detail FROM agent_run",
+        "DROP TABLE agent_run",
+        "ALTER TABLE agent_run_new RENAME TO agent_run",
+        "CREATE INDEX idx_run_sku ON agent_run (sku, started_at)",
+        "COMMIT",
+        "PRAGMA foreign_keys = ON",
+    ),
 )
 
 

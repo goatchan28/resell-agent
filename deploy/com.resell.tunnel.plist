@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The tunnel, as a *user* LaunchAgent.
+
+  `sudo cloudflared service install` writes a root LaunchDaemon whose
+  ProgramArguments are bare `/opt/homebrew/bin/cloudflared` -- no `tunnel run`,
+  no `--config`. Running as root it also cannot see ~/.cloudflared, where `login`
+  and `create` put the certificate and the tunnel credentials. The result starts,
+  does nothing, and registers zero connections.
+
+  A user agent instead, for the same reason the app is one: the credentials, the
+  config and the virtualenv all live in this user's home. Neither service needs
+  sudo, and neither can be up while the other is down for want of a password.
+
+  The trade, stated: a LaunchAgent runs when the user is logged in. On an
+  always-on Mac Studio that is every moment except an unattended reboot -- if
+  that matters, turn on automatic login in System Settings > Users & Groups.
+
+      cp deploy/com.resell.tunnel.plist ~/Library/LaunchAgents/
+      launchctl load -w ~/Library/LaunchAgents/com.resell.tunnel.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.resell.tunnel</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/cloudflared</string>
+    <string>--config</string>
+    <string>/Users/kington/.cloudflared/config.yml</string>
+    <string>--no-autoupdate</string>
+    <string>tunnel</string>
+    <string>run</string>
+    <string>resell</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/kington/Library/Logs/resell-tunnel.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/kington/Library/Logs/resell-tunnel.log</string>
+</dict>
+</plist>

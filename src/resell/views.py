@@ -239,6 +239,7 @@ def item_summaries(
     *,
     states: tuple[str, ...] = (),
     active_only: bool = False,
+    owner_email: str | None = None,
 ) -> list[ItemSummary]:
     """Every item, in SKU order, terminal ones included unless filtered out.
 
@@ -252,6 +253,12 @@ def item_summaries(
         params.extend(states)
     if active_only:
         clauses.append("i.state NOT IN ('abandoned', 'listed')")
+    if owner_email is not None:
+        # Equality, so an item with no owner matches nobody. That is the safe
+        # direction: the column was added to a database that already had 45 items
+        # in it, and they should stay out of the beta until something claims them.
+        clauses.append("i.owner_email = ?")
+        params.append(owner_email.casefold())
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
     rows = conn.execute(
@@ -1155,6 +1162,10 @@ class WorkflowView:
     stopped_step: str = ""
     stopped_reason: str = ""
     stopped_cleanly: bool = False
+    # The last run did not end -- the process did. Said differently to the seller,
+    # because nothing was learned about the item and claiming otherwise would be
+    # the same error the pricing invariant exists to prevent.
+    stopped_interrupted: bool = False
 
     @property
     def is_done(self) -> bool:
@@ -1281,6 +1292,7 @@ def workflow_view(
         stopped_step=(str(step.step) if stopped else ""),
         stopped_reason=(stopped.detail if stopped else ""),
         stopped_cleanly=bool(stopped and stopped.blocked),
+        stopped_interrupted=bool(stopped and stopped.interrupted),
         condition_id=(identification.condition_id if identification else "") or "",
         condition_label=condition_label(
             identification.condition_id if identification else None
@@ -1353,6 +1365,7 @@ class InventoryRow:
 def inventory(
     conn: sqlite3.Connection, *, marketplace: str, environment: str,
     include_abandoned: bool = False,
+    owner_email: str | None = None,
 ) -> list[InventoryRow]:
     """The whole table in one pass.
 
@@ -1370,7 +1383,9 @@ def inventory(
     # One query for every item's total, rather than one per row.
     costs = total_cost_by_sku(conn)
     rows = []
-    for summary in item_summaries(conn):
+    # `owner_email=None` is every item, which is what /ops passes and what the CLI
+    # gets. The consumer screens always pass an address.
+    for summary in item_summaries(conn, owner_email=owner_email):
         # Hidden rather than deleted, and hidden by default: an abandoned item is
         # kept whole -- photos, evidence, research, costs -- and the only thing
         # wrong with it is that it clutters a list of work.
@@ -1623,6 +1638,16 @@ GENERIC_ASPECTS = ("Type",)
 IDENTITY_ASPECTS = DISTINCTIVE_ASPECTS + GENERIC_ASPECTS
 
 
+def owner_of(conn, sku: str) -> str | None:
+    """Whose shelf this item is on, or None if nobody's.
+
+    Read straight rather than through `item_summaries`, because the callers are
+    per-request authorisation checks and they want one row.
+    """
+    row = conn.execute("SELECT owner_email FROM item WHERE sku = ?", (sku,)).fetchone()
+    return row["owner_email"] if row else None
+
+
 def _stopped_run(conn, sku: str):
     """The last run on this item, if it stopped without finishing the work.
 
@@ -1818,10 +1843,19 @@ def price_check(
     )
 
 
-def abandoned_count(conn: sqlite3.Connection) -> int:
-    """How many items are set aside, so the inventory can offer to show them."""
+def abandoned_count(conn: sqlite3.Connection, owner_email: str | None = None) -> int:
+    """How many items are set aside, so the inventory can offer to show them.
+
+    Scoped like every other consumer count: "3 set aside" over a shelf holding
+    none of them is a worse answer than no count at all.
+    """
     from resell.domain import ItemState
 
+    if owner_email is None:
+        return conn.execute(
+            "SELECT COUNT(*) FROM item WHERE state = ?", (str(ItemState.ABANDONED),)
+        ).fetchone()[0]
     return conn.execute(
-        "SELECT COUNT(*) FROM item WHERE state = ?", (str(ItemState.ABANDONED),)
+        "SELECT COUNT(*) FROM item WHERE state = ? AND owner_email = ?",
+        (str(ItemState.ABANDONED), owner_email.casefold()),
     ).fetchone()[0]

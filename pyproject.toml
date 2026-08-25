@@ -15,6 +15,16 @@ dependencies = [
 ui = [
     "flask>=3.0",
 ]
+# The private beta host. Waitress rather than gunicorn: pure Python, no fork or
+# preload behaviour to reason about on macOS, and single-process-with-threads is
+# exactly the shape this app needs -- agent runs live on background threads in
+# the same process, and `recover_interrupted_runs` assumes at startup that a
+# `running` row means a process that has died. A second worker would make that
+# assumption false.
+beta = [
+    "flask>=3.0",
+    "waitress>=3.0",
+]
 
 [dependency-groups]
 dev = [

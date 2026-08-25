@@ -921,11 +921,19 @@ material, but a different fit, cut, sub-line or trim level.
   `excluded` -- must not count at all. Say why: a bundle, a broken unit sold for \
 parts, a wholesale lot, an obvious misdescription.
 - Work through this in order, and stop at the first line that applies.
-  1. More than one article in the price? A suit is a jacket and trousers; a body \
-sold with a lens is two things; a set is a set. `excluded`, naming the extra \
-item. Every bundle admitted \
-drags the whole band upwards and the seller prices above the market without being \
-told why.
+  1. More than one *separately saleable product* in the price? A suit is a jacket \
+and trousers; a body sold with a lens is two things; three units in one lot is a \
+lot. `excluded`, naming the extra product. Every bundle admitted drags the whole \
+band upwards and the seller prices above the market without being told why.
+     What does *not* make a bundle: whatever the thing ordinarily comes with. A \
+charger, a cable, a case, the standard head or blade or attachment set, the manual. \
+Those are how the product is sold new, not a second product sold alongside it, and \
+a listing is not less comparable for describing them. The question to ask is \
+whether a buyer would plausibly shop for the extra thing on its own -- a camera \
+lens yes, a charging cable no.
+     An Achedaway massage gun listed as "with extra attachments, case and charger" \
+is one massage gun. Excluding it left a real market of three listings showing as \
+one, and the seller was handed a single price with nothing to choose between.
   2. A different material or cloth? Linen, corduroy, seersucker, tweed and cashmere \
 are different markets from a wool blend, whoever made them. `excluded`, naming \
 the cloth.

@@ -423,7 +423,11 @@ def cmd_ui(args: argparse.Namespace) -> int:
     if args.host != "127.0.0.1":
         print(f"  WARNING: bound to {args.host}, which is not loopback. This UI has "
               f"no authentication.\n", file=sys.stderr)
-    return serve(host=args.host, port=args.port, debug=args.debug)
+    return serve(
+        host=args.host, port=args.port, debug=args.debug,
+        production=getattr(args, "production", False),
+        threads=getattr(args, "threads", 12),
+    )
 
 
 def cmd_price(args: argparse.Namespace) -> int:
@@ -513,6 +517,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="loopback by default; this UI has no authentication")
     ui.add_argument("--port", type=int, default=5000)
     ui.add_argument("--debug", action="store_true", help="Flask reloader and tracebacks")
+    ui.add_argument("--production", action="store_true",
+                    help="serve with Waitress instead of the development server")
+    ui.add_argument("--threads", type=int, default=12,
+                    help="Waitress worker threads; one process either way")
     ui.set_defaults(func=cmd_ui)
 
     images = subparsers.add_parser("images", help="listing photo handling")

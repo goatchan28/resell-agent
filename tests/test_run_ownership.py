@@ -153,12 +153,30 @@ def test_an_item_with_no_observations_is_refused_rather_than_filled(tmp_path):
 
 
 def running(conn, sku, run_id="run_open"):
+    """A run in flight, seeded rather than started.
+
+    Order matters against `create_app` now: startup reconciliation treats any
+    `running` row it finds as the wreckage of a process that has died, because at
+    startup that is the only thing it can be. So the app has to exist before this
+    is called -- which is also the real sequence, since a live process is what
+    starts a run. `app_then_running` does both in the right order.
+    """
     conn.execute(
         "INSERT INTO agent_run (run_id, sku, status, started_at) VALUES (?,?,?,?)",
         (run_id, sku, "running", db.now_iso()),
     )
     conn.commit()
     return run_id
+
+
+def app_then_running(config, conn, sku, run_id="run_open"):
+    """The app first, then the run it is holding. Returns a ready client."""
+    from resell.webui import create_app
+
+    app = create_app(config=config)
+    app.config["TESTING"] = True
+    running(conn, sku, run_id)
+    return app.test_client()
 
 
 def test_a_card_shows_progress_not_actions_while_the_agent_works(tmp_path):
@@ -257,11 +275,7 @@ def test_pressing_run_during_a_run_starts_nothing(tmp_path):
     conn = db.connect(config.db_path)
     gateway = Gateway(conn, marketplace="EBAY_US", environment="sandbox", fees=FeeModel())
     sku = gateway.ingest_item(purchase_cost_cents=100).sku
-    running(conn, sku)
-
-    app = create_app(config=config)
-    app.config["TESTING"] = True
-    client = app.test_client()
+    client = app_then_running(config, conn, sku)
     for _ in range(5):
         response = client.post(f"/items/{sku}/run")
         assert "run=run_open" in response.headers["Location"]
@@ -281,11 +295,7 @@ def test_no_duplicate_runs_even_from_different_routes(tmp_path):
     conn = db.connect(config.db_path)
     gateway = Gateway(conn, marketplace="EBAY_US", environment="sandbox", fees=FeeModel())
     sku = gateway.ingest_item(purchase_cost_cents=100).sku
-    running(conn, sku)
-
-    app = create_app(config=config)
-    app.config["TESTING"] = True
-    client = app.test_client()
+    client = app_then_running(config, conn, sku)
     client.post(f"/items/{sku}/run")
     client.post(f"/items/{sku}/photos", data={
         "photos": (__import__("io").BytesIO(png()), "b.png"),
@@ -307,11 +317,7 @@ def test_the_backend_refuses_the_transition_not_just_the_button(tmp_path):
     conn = db.connect(config.db_path)
     gateway = Gateway(conn, marketplace="EBAY_US", environment="sandbox", fees=FeeModel())
     sku = gateway.ingest_item(purchase_cost_cents=100).sku
-    running(conn, sku)
-
-    app = create_app(config=config)
-    app.config["TESTING"] = True
-    app.test_client().post(f"/items/{sku}/abandon", data={})
+    app_then_running(config, conn, sku).post(f"/items/{sku}/abandon", data={})
 
     state = conn.execute("SELECT state FROM item WHERE sku = ?", (sku,)).fetchone()[0]
     assert state != "abandoned", "an item was set aside out from under a running agent"
@@ -334,7 +340,7 @@ def test_no_state_changing_route_acts_while_a_run_holds_the_item(tmp_path, route
     conn = db.connect(config.db_path)
     gateway = Gateway(conn, marketplace="EBAY_US", environment="sandbox", fees=FeeModel())
     sku = gateway.ingest_item(purchase_cost_cents=100).sku
-    running(conn, sku)
+    client = app_then_running(config, conn, sku)
 
     def snapshot():
         return (
@@ -347,10 +353,8 @@ def test_no_state_changing_route_acts_while_a_run_holds_the_item(tmp_path, route
                          (sku,)).fetchone()[0],
         )
 
-    app = create_app(config=config)
-    app.config["TESTING"] = True
     before = snapshot()
-    response = app.test_client().post(f"/items/{sku}/{route}", data=payload)
+    response = client.post(f"/items/{sku}/{route}", data=payload)
 
     assert response.status_code == 302
     assert snapshot() == before, f"/{route} changed the item mid-run"

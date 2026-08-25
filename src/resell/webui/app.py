@@ -21,6 +21,7 @@ shows the decision.
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -38,6 +39,7 @@ from flask import (
 )
 
 from resell import db, runs, store_pricing as sp, views, views_consumer
+from resell.webui import access
 from resell.config import ConfigError, load_config
 from resell.domain import FeeModel
 from resell.gateway import Gateway, Rejected
@@ -69,9 +71,38 @@ def _comp_adapter(sku: str, urls: list[str]):
     )
 
 
+# What a single request may carry. Photos are shrunk to about 2048px in the
+# browser before they are sent, so a normal ten-photo upload is a few megabytes;
+# this is the ceiling for the case where that did not happen -- an older browser
+# without `createImageBitmap` falls back to sending the originals, and ten
+# 24-megapixel photos is around 50 MB. Cloudflare's own free-plan cap is 100 MB,
+# so this stays comfortably under it and fails on our side with a sentence rather
+# than on theirs with a 413 page.
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+
+
+def _secret_key() -> str:
+    """Stable across restarts when configured, random when it is not.
+
+    Only flash messages depend on this today, so a per-process value merely lost
+    the odd message when the server restarted. The previous value was
+    `sha256(id(app))` -- an object's memory address, which is not a secret and is
+    not high-entropy. Neither property matters for flashes and both would matter
+    the moment anything of value goes in a session, which is exactly the kind of
+    assumption that is cheap to remove now and expensive to notice later.
+
+    The fallback stays random rather than fixed, so an unconfigured deployment is
+    merely forgetful rather than predictable.
+    """
+    import secrets
+
+    return os.environ.get("RESELL_SECRET_KEY", "").strip() or secrets.token_hex(32)
+
+
 def create_app(*, config=None) -> Flask:
     app = Flask(__name__)
-    app.secret_key = hashlib.sha256(str(id(app)).encode()).hexdigest()
+    app.secret_key = _secret_key()
+    app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
     app.config["RESELL_CONFIG"] = config
     app.jinja_env.filters["money"] = _money
     app.jinja_env.filters["shorten"] = _shorten
@@ -102,6 +133,18 @@ def create_app(*, config=None) -> Flask:
             g.conn, marketplace=g.config.marketplace_id,
             environment=g.config.env.name, fees=FeeModel(),
         )
+        # Who is asking, before anything reads or writes on their behalf, and a
+        # same-origin check on anything that changes state. See `access.py`.
+        access.require_identity()
+        access.check_origin()
+
+    @app.errorhandler(413)
+    def _too_large(_error):
+        # In the seller's words. The default is a Werkzeug page that says
+        # "Request Entity Too Large", which is true and unhelpful when what
+        # happened is that somebody picked thirty photographs.
+        flash("Those photos were too large to send. Try a few at a time.", "error")
+        return redirect(request.referrer or url_for("home")), 302
 
     @app.teardown_appcontext
     def _close_database(_exception) -> None:
@@ -117,7 +160,50 @@ def create_app(*, config=None) -> Flask:
         }
 
     _register_routes(app)
+    _reconcile_at_startup(app)
     return app
+
+
+def _reconcile_at_startup(app: Flask) -> None:
+    """Two one-off repairs, done once per process before any request arrives.
+
+    Runs left `running` by a process that no longer exists, and items that
+    predate `owner_email`. Both are idempotent, both are cheap, and both are
+    things that would otherwise need a human to remember them at the exact moment
+    they are least likely to.
+    """
+    try:
+        config = app.config["RESELL_CONFIG"] or load_config(require_credentials=False)
+        conn = db.connect(config.db_path)
+    except Exception:  # noqa: BLE001 - a server that starts beats a tidy database
+        return
+    try:
+        recovered = runs.recover_interrupted_runs(conn)
+        if recovered:
+            print(f"recovered {recovered} interrupted run(s) from a previous process")
+        claimed = _claim_unowned(conn)
+        if claimed:
+            print(f"claimed {claimed} pre-beta item(s) for the operator")
+    finally:
+        conn.close()
+
+
+def _claim_unowned(conn) -> int:
+    """Give every item that predates the beta to the operator.
+
+    They were created before there was any such thing as an owner, and an
+    unowned item shows on nobody's shelf -- so without this the operator's own
+    forty-five items vanish from their consumer screens while remaining, as they
+    should, on /ops. The first configured admin address gets them.
+    """
+    admins = sorted(access.admin_emails())
+    if not admins:
+        return 0
+    cursor = conn.execute(
+        "UPDATE item SET owner_email = ? WHERE owner_email IS NULL", (admins[0],)
+    )
+    conn.commit()
+    return cursor.rowcount
 
 
 def _register_routes(app: Flask) -> None:
@@ -143,9 +229,13 @@ def _register_routes(app: Flask) -> None:
         is the requirement, and it is presentation only: `create_item` is shared
         with the operator UI, whose own intake form is unaffected.
         """
+        # Scoped to whoever Cloudflare Access authenticated. Without this the
+        # "one active item at a time" rule is one item across the whole beta:
+        # whoever uploaded most recently owns the app, and the other four see
+        # their item and cannot start their own.
         rows = views.inventory(
             g.conn, marketplace=g.config.marketplace_id,
-            environment=g.config.env.name,
+            environment=g.config.env.name, owner_email=g.email,
         )
         sku = views_consumer.active_sku(rows)
         if sku is None:
@@ -163,17 +253,18 @@ def _register_routes(app: Flask) -> None:
         """Everything the seller has, as a list they would recognise."""
         rows = views.inventory(
             g.conn, marketplace=g.config.marketplace_id,
-            environment=g.config.env.name,
+            environment=g.config.env.name, owner_email=g.email,
             include_abandoned=request.args.get("aside") == "1",
         )
         return render_template(
             "consumer/shelf.html",
             rows=views_consumer.shelf_rows(rows, net_of=_net_of),
             showing_aside=request.args.get("aside") == "1",
-            aside_count=views.abandoned_count(g.conn),
+            aside_count=views.abandoned_count(g.conn, g.email),
         )
 
     @app.get("/ops")
+    @access.admin_only
     def ops_home():
         """Everything that wants a decision, and nothing that does not.
 
@@ -195,6 +286,7 @@ def _register_routes(app: Flask) -> None:
         )
 
     @app.get("/ops/inventory")
+    @access.admin_only
     def ops_inventory():
         # Abandoned items are hidden unless asked for. They are kept whole, so the
         # only reason to hide them is that a list of work should be a list of work.
@@ -210,6 +302,7 @@ def _register_routes(app: Flask) -> None:
         )
 
     @app.get("/ops/items/<sku>")
+    @access.admin_only
     def ops_item(sku: str):
         """One item's card on its own, for when the home screen is crowded."""
         return render_template(
@@ -221,6 +314,7 @@ def _register_routes(app: Flask) -> None:
     def photo(sku: str, position: int):
         from resell.derivatives import ConversionError, for_model
 
+        _require_item(sku)
         detail = views.item_detail(
             g.conn, g.gateway, sku, marketplace=g.config.marketplace_id,
             environment=g.config.env.name,
@@ -256,6 +350,10 @@ def _register_routes(app: Flask) -> None:
                 purchase_cost_cents=_cents(request.form.get("cost_dollars")),
                 acquisition_intent=request.form.get("intent") or "resale",
                 notes=request.form.get("notes") or None,
+                # Whose shelf this lands on. The operator's own intake through
+                # /ops records the operator, which is what makes their items
+                # visible on their own consumer screens too.
+                owner_email=g.email,
             )
         except Rejected as exc:
             _flash_rejection(exc)
@@ -317,6 +415,9 @@ def _register_routes(app: Flask) -> None:
         view = runs.read_run(g.conn, run_id)
         if view is None:
             return {"error": "no such run"}, 404
+        # A run belongs to an item, and an item belongs to a shelf. Without this a
+        # tester could poll somebody else's run and read its step messages.
+        _require_item(view.sku)
         return {
             "run_id": view.run_id,
             "sku": view.sku,
@@ -349,6 +450,7 @@ def _register_routes(app: Flask) -> None:
             request.form.get("answer") or ""
         ).strip()
         sku = request.form.get("sku", "")
+        _require_item(sku)
         try:
             g.gateway.answer_question(
                 question_id, answer, operator=True,
@@ -372,6 +474,7 @@ def _register_routes(app: Flask) -> None:
         not a question the interface should raise.
         """
         sku = request.form.get("sku", "")
+        _require_item(sku)
         try:
             sp.accept_comp_candidate(
                 g.conn, candidate_id,
@@ -389,6 +492,7 @@ def _register_routes(app: Flask) -> None:
     @app.post("/candidates/<candidate_id>/reject")
     def reject_candidate(candidate_id: str):
         sku = request.form.get("sku", "")
+        _require_item(sku)
         reason = request.form.get("reason") or "not comparable"
         try:
             sp.reject_comp_candidate(g.conn, candidate_id, reason=reason)
@@ -500,6 +604,7 @@ def _register_routes(app: Flask) -> None:
 
     @app.post("/items/<sku>/approve-listing")
     def approve_listing(sku: str):
+        _require_item(sku)
         busy = _busy(sku)
         if busy:
             flash(f"{sku}: the agent is working on this one — that has to finish "
@@ -521,6 +626,7 @@ def _register_routes(app: Flask) -> None:
         return redirect(url_for("item", sku=sku))
 
     @app.post("/items/<sku>/comps")
+    @access.admin_only
     def find_comps(sku: str):
         """Read the listings the operator pasted, and offer them as candidates.
 
@@ -704,6 +810,7 @@ def _register_routes(app: Flask) -> None:
         proposed. The item leaves the work queue and the runner will not touch it,
         and `restore` brings it back to the same state it left.
         """
+        _require_item(sku)
         busy = _busy(sku)
         if busy:
             flash(f"{sku}: the agent is working on this one — that has to finish "
@@ -727,6 +834,7 @@ def _register_routes(app: Flask) -> None:
         The state comes from the event log, not from this request: an item returns
         to where it actually was, and nowhere else.
         """
+        _require_item(sku)
         busy = _busy(sku)
         if busy:
             flash(f"{sku}: the agent is working on this one — that has to finish "
@@ -938,12 +1046,22 @@ def _workflow(sku: str) -> views.WorkflowView:
 
 
 def _require_item(sku: str) -> None:
+    """The item exists, and it is this person's to act on.
+
+    404 rather than 403 when it is somebody else's: a 403 confirms the SKU is
+    real, and SKUs are sequential. The operator passes straight through -- /ops is
+    global by design and this is a label on a shelf, not a wall around the data.
+    """
     try:
         views.item_detail(
             g.conn, g.gateway, sku, marketplace=g.config.marketplace_id,
             environment=g.config.env.name,
         )
     except Rejected:
+        abort(404)
+    if g.is_admin:
+        return
+    if views.owner_of(g.conn, sku) != g.email:
         abort(404)
 
 
@@ -1174,6 +1292,30 @@ def _shorten(text, limit: int = 80) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def serve(*, host: str = "127.0.0.1", port: int = 5000, debug: bool = False) -> int:
-    create_app().run(host=host, port=port, debug=debug)
+def serve(
+    *, host: str = "127.0.0.1", port: int = 5000, debug: bool = False,
+    production: bool = False, threads: int = 12,
+) -> int:
+    """Werkzeug for development, Waitress for the beta.
+
+    `production` is the flag that separates them, and it stays a flag rather than
+    a guess about the environment: a server that silently changes what it is
+    depending on a variable somebody set last month is worse than one that has to
+    be told.
+
+    Single process either way. The agent runs are threads inside this process --
+    a second worker would double every budget, and `recover_interrupted_runs`
+    would clear runs belonging to a sibling that is still very much alive.
+    """
+    app = create_app()
+    if not production:
+        app.run(host=host, port=port, debug=debug)
+        return 0
+    try:
+        from waitress import serve as waitress_serve
+    except ImportError:
+        print("waitress is not installed: uv sync --extra beta")
+        return 2
+    print(f"resell (beta) on http://{host}:{port} — {threads} threads, one process")
+    waitress_serve(app, host=host, port=port, threads=threads)
     return 0

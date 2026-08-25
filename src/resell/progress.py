@@ -47,6 +47,8 @@ class Phase:
     # on purpose, the item is exactly where it was, and pressing it again is a
     # reasonable thing to do.
     BLOCKED = "blocked"
+    # The process did not survive the run. Neither the item's fault nor a stage's.
+    INTERRUPTED = "interrupted"
 
 
 @dataclass(frozen=True)

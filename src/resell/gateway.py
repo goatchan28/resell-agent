@@ -439,8 +439,15 @@ class Gateway:
         acquired_on: str | None = None,
         notes: str | None = None,
         identification_effort: str = str(IdentificationEffort.STANDARD),
+        owner_email: str | None = None,
     ) -> Accepted:
-        """Allocate a SKU and create the item. The only command without one."""
+        """Allocate a SKU and create the item. The only command without one.
+
+        `owner_email` is whose consumer shelf this belongs on during the private
+        beta -- a label, not an account. Absent for CLI intake and for the
+        operator's own form, which is why it is optional and why NULL appears on
+        nobody's shelf rather than everybody's.
+        """
         if acquisition_intent not in ("resale", "declutter", "unknown"):
             raise Rejected("IngestItem", [f"unknown acquisition_intent {acquisition_intent!r}"])
         if purchase_cost_cents is not None and purchase_cost_cents < 0:
@@ -462,12 +469,12 @@ class Gateway:
             self.conn.execute(
                 "INSERT INTO item (sku, seq, state, purchase_cost_cents, "
                 "acquisition_intent, acquired_on, notes, created_at, updated_at, "
-                "state_changed_at, identification_effort) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "state_changed_at, identification_effort, owner_email) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sku, seq, str(ItemState.INTAKE), purchase_cost_cents,
                     acquisition_intent, acquired_on, notes, stamp, stamp, stamp,
-                    identification_effort,
+                    identification_effort, (owner_email or "").casefold() or None,
                 ),
             )
             log_event(

@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The beta server. Install as a LaunchAgent:
+
+      cp deploy/com.resell.app.plist ~/Library/LaunchAgents/
+      launchctl load -w ~/Library/LaunchAgents/com.resell.app.plist
+
+  Paths are already set for this machine.
+
+  `caffeinate -s` wraps the server rather than `pmset` changing the machine: the
+  assertion lives exactly as long as this process, needs no sudo, is visible in
+  `ps`, and reverts by unloading this job. `pmset -a disablesleep 1` would keep
+  the Mac awake after the beta ended, until somebody remembered a second command.
+
+  Bound to 127.0.0.1 on purpose. cloudflared connects locally, and loopback is
+  what makes the Access header trustworthy -- nothing else can reach the port to
+  forge it.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.resell.app</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+    <string>/Users/kington/Documents/AGENT_ARMY/resell_agent/.venv/bin/python</string>
+    <string>-m</string>
+    <string>resell.cli</string>
+    <string>ui</string>
+    <string>--production</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>5000</string>
+    <string>--threads</string>
+    <string>12</string>
+  </array>
+
+  <!-- Python buffers stdout when it is not a terminal. The first manual run of
+       this server was killed before the buffer flushed, so its log was zero
+       bytes -- no startup banner, no "recovered N interrupted runs", nothing to
+       tell a crash from a kill. Tracebacks would still have arrived (stderr is
+       unbuffered), but the operational lines are worth having too. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/kington/Documents/AGENT_ARMY/resell_agent</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Restarting in a tight loop over a config error helps nobody. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/kington/Library/Logs/resell-app.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/kington/Library/Logs/resell-app.log</string>
+</dict>
+</plist>

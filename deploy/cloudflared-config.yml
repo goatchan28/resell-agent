@@ -1,0 +1,25 @@
+# ~/.cloudflared/config.yml
+#
+# A *named* tunnel, not a quick one: quick tunnels get a new random hostname
+# every restart, and the invitations would go stale nightly.
+#
+#   cloudflared tunnel login
+#   cloudflared tunnel create resell
+#   cloudflared tunnel route dns resell sell.example.com
+#   sudo cloudflared service install
+#
+# The origin is loopback. That is not incidental -- it is what makes the Access
+# header worth trusting, because nothing but cloudflared can reach the port.
+
+tunnel: resell
+credentials-file: /Users/USERNAME/.cloudflared/TUNNEL-UUID.json
+
+ingress:
+  - hostname: sell.example.com
+    service: http://127.0.0.1:5000
+    originRequest:
+      # Comfortably longer than a publish, which talks to eBay synchronously and
+      # took about ten seconds on the last real listing.
+      connectTimeout: 30s
+      noTLSVerify: false
+  - service: http_status:404

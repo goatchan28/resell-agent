@@ -469,11 +469,20 @@ _STUCK: dict[str, str] = {
 }
 
 
+# When the process died rather than the work failing. Not keyed by step, because
+# the step is not what went wrong: no stage reported anything and nothing was
+# learned about the item. "We could not find prices for this" would be a claim
+# about the market that nobody finished looking at.
+INTERRUPTED_SAYS = "We stopped partway. Nothing is lost — pick it up when you like."
+
+
 def stuck_message(view) -> str:
     """"" unless the last attempt stopped short. The technical reason stays on
     the run record, where /ops shows it."""
     if not getattr(view, "stopped_step", ""):
         return ""
+    if getattr(view, "stopped_interrupted", False):
+        return INTERRUPTED_SAYS
     return _STUCK.get(view.stopped_step, "We got stuck on this one.")
 
 

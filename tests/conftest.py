@@ -90,3 +90,25 @@ def _no_ambient_search_config(monkeypatch):
     """
     for name in ("RESELL_SEARCH_BACKEND", "BRAVE_API_KEY"):
         monkeypatch.delenv(name, raising=False)
+
+
+# --- who the web tests are ------------------------------------------------------------
+#
+# Every route now needs an authenticated address (see `webui/access.py`), which
+# in a real deployment arrives in a Cloudflare Access header and here comes from
+# `RESELL_DEV_EMAIL`. Without it every request is a 403 and the suite tests the
+# identity gate eighty times over instead of what it meant to test.
+#
+# The address is also an admin, so tests that create items directly through the
+# gateway -- with no owner, because the gateway is not the consumer route -- can
+# still read them back. Ownership *scoping* is not tested by that arrangement and
+# is not meant to be: `test_beta_access.py` sets its own addresses and drives the
+# real routes to check who can see what.
+
+TEST_EMAIL = "operator@example.test"
+
+
+@pytest.fixture(autouse=True)
+def _authenticated(monkeypatch):
+    monkeypatch.setenv("RESELL_DEV_EMAIL", TEST_EMAIL)
+    monkeypatch.setenv("RESELL_ADMIN_EMAILS", TEST_EMAIL)

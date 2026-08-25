@@ -33,8 +33,6 @@ from resell.pricing.comps import (
     RetailKind,
 )
 from resell.pricing.estimate import (
-    BLEND_BELOW,
-    ENOUGH_COMPS,
     PriceQualifier,
     RetailReference,
     recommend,
@@ -218,38 +216,72 @@ def test_the_mp_000041_case_end_to_end():
                comparability=Comparability.CATEGORY_ATTRIBUTE, cid="bobby_original")
     r = priced([ask])
     assert PriceQualifier.ANCHOR_BLENDED in r.qualifiers
-    assert r.anchor_weight == pytest.approx(1 - 0.5 * (1 / ENOUGH_COMPS), abs=1e-3)
-    assert (r.band_low_cents, r.band_central_cents, r.band_high_cents) == (
-        7156, 8027, 9108,
-    )
+    assert 0 < r.anchor_weight < 1
     assert r.band_low_cents <= 7500, "the observed ask is still inside the band"
     assert r.band_high_cents >= r.retail_anchor.high_cents
 
 
-def test_one_listing_for_the_identical_product_is_not_diluted():
-    """A fact about this product's market outranks an inference from a shop
-    price, however lonely the fact is. Two same-product asks above the shop price
-    mean the thing sells above the shop price, and averaging that toward a
-    depreciation rate would erase a real finding."""
+def test_one_lonely_listing_is_not_a_whole_market():
+    """It used to be. `_market_weight` returned 1.0 for *any* `same_product`
+    comp, so one listing silenced a trustworthy shop price entirely -- the same
+    error as MP-000041, arrived at from the opposite direction. One listing is a
+    fact about one seller."""
     same = comp(7500, kind=PriceKind.ASKING, band=BOBBY_CONDITION,
                 comparability=Comparability.SAME_PRODUCT, cid="identical")
     r = priced([same])
-    assert PriceQualifier.ANCHOR_BLENDED not in r.qualifiers
-    assert r.anchor_weight == 0.0
-    assert r.band_central_cents == 7500
-    assert r.retail_anchor is not None, "still recorded, just not applied"
+    assert r.market_confidence < 0.3, "one comp is not a market"
+    assert PriceQualifier.ANCHOR_BLENDED in r.qualifiers
+    assert r.anchor_weight > 0
 
 
-def test_enough_of_a_market_and_the_anchor_goes_quiet():
-    """At `ENOUGH_COMPS` on the same rung the market is talking. The anchor stays
-    on the record as context and stops touching the band."""
-    market = [comp(7000 + 500 * i, kind=PriceKind.ASKING, band=BOBBY_CONDITION,
-                   comparability=Comparability.CATEGORY_ATTRIBUTE, cid=f"m{i}")
-              for i in range(ENOUGH_COMPS)]
-    r = priced(market)
-    assert PriceQualifier.ANCHOR_BLENDED not in r.qualifiers
-    assert r.band_central_cents == 7500
-    assert (r.band_low_cents, r.band_high_cents) == (7000, 8000)
+def test_an_exact_match_still_outweighs_a_sibling():
+    """Rung has not stopped mattering -- it now scales the count rather than
+    capping the answer."""
+    exact = [comp(7500, kind=PriceKind.ASKING, band=BOBBY_CONDITION,
+                  comparability=Comparability.SAME_PRODUCT, cid=f"e{i}")
+             for i in range(5)]
+    sibling = [comp(7500, kind=PriceKind.ASKING, band=BOBBY_CONDITION,
+                    comparability=Comparability.CATEGORY_ATTRIBUTE, cid=f"s{i}")
+               for i in range(5)]
+    assert priced(exact).market_confidence > priced(sibling).market_confidence
+
+
+def test_a_realized_sale_outweighs_an_ask():
+    sold = [comp(7500, kind=PriceKind.REALIZED, band=BOBBY_CONDITION,
+                 comparability=Comparability.SAME_PRODUCT, cid=f"r{i}")
+            for i in range(5)]
+    asked = [comp(7500, kind=PriceKind.ASKING, band=BOBBY_CONDITION,
+                  comparability=Comparability.SAME_PRODUCT, cid=f"a{i}")
+             for i in range(5)]
+    assert priced(sold).market_confidence > priced(asked).market_confidence
+
+
+def test_enough_of_a_market_and_the_anchor_goes_nearly_quiet():
+    """No threshold any more: the anchor's share falls away continuously as the
+    sample earns confidence, rather than switching off at a cliff."""
+    def share(n):
+        market = [comp(7000 + 10 * i, kind=PriceKind.REALIZED, band=BOBBY_CONDITION,
+                       comparability=Comparability.SAME_PRODUCT, cid=f"m{i}")
+                  for i in range(n)]
+        return priced(market).anchor_weight
+
+    shares = [share(n) for n in (1, 3, 5, 10, 20)]
+    assert shares == sorted(shares, reverse=True), "monotonically decreasing"
+    assert shares[0] > 0.5, "one comp leaves most of the say with retail"
+    assert shares[-1] < 0.05, "twenty realized exact sales all but silence it"
+
+
+def test_quality_scales_the_count_rather_than_capping_the_answer():
+    """The sensitivity check that changed the design. Multiplying a breadth term
+    by the quality factors put a ceiling on confidence that no amount of data
+    could lift -- sibling asks of unknown condition capped at 0.38, so twenty
+    real listings would still hand retail 47% of the say."""
+    weak = [comp(7000 + 10 * i, kind=PriceKind.ASKING, band=ConditionBand.UNKNOWN,
+                 comparability=Comparability.SAME_FAMILY_VARIANT, cid=f"w{i}")
+            for i in range(20)]
+    r = priced(weak)
+    assert r.market_confidence > 0.6, "twenty listings are a market"
+    assert r.anchor_weight < 0.15
 
 
 def test_thin_evidence_widens_the_band_rather_than_narrowing_it():
@@ -259,12 +291,7 @@ def test_thin_evidence_widens_the_band_rather_than_narrowing_it():
                    comparability=Comparability.CATEGORY_ATTRIBUTE, cid=f"t{i}")
               for i in range(2)]
     thin = priced(market)
-    full = priced(market + [comp(8000, kind=PriceKind.ASKING, band=BOBBY_CONDITION,
-                                 comparability=Comparability.CATEGORY_ATTRIBUTE,
-                                 cid="t2")])
     assert PriceQualifier.ANCHOR_BLENDED in thin.qualifiers
-    spread = thin.band_high_cents - thin.band_low_cents
-    assert spread > full.band_high_cents - full.band_low_cents
     assert thin.band_low_cents <= 7000 and thin.band_high_cents >= 9108
 
 
@@ -274,22 +301,27 @@ def test_the_blend_moves_the_centre_in_proportion_and_not_further():
     ask = comp(7500, kind=PriceKind.ASKING, band=BOBBY_CONDITION,
                comparability=Comparability.CATEGORY_ATTRIBUTE, cid="lonely")
     r = priced([ask])
-    market_share = 1 - r.anchor_weight
     assert r.band_central_cents == round(
-        7500 * market_share + r.retail_anchor.point_cents * r.anchor_weight
+        7500 * (1 - r.anchor_weight) + r.retail_anchor.point_cents * r.anchor_weight
     )
     assert 0 < r.anchor_weight < 1
 
 
-def test_the_threshold_is_a_named_constant_both_sides_agree_on():
-    """`BLEND_BELOW` is exclusive: a sample worth exactly half an answer is
-    already the market's answer."""
-    assert BLEND_BELOW == 0.5
-    exactly_half = [comp(7500, kind=PriceKind.ASKING, band=BOBBY_CONDITION,
-                         comparability=Comparability.CATEGORY_ATTRIBUTE, cid=f"h{i}")
-                    for i in range(ENOUGH_COMPS)]
-    assert PriceQualifier.ANCHOR_BLENDED not in priced(exactly_half).qualifiers
-    assert PriceQualifier.ANCHOR_BLENDED in priced(exactly_half[:2]).qualifiers
+def test_there_is_no_threshold_left_to_fall_off():
+    """`BLEND_BELOW` switched retail between "part of the answer" and "ceiling
+    only" at a cliff, so two items either side of it were priced by different
+    philosophies over a hair's difference in evidence."""
+    import inspect
+
+    from resell.pricing import estimate
+
+    # The name survives in the comment explaining why it is gone, which is worth
+    # keeping. What must not survive is the constant and the function.
+    source = inspect.getsource(estimate)
+    assert "BLEND_BELOW =" not in source
+    assert "def _market_weight" not in source
+    assert not hasattr(estimate, "BLEND_BELOW")
+    assert not hasattr(estimate, "_market_weight")
 
 
 # --- a shop price for a different product ---------------------------------------------

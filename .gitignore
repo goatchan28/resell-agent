@@ -11,3 +11,31 @@ dist/
 build/
 *.egg-info/
 photos/
+
+# --- secrets and runtime state (private beta) --------------------------------
+# `.env` alone was not enough: a `.env.bak-before-beta` written while wiring the
+# beta was not matched by it and held live eBay, Anthropic and Brave keys.
+# Match every variant rather than the one filename we happened to think of.
+.env.*
+!.env.example
+
+# Cloudflare tunnel credentials and the account certificate. Anyone holding
+# these can serve traffic as this tunnel.
+.cloudflared/
+*.pem
+cert.pem
+*-credentials.json
+
+# Runtime state: the database, the photographs, backups, logs. None of it is
+# source, all of it is either large or personal, and the uploads are the only
+# copy of what a listing shows.
+data/
+uploads/
+derivatives/
+backups/
+Backups/
+*.log
+logs/
+
+# macOS
+.DS_Store

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nightly backup of the database *and* the photographs.
+
+      cp deploy/com.resell.backup.plist ~/Library/LaunchAgents/
+      launchctl load -w ~/Library/LaunchAgents/com.resell.backup.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.resell.backup</string>
+  <!-- Run by the project's own interpreter, which already holds the Documents
+       grant this needs. `/bin/bash` and `/usr/bin/sqlite3` do not, and under
+       launchd that produced exit 126 and then "authorization denied" -- see the
+       comment at the top of backup.py. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/kington/Documents/AGENT_ARMY/resell_agent/.venv/bin/python</string>
+    <string>/Users/kington/Documents/AGENT_ARMY/resell_agent/deploy/backup.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/kington/Library/Logs/resell-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/kington/Library/Logs/resell-backup.log</string>
+</dict>
+</plist>

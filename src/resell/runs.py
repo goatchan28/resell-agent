@@ -111,6 +111,17 @@ class RunView:
         return self.status == "failed"
 
     @property
+    def interrupted(self) -> bool:
+        """The run did not end; the process did.
+
+        A restart, a crash, or the machine going to sleep. Nothing was learned
+        about the item and no stage said anything, so this is neither `failed`
+        nor `blocked` -- and it is still retryable, because the step is exactly
+        as owed as it was before the run started.
+        """
+        return self.status == "interrupted"
+
+    @property
     def elapsed_ms(self) -> int:
         return self.steps[-1].elapsed_ms if self.steps else 0
 
@@ -135,6 +146,44 @@ class RunView:
         next thing, with no way to know a host had timed out.
         """
         return tuple(s.message for s in self.steps if not s.ok)
+
+
+# What a run left behind when its process did not survive it.
+INTERRUPTED_DETAIL = "the app restarted while this was running"
+
+
+def recover_interrupted_runs(conn: sqlite3.Connection) -> int:
+    """Close out runs whose process is gone. Called once, at startup.
+
+    A run lives on a thread, and a thread does not survive the process. Without
+    this the `agent_run` row stays `running` for ever, `active_run_for` keeps
+    returning it, `_busy` refuses every action on that item, and the seller's
+    screen polls a run that will never finish. There is no way out of that from
+    the interface -- which makes a Mac going to sleep mid-run into an item nobody
+    can touch again.
+
+    Safe to call unconditionally at startup because a `running` row can only mean
+    one of two things at that moment: a process that has just died, or a process
+    that is still alive -- and if another process were still alive it would be
+    holding this port. Single process is the deployment, and this is one of the
+    reasons.
+    """
+    rows = conn.execute("SELECT run_id FROM agent_run WHERE status = 'running'").fetchall()
+    if not rows:
+        return 0
+    conn.execute(
+        "UPDATE agent_run SET status = 'interrupted', finished_at = ?, detail = ? "
+        "WHERE status = 'running'",
+        (now_iso(), INTERRUPTED_DETAIL),
+    )
+    for row in rows:
+        conn.execute(
+            "INSERT INTO agent_run_step (run_id, at, elapsed_ms, phase, message, ok) "
+            "VALUES (?, ?, 0, ?, ?, 0)",
+            (row["run_id"], now_iso(), progress.Phase.INTERRUPTED, INTERRUPTED_DETAIL),
+        )
+    conn.commit()
+    return len(rows)
 
 
 def start_run(db_path, sku: str, work) -> str:

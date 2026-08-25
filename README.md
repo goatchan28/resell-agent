@@ -140,6 +140,13 @@ A local web interface over the same backend the CLI drives. Start it with:
 uv run resell ui        # http://127.0.0.1:5000
 ```
 
+**Every route needs an authenticated identity.** In the private beta that comes
+from a Cloudflare Access header; running locally there is no header, so set
+`RESELL_DEV_EMAIL` in `.env` or every request answers 403. Add your address to
+`RESELL_ADMIN_EMAILS` as well to reach `/ops`, which is operator-only and checked
+in the app rather than only at the edge. See `deploy/beta.md` for the deployed
+arrangement — tunnel, Access policies, services and backups.
+
 Flask is an optional extra, so install it if the command reports it missing:
 
 ```bash

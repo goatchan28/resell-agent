@@ -598,17 +598,23 @@ def declare_mode(conn, gateway, sku: str, proposed: str, rationale: str) -> Mode
     accepted = mode if supported else IdentificationMode.UNRESOLVED
     resolution = identity_resolution(conn, sku)
 
-    identification = current_identification(conn, sku)
-    fields = {
-        column: (identification[column] if identification else None)
-        for column in ("brand", "model", "variant", "title", "description",
-                       "condition_id", "category_id", "reasoning")
-    }
-    aspects = (
-        _json.loads(identification["aspects"])
-        if identification and identification["aspects"] else None
-    )
-    gateway.propose_identification(sku, aspects=aspects, **fields)
+    # Through the shared merge rather than a column list of our own.
+    #
+    # This stage does not change the identification -- it records the mode and the
+    # resolution against it -- so everything must survive the new version intact.
+    # It used to carry the fields forward by name, and the name it did not know
+    # about was `category_path`: written by `suggest_category` at v1 and gone from
+    # v2 onward on every item, because this list was written before that column
+    # existed. What it costs is invisible until pricing, where the path chooses
+    # the retention rate a retail-derived anchor is reasoned down with.
+    #
+    # `merged_identification` is that list, maintained in one place, and its own
+    # docstring says why -- "One implementation, so that cannot happen again."
+    # This was the second implementation.
+    from resell.cli_item import merged_identification
+
+    fields, _ = merged_identification(conn, sku)
+    gateway.propose_identification(sku, **fields)
     conn.execute(
         "UPDATE identification SET mode = ?, mode_rationale = ?, identity_resolution = ? "
         "WHERE sku = ? AND superseded_at IS NULL",

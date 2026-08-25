@@ -60,6 +60,11 @@ class FetchedPage:
     text: str
     bytes_read: int
     truncated: bool
+    # The markup as fetched. `text` is what a model reads; this is what a
+    # machine-readable claim lives in -- `html_to_text` strips <script>, and
+    # `schema.org/Product` JSON-LD is inside one. Kept so an unknown shop can be
+    # admitted on what its page states rather than on who it is.
+    html: str = ""
 
     @property
     def redirected(self) -> bool:
@@ -361,6 +366,7 @@ class PageFetcher:
         final_url = str(response.url)
 
         return FetchedPage(
+            html=body,
             requested_url=url,
             final_url=final_url,
             status_code=response.status_code,

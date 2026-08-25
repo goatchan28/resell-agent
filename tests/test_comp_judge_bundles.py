@@ -72,40 +72,48 @@ def test_the_fixture_is_the_real_ten():
 
 
 # --- what the rule now says -----------------------------------------------------------
+#
+# These check wording, and wording is the weakest kind of evidence about a
+# prompt. They are here to stop the rule being quietly deleted, not to show that
+# it works -- what shows that is the recorded live judging below, which is the
+# only thing that ever caught either version being wrong.
 
 
-def test_a_bundle_is_about_separately_saleable_products():
-    """Not "more than one article". A charger is an article and is not a product
-    anybody shops for when they want a massage gun."""
+def test_the_rule_is_about_the_sale_unit_not_separate_availability():
+    """The first attempt asked "would a buyer shop for the extra thing on its
+    own". For Achedaway attachment heads the answer is demonstrably yes -- the
+    same search found them at $15.89 -- so that test excluded almost everything,
+    and the live judge went on excluding both massage-gun kits."""
     p = prompt()
-    assert SEPARATELY_SALEABLE in p
-    assert "naming the extra product" in p
+    assert "Is the *sale unit* larger" in p
+    assert "Separate availability is not the test" in p
+    assert "would it come in the box" in p
 
 
-def test_the_ordinary_contents_of_a_box_are_named():
-    """Left implicit, this reads as a licence to admit anything. Named, it is a
-    rule about what comes in the box."""
+def test_ambiguity_drops_a_rung_instead_of_excluding():
+    """What actually made it stable. Reframing alone left the judge reading
+    "extra attachments" as beyond-standard and excluding on three runs in five;
+    naming the ambiguous case and sending it to `category_attribute` -- which
+    still contributes -- made six runs of six keep all three guns."""
     p = prompt()
-    for included in ("charger", "cable", "case", "attachment set", "manual"):
-        assert included in p, included
-
-
-def test_the_test_a_judge_can_actually_apply():
-    """"Would a buyer plausibly shop for the extra thing on its own" decides the
-    camera lens and the charging cable in opposite directions, which is the whole
-    difficulty."""
-    p = prompt()
-    assert "shop for the extra thing on its own" in p
-    assert "a camera lens yes, a charging cable no" in p
+    assert "Ambiguity here is a rung question, not an exclusion" in p
+    assert "Count the primary units" in p
 
 
 def test_the_genuine_bundles_are_still_excluded():
-    """The rule must not have become "admit everything". A suit, a body with a
-    lens and a multi-unit lot are all still named."""
+    """The rule must not have become "admit everything"."""
     p = prompt()
-    for still_out in ("A suit is a jacket", "body sold with a lens",
+    for still_out in ("suit's trousers", "lens sold with a camera body",
                       "three units in one lot"):
         assert still_out in p, still_out
+
+
+def test_bundles_are_still_tested_before_anything_else():
+    """Order is what stopped the first version admitting suits."""
+    p = prompt()
+    assert "stop at the first line that applies" in p
+    assert p.index("Is the *sale unit* larger") < p.index("different material")
+    assert p.index("different material") < p.index("different kind of object")
 
 
 def test_the_case_that_exposed_it_is_written_down():
@@ -114,13 +122,48 @@ def test_the_case_that_exposed_it_is_written_down():
     assert "one massage gun" in p
 
 
-def test_bundles_are_still_tested_before_anything_else():
-    """Order is what stopped the first version of this rule admitting suits. It
-    has to survive the narrowing."""
-    p = prompt()
-    assert "stop at the first line that applies" in p
-    assert p.index(SEPARATELY_SALEABLE) < p.index("different material")
-    assert p.index("different material") < p.index("different kind of object")
+# --- what the live judge actually returned --------------------------------------------
+#
+# Recorded from six consecutive runs of the real Comp Judge against the ten
+# stored observations, on a copy of the beta database. Not a hand-written
+# expectation: the previous version of this file asserted the dispositions below
+# as *intent* and passed while the live judge was returning the opposite.
+#
+# Re-run it with `scratch/rejudge47.py` if the prompt changes again. A prompt
+# whose behaviour is not re-measured is a prompt whose behaviour is unknown.
+
+LIVE_VERDICTS_2026_08_25: dict[int, str] = {
+    1589: "excluded",              # replacement fork head, sold alone
+    1789: "excluded",              # aluminium bullet head
+    2581: "excluded",              # charging base
+    4500: "category_attribute",    # the gun the old rule already kept
+    9999: "category_attribute",    # both "Kit" listings -- the two that changed
+    18500: "excluded",             # Cupper unit, a different device
+    30000: "excluded",             # three Cupper units, a lot
+    32999: "excluded",             # heated scraper
+}
+
+
+def test_the_live_judge_keeps_all_three_massage_guns():
+    """1 contributing comp became 3, measured rather than asserted."""
+    kept = [price for price, verdict in LIVE_VERDICTS_2026_08_25.items()
+            if verdict != "excluded"]
+    assert sorted(kept) == [4500, 9999]
+    assert all(price in {l[0] for l in MASSAGE_GUNS} for price in kept)
+
+
+def test_the_live_judge_still_excludes_every_accessory():
+    for price, _, is_bundle, _ in MP_000047_LISTINGS:
+        if is_bundle:
+            assert LIVE_VERDICTS_2026_08_25[price] == "excluded", price
+
+
+def test_what_was_kept_actually_contributes():
+    """`category_attribute` is a rung down, not a polite refusal."""
+    from resell.pricing.comps import Comparability
+
+    for verdict in set(LIVE_VERDICTS_2026_08_25.values()) - {"excluded"}:
+        assert Comparability(verdict).contributes
 
 
 # --- the disposition of each real listing ---------------------------------------------

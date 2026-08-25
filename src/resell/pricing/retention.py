@@ -105,6 +105,10 @@ class RetailAnchor:
     category: str
     condition: ConditionBand
     basis: str
+    # Carried from the reference this was built from, because `anchor_trust`
+    # needs both and neither can be recovered from a price and a rate.
+    match: object | None = None
+    source_trust: float = 1.0
 
     @property
     def is_default_category(self) -> bool:
@@ -125,7 +129,8 @@ def retention_for(category_path: str | None, condition: ConditionBand) -> float:
 
 
 def anchor_from_retail(
-    retail_cents: int, category_path: str | None, condition: ConditionBand
+    retail_cents: int, category_path: str | None, condition: ConditionBand,
+    *, match: object | None = None, source_trust: float = 1.0,
 ) -> RetailAnchor:
     """A band, not a number, because it is inferred and not observed."""
     retention = retention_for(category_path, condition)
@@ -138,6 +143,8 @@ def anchor_from_retail(
         high_cents=round(point * (1 + ANCHOR_SPREAD)),
         retail_cents=retail_cents,
         retention=retention,
+        match=match,
+        source_trust=source_trust,
         category=group if known else "",
         condition=condition,
         basis=(

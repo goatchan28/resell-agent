@@ -78,11 +78,31 @@ def upload(client, *, cost="12.00"):
     return response.headers["Location"].split("/items/")[1].split("?")[0]
 
 
+def settle(conn, tries=200):
+    """Wait for the agent runs the uploads started to finish.
+
+    `/items` hands off to `_start_agent`, so five uploads leave five background
+    threads walking five items through the state machine. A test that snapshots
+    an item and asserts nothing changed is then racing them: `updated_at` moves
+    under it and the assertion fails for a reason that has nothing to do with the
+    cross-user write it is checking. Intermittent, and it was.
+    """
+    import time
+
+    for _ in range(tries):
+        if not conn.execute(
+            "SELECT COUNT(*) FROM agent_run WHERE status = 'running'"
+        ).fetchone()[0]:
+            return
+        time.sleep(0.02)
+
+
 def five_shelves(tmp_path):
     """One item each, uploaded by five different authenticated addresses."""
     app, conn = beta_app(tmp_path)
     clients = {email: as_user(app, email) for email in TESTERS}
     skus = {email: upload(client) for email, client in clients.items()}
+    settle(conn)
     return app, conn, clients, skus
 
 

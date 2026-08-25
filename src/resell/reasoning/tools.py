@@ -1458,6 +1458,73 @@ COMP_PLAN_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+RETAIL_EXTRACT_TOOL_NAME = "extract_retail_prices"
+
+RETAIL_EXTRACT_TOOL_SCHEMA: dict[str, Any] = {
+    "name": RETAIL_EXTRACT_TOOL_NAME,
+    "description": (
+        "List the products a shop's page offers and what the shop charges for "
+        "each, quoting the page."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "products": {
+                "type": "array",
+                "description": (
+                    "One entry per product the page offers. A product page has "
+                    "one; a collection or grid page has as many as it shows. "
+                    "Empty when the page sells nothing -- a brand's homepage "
+                    "usually sells nothing -- which is a correct answer."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "product_title": {
+                            "type": "string",
+                            "description": "The product's name as the page gives it.",
+                        },
+                        "price_cents": {
+                            "type": "integer",
+                            "description": (
+                                "What the shop charges today, in cents. Where a "
+                                "page shows a struck-through price beside a "
+                                "current one, this is the current one."
+                            ),
+                        },
+                        "was_price_cents": {
+                            "type": "integer",
+                            "description": (
+                                "The struck-through or compare-at price, where the "
+                                "page shows one. Omit entirely when it does not."
+                            ),
+                        },
+                        "currency": {"type": "string"},
+                        "in_stock": {
+                            "type": "boolean",
+                            "description": (
+                                "Only where the page says. Omit when it does not."
+                            ),
+                        },
+                        "excerpt": {
+                            "type": "string",
+                            "description": (
+                                "The page's own words for this product, verbatim, "
+                                "and the quotation must contain the price. An "
+                                "entry whose price is not in its quotation is "
+                                "discarded."
+                            ),
+                        },
+                    },
+                    "required": ["product_title", "price_cents", "excerpt"],
+                },
+            },
+        },
+        "required": ["products"],
+    },
+}
+
+
 COMP_EXTRACT_TOOL_NAME = "extract_comps"
 
 COMP_EXTRACT_TOOL_SCHEMA: dict[str, Any] = {

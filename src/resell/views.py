@@ -832,7 +832,7 @@ def pricing_input(conn: sqlite3.Connection, sku: str, request: "PricingRequest")
     recompute *the same* price, so the assembly lives here and is called.
     """
     from resell import store_pricing as sp
-    from resell.pricing.comps import ConditionBand, RetailKind
+    from resell.pricing.comps import Comparability, ConditionBand, RetailKind
     from resell.pricing.estimate import PricingInput, RetailReference
 
     scored = sp.load_scored_comps(conn, sku)
@@ -858,6 +858,23 @@ def pricing_input(conn: sqlite3.Connection, sku: str, request: "PricingRequest")
         for c in scored
         if c.observation.retail_kind is RetailKind.CURRENT
         and c.observation.price_cents
+    ) + tuple(
+        # Retail research's own evidence, out of `retail_observation`. Kept apart
+        # from comps the whole way down: these rows are not in `scored`, were
+        # never in a distribution, and reach pricing only as `RetailReference`.
+        #
+        # The middle source above is the older path -- a shop page that happened
+        # to parse as a marketplace listing -- and it stays until every live item
+        # has been through a round with retail research.
+        RetailReference(
+            price_cents=row["price_cents"],
+            kind=RetailKind(row["retail_kind"]),
+            source=row["host"],
+            citation=row["product_title"],
+            match=Comparability(row["match"]),
+        )
+        for row in sp.load_retail_references(conn, sku)
+        if row["price_cents"] and row["match"] != "excluded"
     )
     return PricingInput(
         sku=sku,

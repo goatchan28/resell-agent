@@ -900,6 +900,36 @@ not translate it, tidy it or judge it.
 Call the extract_comps tool exactly once."""
 
 
+RETAIL_EXTRACT_SYSTEM_PROMPT = """You are reading one shop's page and listing what \
+the shop charges for the products on it. You are not judging whether any of them is \
+the item somebody is selling second-hand: another stage decides that.
+
+This is a shop, not a marketplace. The prices here are what a thing costs new from \
+a seller entitled to sell it new -- not what a stranger is asking for a used one.
+
+Rules:
+
+- Every product quotes the page, and the quotation must contain that product's \
+price. Put the page's own words in `excerpt`. An entry whose price is not in its \
+quotation is discarded.
+- One entry per product the page offers. A product page offers one. A collection, \
+category or grid page offers as many as it shows, and all of them belong here -- \
+which of them is the item on the table is not your question.
+- The current price, not the crossed-out one. Shops show "was $399, now $299"; \
+`price_cents` is what you would pay today and `was_price_cents` is the other one. \
+Where only one price is shown it is the current one.
+- Prices that are not this product's price are not entries. Shipping thresholds \
+("free delivery over $50"), finance offers ("from $33/month"), bundle upsells, \
+gift-card denominations and other customers' review scores are none of them a \
+price for a product on this page.
+- A page that sells nothing yields an empty list, which is a correct answer. A \
+brand's homepage usually sells nothing: it is navigation, and the products are a \
+click away.
+- Do not convert currencies and do not infer a currency the page never states.
+
+Call the extract_retail_prices tool exactly once."""
+
+
 COMP_JUDGE_SYSTEM_PROMPT = """You are judging how comparable each retrieved listing is \
 to one second-hand item. You are not pricing anything and you are not choosing which \
 comps to keep: every judgement you make is recorded, including the ones that rule a \
@@ -921,19 +951,29 @@ material, but a different fit, cut, sub-line or trim level.
   `excluded` -- must not count at all. Say why: a bundle, a broken unit sold for \
 parts, a wholesale lot, an obvious misdescription.
 - Work through this in order, and stop at the first line that applies.
-  1. More than one *separately saleable product* in the price? A suit is a jacket \
-and trousers; a body sold with a lens is two things; three units in one lot is a \
-lot. `excluded`, naming the extra product. Every bundle admitted drags the whole \
-band upwards and the seller prices above the market without being told why.
-     What does *not* make a bundle: whatever the thing ordinarily comes with. A \
-charger, a cable, a case, the standard head or blade or attachment set, the manual. \
-Those are how the product is sold new, not a second product sold alongside it, and \
-a listing is not less comparable for describing them. The question to ask is \
-whether a buyer would plausibly shop for the extra thing on its own -- a camera \
-lens yes, a charging cable no.
-     An Achedaway massage gun listed as "with extra attachments, case and charger" \
-is one massage gun. Excluding it left a real market of three listings showing as \
-one, and the seller was handed a single price with nothing to choose between.
+  1. Is the *sale unit* larger than the product? Count primary units and \
+separately valuable optional products. Do not count parts.
+     `excluded`: more than one of the thing (three units in one lot); or a second \
+product that is optional and independently valuable -- a suit's trousers when the \
+item is a jacket, a lens sold with a camera body. Name what is extra. Every such \
+bundle admitted drags the whole band upwards and the seller prices above the \
+market without being told why.
+     Not a bundle: whatever the product ordinarily ships with. The charger, the \
+cable, the case, the manual, the stand, the standard set of heads or blades or \
+attachments. The question is **"if I bought this new, would it come in the \
+box?"** -- if yes, the listing is this product in its normal configuration, \
+however enthusiastically it words that.
+     **Separate availability is not the test.** Almost every accessory is also \
+sold on its own as a replacement, and that says nothing about how the product is \
+normally sold. Achedaway attachment heads sell separately for $15-$18; a massage \
+gun listed "Kit -- extra attachments, case, charger" is still one massage gun.
+     **Ambiguity here is a rung question, not an exclusion.** A title cannot \
+usually tell you whether "extra attachments", "Kit", "Set" or "complete" means \
+the standard contents or genuine additions -- and you will not resolve it by \
+staring at the words. When you cannot tell, say `category_attribute` and let the \
+pricing layer weigh it accordingly. Reserve `excluded` for a sale unit you can \
+actually see is larger: a second primary unit, or an optional product with a \
+market of its own. Count the primary units; one gun is one gun.
   2. A different material or cloth? Linen, corduroy, seersucker, tweed and cashmere \
 are different markets from a wool blend, whoever made them. `excluded`, naming \
 the cloth.
@@ -1046,6 +1086,126 @@ def comp_extraction_stage(
             name=COMP_EXTRACT_TOOL_NAME,
             description=COMP_EXTRACT_TOOL_SCHEMA["description"],
             json_schema=COMP_EXTRACT_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
+RETAIL_JUDGE_SYSTEM_PROMPT = """You are deciding, for each price a shop charges, \
+whether it is the price of the item somebody is holding -- not whether it is a good \
+price, and not what the item is worth second-hand.
+
+A shop's page often offers a whole product line. The massage gun on the table is one \
+of them; the scraper, the cupping set, the spare attachment heads and the bigger model \
+are not, and a price taken from the wrong row would be reasoned down into a resale \
+value for something nobody is selling.
+
+Rules:
+
+- Cite both sides. Which observation of the item corresponds to which part of the \
+shop's description. A judgement citing only the page is a description of a web page.
+- Choose the rung honestly.
+  `same_product` -- the shop is selling this exact product. Only available when the \
+item's identity was resolved; if it was not, this claim is refused downstream.
+  `same_family_variant` -- the same product line, a different size, colour or \
+generation. The 552 when the item is the 1090.
+  `category_attribute` -- the same kind of thing from the same maker. Recorded, and \
+too far away to price from.
+  `superficial` -- it merely resembles it.
+  `excluded` -- a different product. An accessory, a spare part, a bundle, another \
+line entirely. Say which, in `excluded_reason`, every time.
+- An accessory is not the product. A charging base, a spare head, a carry case and a \
+replacement strap are all sold by the maker and none of them is the thing on the \
+table. This is the failure that matters most here: MP-000022 anchored a $399 pair of \
+dumbbells on a $29.99 tablet holder from the maker's own site.
+- The bigger or smaller model is a variant, not this product. Where a line is sold in \
+sizes -- 552 and 1090, Pro and Mini -- say `same_family_variant` unless the item's \
+own identity names which one.
+- When the item's identity does not name a model and the shop sells several, you \
+cannot honestly say `same_product`. Say `same_family_variant` and let the pricing \
+layer trust it less.
+
+Call the judge_comps tool exactly once."""
+
+
+def retail_judging_stage(
+    identification: str,
+    observations: str,
+    prices: str,
+    identity_ceiling: str,
+    max_output_tokens: int = 2000,
+):
+    """Match shop prices to the item, on the same ladder comps use.
+
+    Same tool as comp judging, so one vocabulary describes both kinds of evidence
+    and `ANCHORABLE_RETAIL` can be expressed in it. A different prompt, because
+    the question is different: not "how comparable is this second-hand listing"
+    but "is this row the product on the table".
+    """
+    from resell.reasoning.tools import COMP_JUDGE_TOOL_NAME, COMP_JUDGE_TOOL_SCHEMA
+
+    instruction = (
+        f"The item, as currently identified:\n\n{identification}\n\n"
+        f"Observations of the item:\n\n{observations}\n\n"
+        f"Prices this shop charges:\n\n{prices}\n\n"
+        f"The strongest rung available for this item is {identity_ceiling}, because "
+        f"of how far its identity was resolved.\n\n"
+        "Decide which of these prices, if any, is this product's."
+    )
+    return StageRequest(
+        system_prompt=RETAIL_JUDGE_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=COMP_JUDGE_TOOL_NAME,
+            description=COMP_JUDGE_TOOL_SCHEMA["description"],
+            json_schema=COMP_JUDGE_TOOL_SCHEMA["input_schema"],
+        ),
+        max_tokens=max_output_tokens,
+    )
+
+
+def retail_extraction_stage(
+    page_text: str,
+    url: str,
+    query: str,
+    max_output_tokens: int = 2000,
+    max_page_chars: int = MAX_PAGE_CHARS,
+) -> StageRequest:
+    """Build the price-extraction request for one fetched shop page.
+
+    Deliberately not the comp extractor with a different prompt. The two answer
+    different questions -- "what are strangers asking for used ones" and "what
+    does this shop charge for a new one" -- and MP-000047 is what happens when
+    only the first exists: `recoveryforathletes.com` carried $399.00 for the exact
+    massage gun on the table, was fetched, was handed to the comp extractor, and
+    came back empty. It was obeying its instructions.
+    """
+    from resell.reasoning.tools import (
+        RETAIL_EXTRACT_TOOL_NAME, RETAIL_EXTRACT_TOOL_SCHEMA,
+    )
+
+    body = page_body_for_extraction(page_text, max_page_chars)
+    truncated = len(page_text) > max_page_chars
+    instruction = (
+        f"Page URL: {url}\n"
+        f"Retrieved by searching: {query}\n\n"
+        f"Page text{' (truncated)' if truncated else ''}:\n\n{body}\n\n"
+    )
+    if truncated:
+        instruction += (
+            f"The text above is the first {max_page_chars} characters of "
+            f"{len(page_text)}. Quote only from what you were given.\n\n"
+        )
+    instruction += "List what this shop charges for the products on this page."
+    return StageRequest(
+        system_prompt=RETAIL_EXTRACT_SYSTEM_PROMPT,
+        images=(),
+        instruction=instruction,
+        tool=ToolSpec(
+            name=RETAIL_EXTRACT_TOOL_NAME,
+            description=RETAIL_EXTRACT_TOOL_SCHEMA["description"],
+            json_schema=RETAIL_EXTRACT_TOOL_SCHEMA["input_schema"],
         ),
         max_tokens=max_output_tokens,
     )

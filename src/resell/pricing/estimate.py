@@ -220,6 +220,10 @@ class RetailReference:
     # None = asserted of this item directly. Otherwise the judge's grade for the
     # page it was read from.
     match: Comparability | None = None
+    # How far the *source* was believed when this was taken. 1.0 for a maker's
+    # own site or a registered retailer; lower for a shop admitted on what its
+    # page could prove rather than on who it is. See `retail_reading.SOURCE_TRUST`.
+    source_trust: float = 1.0
 
     @property
     def prices_this_item(self) -> bool:
@@ -1107,7 +1111,11 @@ def anchor_trust(anchor) -> float:
         Comparability.SAME_FAMILY_VARIANT: 0.60,
     }.get(match, 0.0)
     by_category = 0.75 if anchor.is_default_category else 1.00
-    return by_match * by_category
+    # Three separable doubts, and until this was written the first was inert:
+    # `RetailAnchor` had no `match` field, so `getattr` fell through to the
+    # default and a family-variant shop price was trusted like an exact one.
+    by_source = getattr(anchor, "source_trust", 1.0)
+    return by_match * by_category * by_source
 
 
 def anchor_share(confidence: float, trust: float) -> float:
@@ -1161,7 +1169,8 @@ def _anchor_for(inp: "PricingInput"):
     if current is None or current.price_cents <= 0:
         return None
     return anchor_from_retail(
-        current.price_cents, inp.category_path, inp.item_condition_band
+        current.price_cents, inp.category_path, inp.item_condition_band,
+        match=current.match, source_trust=current.source_trust,
     )
 
 

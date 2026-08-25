@@ -1072,3 +1072,130 @@ def _item_observation_ids(conn: sqlite3.Connection, sku: str) -> tuple[str, ...]
             "AND subject = 'this_item' ORDER BY id", (sku,),
         )
     )
+
+
+# --- retail evidence ---------------------------------------------------------
+#
+# Separate tables from comps, and separate functions, so that nothing which
+# loads comparable listings can pick up a shop's price for a new one by
+# accident. `load_scored_comps` cannot reach these rows because it does not
+# know they exist.
+
+
+def record_retail_observation(
+    conn: sqlite3.Connection, *, sku: str, url: str, host: str,
+    product_title: str | None, price_cents: int, currency: str = "USD",
+    retail_kind: str = "retail_current", in_stock: bool | None = None,
+    source_authority: str = "unknown", source_trust: float = 1.0,
+    query_text: str | None = None, source_excerpt: str | None = None,
+    observed_at: str | None = None,
+) -> str:
+    """Append-only, like every other observation in this file.
+
+    `source_trust` is stored rather than recomputed at read time so that an
+    observation records how far its source was believed *when it was taken*.
+    Widening which hosts may contribute later must not silently re-weight
+    evidence gathered under the older rule.
+    """
+    retail_id = f"retail_{uuid.uuid4().hex[:12]}"
+    stamp = observed_at or _now()
+    conn.execute(
+        """
+        INSERT INTO retail_observation (
+            retail_id, sku, url, host, product_title, price_cents, currency,
+            retail_kind, in_stock, source_authority, source_trust,
+            retrieval_method, query_text, source_excerpt, observed_at, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'automated_fetch',?,?,?,?)
+        """,
+        (retail_id, sku, url, host, product_title, price_cents, currency,
+         retail_kind, None if in_stock is None else int(in_stock),
+         source_authority, source_trust, query_text, source_excerpt,
+         stamp, _now()),
+    )
+    conn.commit()
+    return retail_id
+
+
+def record_retail_claim(
+    conn: sqlite3.Connection, *, sku: str, retail_id: str, match: str,
+    item_citations: tuple[str, ...] = (), retail_citations: tuple[str, ...] = (),
+    rationale: str = "", excluded_reason: str | None = None,
+) -> str:
+    """The judge's verdict on whether a shop price is for *this* product.
+
+    Same ladder as comps, and the same discipline: an exclusion without a reason
+    is refused, because a shop price that is neither counted nor accounted for is
+    the thing that makes a pricing round impossible to read afterwards.
+    """
+    if match == "excluded" and not (excluded_reason or "").strip():
+        raise ValueError("an excluded retail price must say why")
+    claim_id = f"rclaim_{uuid.uuid4().hex[:12]}"
+    conn.execute(
+        """
+        INSERT INTO retail_claim (
+            claim_id, sku, retail_id, match, item_citations, retail_citations,
+            rationale, excluded_reason, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (claim_id, sku, retail_id, match, json.dumps(list(item_citations)),
+         json.dumps(list(retail_citations)), rationale, excluded_reason, _now()),
+    )
+    conn.commit()
+    return claim_id
+
+
+def load_retail_references(conn: sqlite3.Connection, sku: str) -> list[dict]:
+    """Every judged retail price for an item, newest first.
+
+    Returns plain dicts rather than a dataclass because the one consumer --
+    `views.pricing_input` -- turns them straight into `RetailReference`, and a
+    second shape in between would be a second place for the two to disagree.
+
+    Unjudged observations are omitted. A shop price nobody has matched to the
+    item is not yet evidence about the item.
+    """
+    rows = conn.execute(
+        """
+        SELECT o.*, c.match, c.excluded_reason
+          FROM retail_observation o
+          JOIN retail_claim c ON c.retail_id = o.retail_id
+         WHERE o.sku = ?
+         ORDER BY o.observed_at DESC, o.rowid DESC
+        """,
+        (sku,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def unjudged_retail(conn: sqlite3.Connection, sku: str) -> list[dict]:
+    """Observations still waiting on a verdict, for the round that must supply one."""
+    rows = conn.execute(
+        """
+        SELECT o.* FROM retail_observation o
+         WHERE o.sku = ?
+           AND NOT EXISTS (SELECT 1 FROM retail_claim c WHERE c.retail_id = o.retail_id)
+         ORDER BY o.rowid
+        """,
+        (sku,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def has_trustworthy_retail(conn: sqlite3.Connection, sku: str) -> bool:
+    """Whether this item already has a same-product current shop price.
+
+    What retail discovery checks before spending a query. Once the question is
+    answered there is no reason to ask it again every round -- a shop price does
+    not change between two rounds of the same run, and searching for it again is
+    a lookup spent on a fact already on the record.
+    """
+    return bool(conn.execute(
+        """
+        SELECT 1 FROM retail_observation o
+          JOIN retail_claim c ON c.retail_id = o.retail_id
+         WHERE o.sku = ? AND o.retail_kind = 'retail_current'
+           AND c.match = 'same_product'
+         LIMIT 1
+        """,
+        (sku,),
+    ).fetchone())

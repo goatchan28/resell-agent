@@ -716,6 +716,62 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "COMMIT",
         "PRAGMA foreign_keys = ON",
     ),
+    # Retail evidence, in its own tables and deliberately not in `comp_observation`.
+    #
+    # A shop's price for a new one and a stranger's price for a used one answer
+    # different questions, and the pricing model turns on not confusing them.
+    # Keeping retail inside `comp_observation` worked -- `summarize` refuses
+    # `price_kind='reference'` -- but it put shop prices into `load_scored_comps`,
+    # the comparability profile, the excluded counts and the judge's comp prompt.
+    # A firewall you have to remember at every read is not a firewall. Nothing
+    # loads these rows as comps because nothing can.
+    #
+    # `source_authority` and `source_trust` are stored rather than derived, so an
+    # unknown retailer can later be admitted at reduced trust on the strength of
+    # page-level attribution without a migration. Today only a maker's own site or
+    # a registered retailer reaches here and trust is 1.0; the columns exist so
+    # widening that is a policy decision rather than a schema change.
+    (
+        """
+        CREATE TABLE retail_observation (
+            retail_id        TEXT PRIMARY KEY,
+            sku              TEXT NOT NULL REFERENCES item(sku),
+            url              TEXT NOT NULL,
+            host             TEXT NOT NULL,
+            product_title    TEXT,
+            price_cents      INTEGER NOT NULL CHECK (price_cents >= 0),
+            currency         TEXT NOT NULL DEFAULT 'USD',
+            retail_kind      TEXT NOT NULL DEFAULT 'retail_current'
+                               CHECK (retail_kind IN ('retail_current','retail_original')),
+            in_stock         INTEGER,
+            source_authority TEXT NOT NULL DEFAULT 'unknown',
+            source_trust     REAL NOT NULL DEFAULT 1.0
+                               CHECK (source_trust >= 0.0 AND source_trust <= 1.0),
+            retrieval_method TEXT NOT NULL DEFAULT 'automated_fetch',
+            query_text       TEXT,
+            source_excerpt   TEXT,
+            observed_at      TEXT NOT NULL,
+            created_at       TEXT NOT NULL,
+            UNIQUE (sku, url, price_cents, observed_at)
+        )
+        """,
+        """
+        CREATE TABLE retail_claim (
+            claim_id         TEXT PRIMARY KEY,
+            sku              TEXT NOT NULL REFERENCES item(sku),
+            retail_id        TEXT NOT NULL REFERENCES retail_observation(retail_id),
+            match            TEXT NOT NULL,
+            item_citations   TEXT NOT NULL DEFAULT '[]',
+            retail_citations TEXT NOT NULL DEFAULT '[]',
+            rationale        TEXT,
+            excluded_reason  TEXT,
+            created_at       TEXT NOT NULL,
+            UNIQUE (sku, retail_id)
+        )
+        """,
+        "CREATE INDEX idx_retail_sku ON retail_observation (sku, observed_at)",
+        "CREATE INDEX idx_retail_claim_sku ON retail_claim (sku)",
+    ),
 )
 
 

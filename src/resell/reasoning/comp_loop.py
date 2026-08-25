@@ -98,6 +98,11 @@ class CompRoundOutcome:
     # The extraction budget ran out partway. Not a failure: the round keeps what
     # it retrieved, judges it, and stops searching for pages it cannot read.
     stopped_early: bool = False
+    # Retail research, counted apart from everything above it.
+    retail_query: str = ""
+    retail_pages_read: int = 0
+    retail_recorded: int = 0
+    retail_skipped: str = ""
     # Listings that went into judging and came back without a verdict, and why.
     #
     # An empty list is the only thing that makes "no usable comparables" a
@@ -163,6 +168,71 @@ STAGE_SAYS: dict[str, str] = {
 # returning three pages must not be able to spend the whole item's allowance, and
 # a round that reads eight pages has been given a fair chance to find a market.
 EXTRACT_PER_ROUND = 8
+
+# --- retail research, the second evidence objective ---------------------------
+#
+# Pricing research has two objectives and they are counted separately:
+#
+#   marketplace research  ->  what strangers ask or get for used ones
+#   retail research       ->  what the thing costs new, from someone entitled
+#                             to sell it new
+#
+# Separate because they are different questions with different extractors,
+# different storage and different downstream evidence types -- and because
+# MP-000047 showed what sharing a budget costs. Eight extractions that round all
+# went to shop pages the comp extractor could not read, the marketplace searches
+# planned as 4 and 5 never ran, and the item was priced from one $45 ask while
+# $399.00 sat unread on a page the round had already fetched.
+#
+# Narrow on purpose. One targeted query, and only while the answer is unknown:
+# a shop price does not change between two rounds of one run, so once a
+# same-product current price is on the record the question is closed.
+RETAIL_EXTRACT_PER_ROUND = 2
+
+# What the retail-intent query looks for. Deliberately not a marketplace query:
+# "used", "for sale" and "second-hand" are what the other objective asks, and
+# adding them here returns resale listings again.
+# Wording that has to name the *thing*, not just who made it.
+#
+# "Achedaway price new official store" returns the brand's homepage, which sells
+# nothing -- it is navigation, and the products are a click away. Adding the
+# product noun ("massage gun") turns up
+# `achedaway.com/collections/achedaway-massage-gun`, which has the prices. The
+# noun usually only exists in the drafted title, so the title is used whenever
+# the model is unknown, with the condition wording stripped: "USED Excellent" in
+# a retail query asks for the wrong market entirely.
+_CONDITION_WORDS = (
+    "used", "new", "pre-owned", "preowned", "excellent", "very good", "good",
+    "fair", "refurbished", "open box", "for parts", "with tags", "nwt",
+)
+
+
+def retail_query_for(brand: str | None, model: str | None, title: str | None) -> str:
+    """The one retail-intent search a round may spend.
+
+    Built from identity rather than proposed by the planner. The planner is
+    briefed to find a resale market and does that well; asking it to also carry
+    an unrelated objective is how the objective gets dropped on the items that
+    need it most.
+    """
+    if brand and model and model.strip():
+        subject = f"{brand} {model}".strip()
+    elif title and title.strip():
+        subject = _without_condition(title)
+    elif brand:
+        subject = brand.strip()
+    else:
+        return ""
+    return f"{subject} price official site".strip() if subject else ""
+
+
+def _without_condition(title: str) -> str:
+    """The product, with the grade taken off. `title` is written to sell a used
+    one and this query is asking a shop what a new one costs."""
+    head = title.split(" - ")[0].split(" | ")[0].split(",")[0]
+    words = [w for w in head.split()
+             if w.strip(",.").casefold() not in _CONDITION_WORDS]
+    return " ".join(words).strip()
 
 JUDGE_BATCH = 10
 # Sized to the batch rather than to the old single-call world.
@@ -634,6 +704,10 @@ def run_comp_round(
             )
             break
 
+    # --- retail research, once, and only while the answer is unknown ---------
+    _retail_round(conn, gateway, sku, research_adapter, model_adapter,
+                  stage_budget, outcome)
+
     outcome.listings_found = len(recorded)
     if not recorded:
         outcome.stopped = "searched_not_found"
@@ -958,3 +1032,333 @@ def _drain_adapter_notes(adapter, outcome) -> None:
         return
     outcome.notes.extend(f"page: {note}" for note in notes)
     notes.clear()
+
+
+# --- retail research ---------------------------------------------------------
+
+
+def _retail_from_document(conn, sku, document, query, model_adapter, stage_budget,
+                          outcome, brand) -> int:
+    """Read one shop page and record what it charges. Returns rows written.
+
+    Every entry is checked twice before it is stored: the excerpt must be in the
+    page, and the price must be in the excerpt. The first is the same rule the
+    comp extractor lives by; the second matters more here, because a shop page is
+    dense with numbers that are not the product's price -- delivery thresholds,
+    finance offers, review counts -- and the whole value of a retail reference is
+    that it is the price of a specific thing.
+    """
+    from resell.reasoning.retail_reading import is_retail_source, trust_for
+    from resell.reasoning.stages import (
+        page_body_for_extraction, retail_extraction_stage,
+    )
+
+    url = getattr(document, "url", "") or ""
+    allowed, why = is_retail_source(url, brand)
+    if not allowed:
+        outcome.notes.append(f"{url}: not read as a shop -- {why}")
+        return 0
+
+    page_text = getattr(document, "page_text", "") or ""
+    if not page_text.strip():
+        outcome.notes.append(f"{url}: no readable text")
+        return 0
+
+    # A shop we know by name is read by the model; a shop we do not must prove
+    # itself from the page's own machine-readable claim about what it sells and
+    # for how much. `recoveryforathletes.com` is the case: a real retailer with a
+    # `schema.org/Product` offer for the exact item, previously worth nothing
+    # because of who it is rather than what it says.
+    trust = trust_for(url, brand)
+    if trust < 1.0:
+        return _retail_from_structured_data(conn, sku, document, query, outcome,
+                                            brand, trust)
+
+    body = page_body_for_extraction(page_text)
+    haystack = _squashed(body)
+    request = retail_extraction_stage(
+        page_text=page_text, url=url, query=query,
+        max_output_tokens=min(2000, stage_budget.max_output_tokens),
+    )
+    result = _run_stage(
+        conn, sku, model_adapter, request, purpose="retail_extract",
+        budget=stage_budget, spent=_round_spend(conn, sku, "retail_extract"),
+    )
+    products = (result.tool_input or {}).get("products") or []
+    outcome.retail_pages_read += 1
+
+    from urllib.parse import urlsplit
+
+    from resell import store_pricing as sp
+    from resell.reasoning.authority import authority_for_url
+
+    authority, _ = authority_for_url(url)
+    host = urlsplit(url).netloc.casefold()
+    written = 0
+    for entry in products:
+        price = entry.get("price_cents")
+        excerpt = (entry.get("excerpt") or "").strip()
+        title = (entry.get("product_title") or "").strip()
+        if not isinstance(price, int) or price <= 0 or not excerpt:
+            continue
+        # Whitespace-normalised, exactly as the comp extractor checks its own
+        # quotations: HTML-to-text collapses line breaks unpredictably, and a
+        # quotation that differs only in spacing is still the page's own words.
+        # Compared raw, every product on a shop's grid page failed -- the model
+        # joins a title and the price beneath it with a space, the page has a
+        # newline, and eleven real prices were dropped as fabrications.
+        if _squashed(excerpt) not in haystack:
+            outcome.notes.append(
+                f"{url}: a quotation for {title[:40]!r} is not in the page; dropped"
+            )
+            continue
+        # The price has to be in the words quoted for it, or the quotation is
+        # not evidence of that price.
+        if not _price_in_excerpt(price, excerpt):
+            outcome.notes.append(
+                f"{url}: {title[:40]!r} quotes text that does not contain its price; dropped"
+            )
+            continue
+        sp.record_retail_observation(
+            conn, sku=sku, url=url, host=host, product_title=title or None,
+            price_cents=price, currency=(entry.get("currency") or "USD"),
+            in_stock=entry.get("in_stock"),
+            source_authority=str(authority),
+            # Everything that reaches here today is a maker's own site or a
+            # registered retailer, so the source is believed outright. The column
+            # exists so an unknown shop can later be admitted below 1.0 on the
+            # strength of page-level attribution.
+            source_trust=1.0,
+            query_text=query, source_excerpt=excerpt[:2000],
+        )
+        written += 1
+    outcome.retail_recorded += written
+    if not written:
+        outcome.notes.append(f"{url}: read as a shop, no product price found")
+    return written
+
+
+def _retail_from_structured_data(conn, sku, document, query, outcome, brand,
+                                 trust) -> int:
+    """An unknown shop's price, taken only if the page proves it is a shop's.
+
+    No model call: the page's own `schema.org/Product` offer is the extraction,
+    and a site that publishes one has asserted the price in machine-readable
+    form. That is stronger attribution than a model reading prose, which is what
+    justifies admitting a host nobody vouched for -- at reduced trust, because
+    nobody vouched for it.
+
+    Every test in `validate_product_page` must pass. A coupon aggregator, a
+    review blog, a collection page and a page for a different brand each fail a
+    different one, and the reason is recorded so a round can say which.
+    """
+    from resell import store_pricing as sp
+    from resell.reasoning.retail_reading import validate_product_page
+
+    url = getattr(document, "url", "") or ""
+    html = getattr(document, "raw_html", None) or getattr(document, "page_text", "") or ""
+    product, why = validate_product_page(url, html, brand)
+    outcome.retail_pages_read += 1
+    if product is None:
+        outcome.notes.append(f"{url}: not admitted -- {why}")
+        return 0
+
+    from urllib.parse import urlsplit
+
+    sp.record_retail_observation(
+        conn, sku=sku, url=url, host=urlsplit(url).netloc.casefold(),
+        product_title=product.title, price_cents=product.price_cents,
+        currency=product.currency, in_stock=product.in_stock,
+        source_authority="page_validated", source_trust=trust,
+        query_text=query, source_excerpt=product.excerpt[:2000],
+    )
+    outcome.retail_recorded += 1
+    outcome.notes.append(
+        f"{url}: admitted at trust {trust:.2f} -- {why}"
+    )
+    return 1
+
+
+def _squashed(text: str) -> str:
+    """One space between words, case folded. The comparison both quotation checks
+    in this file use."""
+    return " ".join((text or "").split()).casefold()
+
+
+def _price_in_excerpt(price_cents: int, excerpt: str) -> bool:
+    """Whether the quoted words actually contain the price they are quoted for."""
+    import re
+
+    whole, cents = divmod(price_cents, 100)
+    candidates = {f"{whole}.{cents:02d}", f"{whole:,}.{cents:02d}"}
+    if cents == 0:
+        candidates |= {str(whole), f"{whole:,}"}
+    digits = re.sub(r"[^\d.,]", "", excerpt)
+    return any(c in excerpt or c in digits for c in candidates)
+
+
+def _retail_round(conn, gateway, sku, research_adapter, model_adapter,
+                  stage_budget, outcome) -> None:
+    """One targeted retail-intent search, and the pages it turns up.
+
+    Runs after the marketplace searches and out of their budget, so a shop page
+    can no longer consume an extraction the resale market needed -- which is
+    exactly what MP-000047 spent all eight of its extractions on.
+
+    Skipped entirely once the item has a same-product current shop price. That
+    fact does not change between two rounds of one run, and asking again spends a
+    lookup to learn something already on the record.
+    """
+    from resell import store_pricing as sp
+    from resell.gateway import current_identification
+    from resell.reasoning.adapters.research import ResearchQuery
+
+    if sp.has_trustworthy_retail(conn, sku):
+        outcome.retail_skipped = "a same-product shop price is already on the record"
+        return
+
+    identification = current_identification(conn, sku)
+    brand = identification["brand"] if identification else None
+    query = retail_query_for(
+        brand,
+        identification["model"] if identification else None,
+        identification["title"] if identification else None,
+    )
+    if not query:
+        outcome.retail_skipped = "nothing identified well enough to search a shop for"
+        return
+
+    # Straight to the search backend, not through the marketplace adapter's
+    # `search`. That method answers a different objective and selects for it: it
+    # keeps the first three fetchable hits, so on MP-000047 it spent all three on
+    # resale pages and the two `achedaway.com/collections/...` pages that carry
+    # the prices -- hits four and five -- were never fetched. Retail research
+    # chooses its own pages, which is the point of it being a separate objective.
+    backend = getattr(research_adapter, "backend", None)
+    retrieve = getattr(research_adapter, "_retrieve", None)
+    if backend is None or retrieve is None:
+        outcome.retail_skipped = "this adapter cannot search shops"
+        return
+
+    outcome.retail_query = query
+    progress.report(progress.Phase.SEARCHING, f"what it costs new: {query[:52]}")
+    try:
+        hits = backend.find(ResearchQuery(query, "retail", "what it costs new"))
+    except Exception as exc:  # noqa: BLE001 - retail is additive; never fail the round
+        outcome.notes.append(f"retail search failed: {type(exc).__name__}: {exc}")
+        return
+
+    from resell.reasoning.retail_reading import is_retail_source, shop_page_first
+
+    shops = [h for h in hits if is_retail_source(getattr(h, "url", ""), brand)[0]]
+    if not shops:
+        outcome.retail_skipped = "the search found no shop we recognise"
+        gateway.record_lookup(
+            sku, provider=research_adapter.provider, query=query,
+            motivation="what it costs new", evidence_ids=[],
+            result_count=len(hits), scope="pricing",
+            cost_micros=research_adapter.cost_micros_per_lookup(),
+        )
+        return
+
+    documents = []
+    for hit in shop_page_first(shops)[:RETAIL_EXTRACT_PER_ROUND]:
+        document = retrieve(getattr(hit, "url", ""))
+        if document is not None:
+            documents.append(document)
+
+    gateway.record_lookup(
+        sku, provider=research_adapter.provider, query=query,
+        motivation="what it costs new", evidence_ids=[],
+        result_count=len(documents), scope="pricing",
+        cost_micros=research_adapter.cost_micros_per_lookup(),
+    )
+
+    from resell.reasoning.retail_reading import shop_page_first
+
+    read = 0
+    for document in documents:
+        progress.report(
+            progress.Phase.READING,
+            f"reading {getattr(document, 'marketplace', 'a shop')}",
+        )
+        try:
+            _retail_from_document(conn, sku, document, query, model_adapter,
+                                  stage_budget, outcome, brand)
+        except (BudgetExceeded, CompLoopError) as exc:
+            outcome.notes.append(f"retail reading stopped: {exc}")
+            break
+        read += 1
+    if not outcome.retail_recorded and not outcome.retail_skipped:
+        outcome.retail_skipped = "no shop page yielded a price"
+        return
+    _judge_retail(conn, sku, model_adapter, stage_budget, outcome)
+
+
+def _judge_retail(conn, sku, model_adapter, stage_budget, outcome) -> None:
+    """Decide which of the recorded shop prices are this product's.
+
+    Until this runs the observations are prices somebody charges for something;
+    afterwards they are prices for a named relationship to the item, and only
+    `same_product` or `same_family_variant` may anchor. `load_retail_references`
+    omits anything unjudged, so an unfinished judging step leaves the evidence
+    inert rather than admitting it unchecked.
+    """
+    from resell import store_pricing as sp
+    from resell.gateway import observations_in_scope
+    from resell.reasoning.stages import retail_judging_stage
+    from resell.reasoning.tools import parse_comp_judge_tool_input
+
+    pending = sp.unjudged_retail(conn, sku)
+    if not pending:
+        return
+
+    observations = observations_in_scope(conn, sku)
+    ceiling = ceiling_for_identity(_identity_resolution(conn, sku))
+    lines = "\n".join(
+        f"- {row['retail_id']}: {row['product_title'] or '(untitled)'} "
+        f"at {row['price_cents'] / 100:.2f} {row['currency']} on {row['host']}"
+        for row in pending
+    )
+    request = retail_judging_stage(
+        identification=render_identification(conn, sku),
+        observations=render_observations(observations),
+        prices=lines, identity_ceiling=str(ceiling),
+        max_output_tokens=max(1000, len(pending) * 220),
+    )
+    try:
+        result = _run_stage(
+            conn, sku, model_adapter, request, purpose="retail_judge",
+            budget=stage_budget, spent=_round_spend(conn, sku, "retail_judge"),
+        )
+    except (BudgetExceeded, CompLoopError) as exc:
+        outcome.notes.append(f"shop prices left unjudged: {exc}")
+        return
+
+    judged = parse_comp_judge_tool_input(
+        result.tool_input,
+        valid_item_evidence={row["id"] for row in observations},
+        valid_comp_ids={row["retail_id"] for row in pending},
+    )
+    for note in judged.malformed:
+        outcome.notes.append(f"retail judgement discarded: {note}")
+
+    kept = 0
+    for judgement in judged.judgements:
+        try:
+            sp.record_retail_claim(
+                conn, sku=sku, retail_id=judgement.comp_id,
+                match=str(judgement.comparability),
+                item_citations=tuple(str(i) for i in judgement.item_evidence_ids),
+                retail_citations=tuple(judgement.comp_fields),
+                rationale=judgement.rationale or "",
+                excluded_reason=judgement.excluded_reason,
+            )
+            kept += 1
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            outcome.notes.append(f"retail judgement refused: {exc}")
+    missing = len(pending) - kept
+    if missing > 0:
+        outcome.notes.append(
+            f"{missing} shop price(s) came back without a verdict and stay inert"
+        )

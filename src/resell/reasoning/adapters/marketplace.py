@@ -41,6 +41,8 @@ class MarketplaceDocument:
     marketplace: str
     authority: SourceAuthority
     page_text: str
+    # The markup, for structured-data validation. See `FetchedPage.html`.
+    raw_html: str = ""
     title: str = ""
     adapter: str = "fetch"
     truncated: bool = False
@@ -143,6 +145,7 @@ class OperatorUrlMarketplaceAdapter:
             marketplace=marketplace,
             authority=authority,
             page_text=page.text,
+            raw_html=getattr(page, "html", "") or "",
             title=page.final_url,
             adapter=self.provider,
             truncated=page.truncated,

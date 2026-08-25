@@ -7,13 +7,29 @@ you want out of this sale". They are different questions and the second one is
 not a property of the comps, so it lives in a different module and is stated
 explicitly rather than baked into a single number.
 
-**The rule that keeps this honest: a strategy selects an observed statistic from
-an observed distribution. It never computes a new number.** Fast-sale is not
-"the median minus fifteen percent"; it is the lowest comparable current ask, a
-real listing you can point at. Max-proceeds is not "the median plus a premium";
-it is the upper quartile of the comparable asks, again a real position in a real
-market. The only arithmetic anywhere in this file is the floor, which is a
-constraint rather than an estimate.
+**The rule that keeps this honest: a strategy takes a position in the evidence
+the estimator produced, and names which evidence that was. It never invents a
+number of its own.** Where there is a marketplace sample, fast-sale is not "the
+median minus fifteen percent" -- it is the lowest comparable current ask, a real
+listing you can point at, and max-proceeds is the upper quartile of those asks,
+again a real position in a real market.
+
+That rule used to read "an observed statistic from an observed distribution",
+which was the same discipline stated one layer too specifically. It made the
+retail-derived anchor unusable: an item with no comparable listings and a known
+current shop price produced a perfectly defensible band in `estimate` and no
+strategies at all, so the seller was sent to type a number with strictly less
+information than the agent had. The evidence model now has two shapes -- an
+observed distribution and a computed anchor -- and the rule is about *not
+inventing*, which both satisfy. An anchor band is arithmetic, but it is
+`estimate`'s arithmetic, done once, stated in `RetailAnchor.basis`, and taken
+here rather than redone.
+
+The two never merge. An anchor is not turned into a fake distribution and its
+positions are not described as comps; `PriceAnchor.source` says which of the two
+a price came from, and the seller-facing note says it in words. The only
+arithmetic in this file remains the floor, which is a constraint rather than an
+estimate.
 
 Brand strength participates the same way -- it selects *which* statistic an
 objective takes, and it must be cited or it is treated as unknown. It never
@@ -128,17 +144,55 @@ def _stat(d: Distribution, s: Statistic) -> int:
     }[s]
 
 
+# Where in the anchor band a position sits, said in words rather than in sample
+# statistics. See `PriceAnchor.describe`.
+_ANCHOR_WORD: dict["Statistic", str] = {}
+
+
+class AnchorSource(StrEnum):
+    """Which kind of evidence a strategy took its position in.
+
+    Never inferred from the numbers. A caller reading a price has to be able to
+    tell "the lowest of nine real asks" from "12% under a depreciated shop
+    price" without knowing anything about how either was produced.
+    """
+
+    MARKETPLACE = "marketplace"
+    RETAIL_ANCHOR = "retail anchor"
+
+
 @dataclass(frozen=True)
 class PriceAnchor:
-    """An observed point in an observed sample, and where it came from."""
+    """Where a strategy's number came from, and what kind of thing it is.
+
+    Two shapes, kept apart. A marketplace position names a statistic, a price
+    kind and a sample size. A retail-anchored position has none of those -- there
+    is no sample -- and carries the anchor's own account of itself instead.
+    """
 
     statistic: Statistic
-    price_kind: PriceKind
+    price_kind: PriceKind | None
     band_relation: str
     value_cents: int
     n: int
+    source: AnchorSource = AnchorSource.MARKETPLACE
+    # `RetailAnchor.basis`, verbatim, when there is one. Restating the retention
+    # arithmetic here would be a second copy of it.
+    basis: str = ""
+
+    @property
+    def is_observed(self) -> bool:
+        return self.source is AnchorSource.MARKETPLACE
 
     def describe(self) -> str:
+        if self.source is AnchorSource.RETAIL_ANCHOR:
+            # Not "p75 of the anchor". `min`/`p75` are sample vocabulary and
+            # there is no sample; saying it would imply a distribution that does
+            # not exist behind a number that is one shop price and a rate.
+            return (
+                f"{_ANCHOR_WORD[self.statistic]} of the retail-derived anchor, "
+                f"{self.basis}"
+            )
         return (
             f"{self.statistic} of {self.n} {self.price_kind} comps "
             f"({self.band_relation})"
@@ -179,8 +233,24 @@ def build_strategies(
     minimum_net_proceeds_cents: int = 500,
     default_objective: SellerObjective = SellerObjective.BALANCED,
 ) -> StrategySet | None:
-    """Three prices from one comp set. Returns None when the evidence supports none."""
-    if rec.unpriceable or rec.basis_distribution is None or rec.price_kind is None:
+    """Three prices from the best evidence there is.
+
+    The hierarchy, in order, and each rung is tried only because the one above it
+    is empty:
+
+      a marketplace sample, on its own;
+      a marketplace sample the estimator has already blended with the anchor;
+      the retail-derived anchor alone, when no comparable listing survived
+      judging but a current shop price for this product did;
+      and None -- which is the seller typing a number, and is now reached only
+      when there is genuinely nothing.
+
+    Returns None when the evidence supports none of them.
+    """
+    if rec.unpriceable:
+        return None
+    anchor_only = rec.basis_distribution is None or rec.price_kind is None
+    if anchor_only and rec.retail_anchor is None:
         return None
 
     sig = brand or BrandSignal()
@@ -195,15 +265,21 @@ def build_strategies(
     prices: dict[SellerObjective, StrategyPrice] = {}
     for objective in SellerObjective:
         stat = _SELECTION[(objective, strength)]
-        raw = round(_stat(d, stat) * rec.adjustment_factor)
-        anchor = PriceAnchor(
-            statistic=stat, price_kind=rec.price_kind,
-            band_relation=rec.band_relation, value_cents=raw, n=d.n,
-        )
+        if anchor_only:
+            raw, anchor = _from_anchor(rec, objective, stat)
+        else:
+            raw = round(_stat(d, stat) * rec.adjustment_factor)
+            anchor = PriceAnchor(
+                statistic=stat, price_kind=rec.price_kind,
+                band_relation=rec.band_relation, value_cents=raw, n=d.n,
+            )
         price = max(raw, floor_price)
         floor_bound = price > raw
         reason = f"{objective}: {anchor.describe()}"
-        if strength is not BrandStrength.UNKNOWN:
+        if strength is not BrandStrength.UNKNOWN and not anchor_only:
+            # Brand strength selects *which* statistic of a sample to take. With
+            # no sample it selects nothing, and saying it did would dress up a
+            # depreciation rate as a market judgement.
             reason += f", brand strength {strength}"
         if floor_bound:
             reason += "; raised to the minimum net proceeds floor"
@@ -230,6 +306,46 @@ def build_strategies(
     )
 
 
+# Where each objective sits in the anchor band. The band already expresses the
+# uncertainty in a retail-derived figure -- `ANCHOR_SPREAD`, either side of the
+# point -- so the three objectives take its bottom, middle and top rather than
+# applying a second discount of their own.
+#
+# Brand strength is deliberately not consulted. It selects which statistic of a
+# *sample* to take, and there is no sample here; a strong brand's standing is
+# already in the shop price the anchor depreciates.
+_ANCHOR_POSITION: dict[Statistic, str] = {
+    Statistic.MIN: "low_cents",
+    Statistic.P25: "low_cents",
+    Statistic.MEDIAN: "point_cents",
+    Statistic.P75: "high_cents",
+    Statistic.MAX: "high_cents",
+}
+
+_ANCHOR_WORD.update({
+    Statistic.MIN: "the bottom", Statistic.P25: "the bottom",
+    Statistic.MEDIAN: "the middle",
+    Statistic.P75: "the top", Statistic.MAX: "the top",
+})
+
+
+def _from_anchor(
+    rec: PriceRecommendation, objective: SellerObjective, stat: Statistic
+) -> tuple[int, PriceAnchor]:
+    """A position in the retail-derived anchor band, labelled as one.
+
+    `adjustment_factor` is not applied. Condition is already in the anchor --
+    `retention_for` scales the whole table by it -- and applying a condition
+    adjustment on top would count the same fact twice.
+    """
+    band = rec.retail_anchor
+    raw = getattr(band, _ANCHOR_POSITION[stat])
+    return raw, PriceAnchor(
+        statistic=stat, price_kind=None, band_relation="retail_anchored",
+        value_cents=raw, n=0, source=AnchorSource.RETAIL_ANCHOR, basis=band.basis,
+    )
+
+
 def _sold_note(rec: PriceRecommendation) -> str:
     """What the realized evidence says, when it did not set the number."""
     if rec.band_relation != "condition_matched_asks" or rec.realized_off_band is None:
@@ -252,6 +368,13 @@ def _sold_note(rec: PriceRecommendation) -> str:
 
 def _uncertainty_note(rec: PriceRecommendation) -> str:
     parts: list[str] = []
+    if rec.has(PriceQualifier.RETAIL_ANCHORED):
+        # First, because it is the most limiting thing true of the price: there
+        # is no marketplace evidence under it at all.
+        parts.append(
+            "no comparable listing survived judging, so the band is reasoned "
+            "down from the current shop price rather than observed"
+        )
     if rec.has(PriceQualifier.POSITIONED_ON_ASKS):
         parts.append(
             "priced against current asking prices, not realized sales, because "

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from resell.reasoning.adapters import AdapterError, ModelAdapter, get_adapter
@@ -203,10 +203,26 @@ class RepairOutcome:
     previous: ListingDraft
     preserved_ratio: float
     repaired: tuple[str, ...] = ()
+    # Measures this attempt made worse than the draft it was repairing. A repair
+    # that moves a counted violation in the wrong direction has not repaired
+    # anything, whatever else it changed, and the next attempt is told so.
+    regressed: dict = field(default_factory=dict)
 
     @property
     def looks_like_a_rewrite(self) -> bool:
         return self.preserved_ratio < 0.5
+
+    @property
+    def went_backwards(self) -> bool:
+        return bool(self.regressed)
+
+    def what_went_backwards(self) -> tuple[str, ...]:
+        return tuple(
+            f"the last repair made this worse: {name} went from {before.value} to "
+            f"{now.value} {now.unit} against a limit of {now.limit}. Cut it this "
+            f"time; do not solve another problem by adding length."
+            for name, (before, now) in self.regressed.items()
+        )
 
 
 def _sentences(text: str) -> list[str]:
@@ -236,6 +252,7 @@ def repair_draft(
     *,
     aspects: dict[str, Any],
     condition_id: str | None,
+    also_tell_it: tuple[str, ...] = (),
     adapter: ModelAdapter | None = None,
     provider: str | None = None,
     model: str | None = None,
@@ -279,7 +296,13 @@ def repair_draft(
         previous_description=previous.description,
         previous_claims=claims,
         previous_marketing=previous.marketing_copy,
-        problems="\n".join(f"- {p}" for p in outcome.review.problems),
+        problems="\n".join(
+            f"- {p}" for p in list(outcome.review.problems) + list(also_tell_it)
+        ),
+        # The sums, done. A limit stated as "over eBay's 80" leaves the model to
+        # subtract, and subtracting is exactly what it got wrong: told a title was
+        # 89 characters it answered with 96.
+        arithmetic="\n".join(f"- {a}" for a in outcome.review.arithmetic()),
         aspects=_render_aspects(aspects),
         observations=observation_text,
         condition=condition_id or "",
@@ -331,4 +354,5 @@ def repair_draft(
         previous=previous,
         preserved_ratio=preserved_ratio(previous, draft),
         repaired=tuple(outcome.review.problems),
+        regressed=review.regressions(outcome.review),
     )

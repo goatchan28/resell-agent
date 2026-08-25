@@ -1,39 +1,58 @@
 {% extends "consumer/base.html" %}
 {% block title %}Your items{% endblock %}
+{% block body_class %}c-scrolls{% endblock %}
 {% block content %}
-<h1>Your items</h1>
+<h1 class="c-page-title">Your items</h1>
+
 {% if rows %}
-<table class="c-shelf">
-  <thead>
-    <tr><th></th><th>Item<th>Status<th class="n">Price<th class="n">You paid<th class="n">Profit
-  <tbody>
-  {% for row in rows %}
-    <tr class="{{ 'c-needs' if row.needs_you }}">
-      <td class="c-thumb">
-        {% if row.photo_position is not none %}
-          <img src="{{ url_for('photo', sku=row.sku, position=row.photo_position) }}" alt="">
-        {% endif %}
-      <td><a href="{{ url_for('item', sku=row.sku) }}">{{ row.name | shorten(52) }}</a>
-      <td>{{ row.status }}{% if row.needs_you %}
-        <span class="c-flag">needs you</span>{% endif %}
-      <td class="n">{{ row.price_low_cents | money if row.has_price else '—' }}
-      <td class="n">{{ row.purchase_cost_cents | money if row.purchase_cost_cents is not none else '—' }}
-      <td class="n {{ 'neg' if row.profit_cents is not none and row.profit_cents < 0 }}">
-        {{ row.profit_cents | money if row.profit_cents is not none else '—' }}
-  {% endfor %}
-</table>
-<p class="tiny quiet">Profit is what it sells for, less eBay's fees and postage,
-  less what you paid.</p>
+  <ul class="c-cards">
+    {% for row in rows %}
+      <li class="c-card {{ 'needs-you' if row.needs_you }}">
+        <a class="c-card-link" href="{{ url_for('item', sku=row.sku) }}">
+          <span class="c-card-shot">
+            {% if row.photo_position is not none %}
+              <img src="{{ url_for('photo', sku=row.sku, position=row.photo_position) }}"
+                   alt="" loading="lazy">
+            {% endif %}
+          </span>
+          <span class="c-card-text">
+            <span class="c-card-name">{{ row.name | shorten(64) }}</span>
+            <span class="c-card-status">
+              {{ row.status }}{% if row.needs_you %}
+                <span class="c-card-flag">needs you</span>{% endif %}
+            </span>
+          </span>
+          <span class="c-card-money">
+            <span class="c-card-price">
+              {{ row.price_low_cents | money if row.has_price else '—' }}
+            </span>
+            {% if row.profit_cents is not none %}
+              <span class="c-card-profit {{ 'is-neg' if row.profit_cents < 0 }}">
+                {{ row.profit_cents | money }} profit
+              </span>
+            {% endif %}
+          </span>
+        </a>
+      </li>
+    {% endfor %}
+  </ul>
+  <p class="c-quiet-note">Profit is what it sells for, less eBay's fees and
+    postage, less what you paid.</p>
 {% else %}
-  <p class="c-empty">Nothing here yet. <a href="{{ url_for('home') }}">Add an item</a>.</p>
+  <p class="c-empty">Nothing here yet.</p>
+  <div class="c-actions">
+    <a class="c-big-button c-big-link" href="{{ url_for('home') }}">Sell something</a>
+  </div>
 {% endif %}
+
 {% if aside_count %}
-  <p class="tiny">
+  <p class="c-quiet-note">
     {% if showing_aside %}
       Showing {{ aside_count }} you set aside.
-      <a href="{{ url_for('shelf') }}">hide</a>
+      <a href="{{ url_for('shelf') }}">Hide</a>
     {% else %}
-      {{ aside_count }} set aside. <a href="{{ url_for('shelf', aside=1) }}">show</a>
+      {{ aside_count }} set aside.
+      <a href="{{ url_for('shelf', aside=1) }}">Show</a>
     {% endif %}
   </p>
 {% endif %}

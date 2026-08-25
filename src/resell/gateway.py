@@ -870,6 +870,7 @@ class Gateway:
         description: str | None = None,
         condition_id: str | None = None,
         category_id: str | None = None,
+        category_path: str | None = None,
         aspect_schema: dict | None = None,
         aspects: dict | None = None,
         confidence: float | None = None,
@@ -895,12 +896,13 @@ class Gateway:
             )
             self.conn.execute(
                 "INSERT INTO identification (sku, version, brand, model, variant, title, "
-                "description, condition_id, category_id, aspect_schema, aspects, "
-                "confidence, reasoning, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "description, condition_id, category_id, category_path, aspect_schema, "
+                "aspects, confidence, reasoning, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sku, version, brand, model, variant, title, description, condition_id,
-                    category_id, json.dumps(aspect_schema) if aspect_schema else None,
+                    category_id, category_path,
+                    json.dumps(aspect_schema) if aspect_schema else None,
                     json.dumps(aspects) if aspects else None, confidence, reasoning, now_iso(),
                 ),
             )

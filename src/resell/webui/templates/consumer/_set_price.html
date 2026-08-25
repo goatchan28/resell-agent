@@ -1,17 +1,32 @@
-{# Setting a price by hand, and asking for another look.
+{# Typing a price. Reached three ways: research found no comparable listings,
+   it found only retail prices, or the seller asked for it from under the slider.
 
-   Shared by the two screens that need it: the one where no comparable listings
-   were found, and the one where some were found but none of them was a
-   marketplace price. Same actions, same safety check -- a price below the floor
-   still has to be confirmed. #}
+   This is the path that records `operator_judgement` rather than evidence. That
+   is why it is always reachable and never the default -- a seller who disagrees
+   with the agent must be able to say so, and should know they are trading the
+   evidence for their own judgement rather than discovering it later. The floor
+   check is unchanged: a price that loses money still has to be confirmed on
+   purpose. #}
 <form method="post" action="{{ url_for('set_price', sku=task.sku) }}"
       class="c-price-entry" data-long>
-  <label>$<input type="text" name="price" inputmode="decimal"
-                 placeholder="0.00" required autocomplete="off"></label>
-  <button type="submit" class="primary" data-busy="Working…">Use this price</button>
-  <label class="tiny"><input type="checkbox" name="confirm_below_floor">
-    list it even if it loses money</label>
+  <div class="c-scroll">
+    <div class="c-money-field is-large">
+      <span aria-hidden="true">$</span>
+      <input type="text" name="price" inputmode="decimal" pattern="[0-9.,]*"
+             placeholder="0.00" required autocomplete="off" aria-label="Price">
+    </div>
+    <label class="c-toggle">
+      <input type="checkbox" name="confirm_below_floor" value="1">
+      <span>List it even if it loses money</span>
+    </label>
+  </div>
+  <button type="submit" class="c-big-button c-pinned" data-busy="One moment…">
+    Use this price
+  </button>
 </form>
-<form method="post" action="{{ url_for('more_research', sku=task.sku) }}" data-long>
-  <button type="submit" data-busy="Looking…">Let it look again</button>
+<form class="c-pinned" method="post"
+      action="{{ url_for('more_research', sku=task.sku) }}" data-long>
+  <button type="submit" class="c-secondary-button" data-busy="Looking…">
+    Look again
+  </button>
 </form>

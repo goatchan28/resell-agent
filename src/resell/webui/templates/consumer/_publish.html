@@ -1,0 +1,14 @@
+{# The one irreversible action in the product.
+
+   Three lines, three different facts: the heading (above, from the step) says
+   what is about to happen, the amount says how much, and the button names the
+   marketplace. It previously said "put it up for sale" in the heading, again in
+   a sentence, and a third time on the button. #}
+<p class="c-amount c-pinned">{{ task.approved_price_cents | money }}</p>
+<div class="c-actions">
+  <form method="post" action="{{ url_for('publish', sku=task.sku) }}" data-long>
+    <button type="submit" class="c-big-button" data-busy="Listing it…">
+      List it on eBay
+    </button>
+  </form>
+</div>

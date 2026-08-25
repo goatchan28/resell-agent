@@ -1,0 +1,59 @@
+{% extends "consumer/base.html" %}
+{% block title %}{{ 'Sell' if not task else task.name | shorten(40) }}{% endblock %}
+{# Every state is one viewport except the last one. Review Listing is where the
+   seller actually reads what goes to eBay, and squeezing that into an internal
+   scrolling box made the final check feel like another small form to clear. #}
+{% block body_class %}{{ 'c-scrolls c-review' if task and task.action == 'approve_listing'
+                         else 'c-fixed' }}{% endblock %}
+{% block content %}
+
+{% if not task %}
+  {# Nothing in flight. One thing to do, and it fills the screen. #}
+  {% include "consumer/_hero.html" %}
+
+{% else %}
+  {# The item's workspace: one thing on screen at a time.
+
+     The photograph appears while the agent works, where it is the reassurance
+     that it has the right item and there is nothing else to look at. It does
+     not appear on a decision screen: cropped to fit it told the seller nothing
+     they needed to decide with, and it was taking the room the decision wanted.
+     The exception is the finished item, where the picture is the point.
+
+     Review Listing has its own photographs, uncropped, in the card itself. #}
+  {% if task.working or task.is_done %}
+    <section class="c-item">
+      <div class="c-shot">
+        {% if task.photo_positions %}
+          <img src="{{ url_for('photo', sku=task.sku, position=task.photo_positions[0]) }}"
+               alt="{{ task.name }}">
+        {% else %}
+          <div class="c-shot-empty" aria-hidden="true"></div>
+        {% endif %}
+      </div>
+      <h1 class="c-name">{{ task.name | shorten(64) }}</h1>
+    </section>
+  {% endif %}
+
+  {% if task.is_done %}
+    {% include "consumer/_done.html" %}
+  {% elif task.working %}
+    {% include "consumer/_progress.html" %}
+  {% else %}
+    {% include "consumer/_decision.html" %}
+  {% endif %}
+
+  {# Hidden outright while a run is in flight: every action inside it is behind
+     the `_busy` guard, so offering them would only produce a refusal.
+
+     Hidden on a question too. The sheet exists to correct a title and a
+     description, and the agent asks its questions before it has written either
+     -- so it offered to fix fields that do not exist yet, next to the one thing
+     it actually needed. #}
+  {% if not task.is_done and not task.active_run
+        and task.action != 'answer_questions' %}
+    {% include "consumer/_more.html" %}
+  {% endif %}
+{% endif %}
+
+{% endblock %}

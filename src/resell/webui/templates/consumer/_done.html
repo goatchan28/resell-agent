@@ -1,0 +1,35 @@
+{# Finished. Two things a seller wants now: to look at what they just put up,
+   and to sell the next thing.
+
+   The card becomes a link only when there is a listing to open. Published in
+   the sandbox it points at the sandbox host; the URL is built once, in
+   `views.listing_url`, which the CLI prints from too. #}
+{% if task.listing_url %}
+  <a class="c-status c-status-done c-status-link" href="{{ task.listing_url }}"
+     target="_blank" rel="noopener">
+    <span class="c-scroll">
+      <span class="c-status-head">
+        <span class="c-tick" aria-hidden="true">&#10003;</span> It is up for sale
+      </span>
+      {% if task.approved_price_cents %}
+        <span class="c-amount">{{ task.approved_price_cents | money }}</span>
+      {% endif %}
+    </span>
+    <span class="c-status-go c-pinned">View your listing &rsaquo;</span>
+  </a>
+{% else %}
+  <section class="c-status c-status-done">
+    <div class="c-scroll">
+      <p class="c-status-head"><span class="c-tick" aria-hidden="true">&#10003;</span>
+        It is up for sale</p>
+      {% if task.approved_price_cents %}
+        <p class="c-amount">{{ task.approved_price_cents | money }}</p>
+      {% endif %}
+    </div>
+  </section>
+{% endif %}
+
+<div class="c-actions">
+  <a class="c-big-button c-big-link" href="{{ url_for('home') }}">Sell another item</a>
+  <a class="c-quiet-link" href="{{ url_for('shelf') }}">See your items</a>
+</div>

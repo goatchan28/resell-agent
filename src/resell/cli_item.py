@@ -158,7 +158,7 @@ def merged_identification(conn, sku: str, **overrides) -> tuple[dict, list[str]]
     fields = {
         "brand": None, "model": None, "variant": None, "title": None,
         "description": None, "condition_id": None, "category_id": None,
-        "aspects": None, "confidence": None, "reasoning": None,
+        "category_path": None, "aspects": None, "confidence": None, "reasoning": None,
     }
     fields.update({key: value for key, value in overrides.items() if key in fields})
 
@@ -166,6 +166,7 @@ def merged_identification(conn, sku: str, **overrides) -> tuple[dict, list[str]]
     previous = current_identification(conn, sku)
     if previous is not None:
         for field in ("brand", "model", "variant", "title", "description",
+                      "category_path",
                       "condition_id", "category_id", "reasoning"):
             if fields[field] is None and previous[field]:
                 fields[field] = previous[field]
@@ -1374,8 +1375,9 @@ def cmd_item_publish(args: argparse.Namespace) -> int:
         print("\nDry run only. Nothing was uploaded or written to eBay.")
     elif listing_id:
         print(f"\nPUBLISHED  listingId={listing_id}")
-        print(f"  https://www.sandbox.ebay.com/itm/{listing_id}"
-              if config.env.name == "sandbox" else f"  https://www.ebay.com/itm/{listing_id}")
+        from resell.views import listing_url
+
+        print("  " + listing_url(listing_id, environment=config.env.name))
     return 0
 
 

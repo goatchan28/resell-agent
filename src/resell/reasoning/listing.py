@@ -226,15 +226,65 @@ class ListingDraft:
     malformed: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class Measure:
+    """A violation with a number on it, and the number it has to reach.
+
+    Most refusals are matters of fact -- this claim is not supported, that word
+    needs evidence -- and there is nothing to count. A few are quantities, and a
+    quantity can be compared before and after a repair. That is the whole reason
+    this exists: a repair told "89 characters, over eBay's 80 limit" once
+    answered with 96, and nothing noticed it had gone the wrong way.
+    """
+
+    value: int
+    limit: int
+    unit: str
+
+    @property
+    def excess(self) -> int:
+        return max(0, self.value - self.limit)
+
+    def arithmetic(self, subject: str) -> str:
+        """The instruction, with the sum already done.
+
+        "over eBay's 80 limit" leaves the reader to work out how much to cut, and
+        the reader is a language model that is bad at exactly that.
+        """
+        return (f"{subject} is {self.value} {self.unit}; "
+                f"remove at least {self.excess} to reach {self.limit}")
+
+
 @dataclass
 class DraftReview:
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     untraceable: tuple[str, ...] = ()
+    # Keyed by what is being measured, so two reviews can be compared.
+    measures: dict[str, Measure] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
         return not self.problems
+
+    def regressions(self, previous: "DraftReview") -> dict[str, tuple[Measure, Measure]]:
+        """Measures this review makes worse than `previous` did.
+
+        Only counts where the measure is still in violation: going from 96 down
+        to 84 is progress even though 84 is still too long, and a repair that
+        lands inside the limit is not a regression whatever it did to the number.
+        """
+        worse = {}
+        for name, now in self.measures.items():
+            before = previous.measures.get(name)
+            if before is None or not now.excess:
+                continue
+            if now.value > before.value:
+                worse[name] = (before, now)
+        return worse
+
+    def arithmetic(self) -> tuple[str, ...]:
+        return tuple(m.arithmetic(name.replace("_", " ")) for name, m in self.measures.items())
 
 
 def _tokens(text: str) -> list[str]:
@@ -340,6 +390,7 @@ def review_draft(
     if not draft.title.strip():
         review.problems.append("title is empty")
     elif len(draft.title) > TITLE_MAX:
+        review.measures["title"] = Measure(len(draft.title), TITLE_MAX, "characters")
         review.problems.append(
             f"title is {len(draft.title)} characters, over eBay's {TITLE_MAX} limit"
         )
@@ -352,6 +403,9 @@ def review_draft(
             # reviewer refuses claims, not prose -- and a draft thrown away for
             # running long leaves the seller writing the listing themselves,
             # which is a far worse outcome than four sentences.
+            review.measures["description"] = Measure(
+                sentences, DESCRIPTION_MAX_SENTENCES, "sentences"
+            )
             review.warnings.append(
                 f"description is {sentences} sentences; "
                 f"{DESCRIPTION_MAX_SENTENCES} is the intended maximum"

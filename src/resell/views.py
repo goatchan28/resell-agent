@@ -180,6 +180,10 @@ class ItemSummary:
     created_at: str
     notes: str | None
     photo_count: int
+    # Positions are the order they were attached in and do not start at zero: a
+    # thumbnail hard-coded to position 0 asked for a photo that does not exist on
+    # most items, and every card on the list rendered a broken image.
+    first_photo_position: int | None
     evidence_count: int
     open_question_count: int
     blocking_question_count: int
@@ -255,6 +259,8 @@ def item_summaries(
         SELECT i.sku, i.state, i.acquisition_intent, i.purchase_cost_cents,
                i.identification_effort, i.created_at, i.notes,
                (SELECT COUNT(*) FROM photo p WHERE p.sku = i.sku) AS photos,
+               (SELECT MIN(p.position) FROM photo p WHERE p.sku = i.sku)
+                   AS first_photo,
                (SELECT COUNT(*) FROM evidence e WHERE e.sku = i.sku) AS evidence,
                (SELECT COUNT(*) FROM open_question q
                  WHERE q.sku = i.sku AND q.answered_at IS NULL) AS open_questions,
@@ -280,6 +286,7 @@ def item_summaries(
             created_at=row["created_at"],
             notes=row["notes"],
             photo_count=row["photos"],
+            first_photo_position=row["first_photo"],
             evidence_count=row["evidence"],
             open_question_count=row["open_questions"],
             blocking_question_count=row["blocking_questions"],
@@ -796,11 +803,64 @@ class PricingRequest:
     retail_cents: tuple[int, ...] = ()
     retail_kind: str | None = None
     category_id: str | None = None
+    # eBay's own path to the category. Read only to choose a retention rate for
+    # the retail-derived anchor -- see `pricing/retention.py`.
+    category_path: str | None = None
     shipping_cost_cents: int = 0
     minimum_net_cents: int = 500
     brand_strength: str | None = None
     brand_citations: tuple[str, ...] = ()
     brand_rationale: str = ""
+
+
+def pricing_input(conn: sqlite3.Connection, sku: str, request: "PricingRequest"):
+    """The one place a `PricingInput` is assembled from the record.
+
+    There were three, and they disagreed. The web page passed the retail
+    references and the category path; `approve_price` passed neither, and the
+    CLI passed only what the operator typed. So a seller could be shown three
+    retail-anchored prices, tap one, and have the approval recompute without the
+    retail that produced them -- "the evidence supports no strategy" on a screen
+    that had just displayed the evidence. Anything that recomputes a price has to
+    recompute *the same* price, so the assembly lives here and is called.
+    """
+    from resell import store_pricing as sp
+    from resell.pricing.comps import ConditionBand, RetailKind
+    from resell.pricing.estimate import PricingInput, RetailReference
+
+    scored = sp.load_scored_comps(conn, sku)
+    # Two sources, kept apart. What the operator typed is theirs and is taken at
+    # its stated kind, about this item. What pricing research retrieved is only a
+    # *current* shop price where the observation itself says so -- `retail_kind`
+    # is set by the extractor against the page it read -- and it carries the
+    # judge's grade for that page, because a shop price on a page the judge
+    # excluded is a price tag for something else.
+    retail = tuple(
+        RetailReference(
+            price_cents=cents,
+            kind=RetailKind(request.retail_kind or "retail_original"),
+        )
+        for cents in request.retail_cents
+    ) + tuple(
+        RetailReference(
+            price_cents=c.observation.price_cents,
+            kind=RetailKind.CURRENT,
+            source=c.observation.marketplace,
+            match=c.claim.comparability,
+        )
+        for c in scored
+        if c.observation.retail_kind is RetailKind.CURRENT
+        and c.observation.price_cents
+    )
+    return PricingInput(
+        sku=sku,
+        item_condition_band=ConditionBand(request.condition_band),
+        identity_resolution=request.identity_resolution,
+        category_path=request.category_path,
+        comps=tuple(scored),
+        retail=retail,
+        window_days=request.window_days,
+    ), scored
 
 
 @dataclass(frozen=True)
@@ -865,6 +925,7 @@ def default_pricing_request(
     return PricingRequest(
         condition_band=str(_band_for_condition_enum(identification["condition_id"])),
         category_id=identification["category_id"],
+        category_path=identification["category_path"],
     )
 
 
@@ -906,24 +967,9 @@ def pricing_view(
         build_strategies,
     )
 
-    scored = sp.load_scored_comps(conn, sku)
-    retail = tuple(
-        RetailReference(
-            price_cents=cents,
-            kind=RetailKind(request.retail_kind or "retail_original"),
-        )
-        for cents in request.retail_cents
-    )
-    rec = recommend(
-        PricingInput(
-            sku=sku,
-            item_condition_band=ConditionBand(request.condition_band),
-            identity_resolution=request.identity_resolution,
-            comps=tuple(scored),
-            retail=retail,
-            window_days=request.window_days,
-        )
-    )
+    built, scored = pricing_input(conn, sku, request)
+    retail = built.retail
+    rec = recommend(built)
 
     schedule = sp.active_fee_schedule(
         conn, marketplace=marketplace, category_id=request.category_id
@@ -1069,6 +1115,11 @@ class WorkflowView:
     price_low_cents: int | None = None
     price_high_cents: int | None = None
     price_confidence_note: str = ""
+    # The estimator's own qualifiers, carried across unchanged. The consumer UI
+    # translates them into a sentence a seller can act on; parsing the operator's
+    # `price_confidence_note` prose to recover the same facts would be a second,
+    # lossier copy of a decision the estimator already made explicitly.
+    price_qualifiers: tuple[str, ...] = ()
     approved_price_cents: int | None = None
     listing_description: str = ""
     purchase_cost_cents: int | None = None
@@ -1092,6 +1143,18 @@ class WorkflowView:
     # and the screen must not offer to advance the same item in parallel: two
     # advances race through one state machine and spend two budgets.
     active_run: str | None = None
+    # Empty until the item is published. The done screen turns it into a link so
+    # the seller can go and look at what they just put up for sale.
+    listing_url: str = ""
+    # eBay's own wording for the condition, for the final review. The id is on
+    # the identification; the label is the one eBay shows a buyer.
+    condition_id: str = ""
+    condition_label: str = ""
+    # The last run stopped without finishing. `stopped_reason` is the technical
+    # one, for /ops; the consumer projection turns the step into a sentence.
+    stopped_step: str = ""
+    stopped_reason: str = ""
+    stopped_cleanly: bool = False
 
     @property
     def is_done(self) -> bool:
@@ -1111,6 +1174,37 @@ class WorkflowView:
     @property
     def has_price(self) -> bool:
         return bool(self.price_options)
+
+
+def condition_label(condition_id) -> str:
+    """eBay's own wording for a condition id, or "" if there is not one.
+
+    The catalogue already exists and is already what publishing validates
+    against, so this reads it rather than keeping a second list of words for the
+    same fourteen values.
+    """
+    from resell.pricing.condition import EBAY_CONDITIONS
+
+    if condition_id in (None, ""):
+        return ""
+    try:
+        wanted = int(condition_id)
+    except (TypeError, ValueError):
+        return ""
+    return next((c.label for c in EBAY_CONDITIONS if c.condition_id == wanted), "")
+
+
+def listing_url(listing_id: str | None, *, environment: str) -> str:
+    """Where a published listing can be looked at, or "" if it is not published.
+
+    One definition, because there are two of everything else here already: the
+    CLI printed this pair inline after publishing, and a second copy in the web
+    UI would eventually disagree about which host the sandbox is on.
+    """
+    if not listing_id:
+        return ""
+    host = "www.sandbox.ebay.com" if environment == "sandbox" else "www.ebay.com"
+    return f"https://{host}/itm/{listing_id}"
 
 
 def workflow_view(
@@ -1146,15 +1240,26 @@ def workflow_view(
         for row in sp.pending_comp_candidates(conn, sku)
     )
 
+    from resell.orchestrator import Actor as _Actor
+
+    stopped = _stopped_run(conn, sku) if step.actor is _Actor.AGENT else None
+
     price_summary, options, low, high, note = "", (), None, None, ""
-    if sp.load_scored_comps(conn, sku):
+    qualifiers: tuple[str, ...] = ()
+    # Retail-only pricing needs `pricing_view` to run with no usable comps. It
+    # already does: a harvested shop price rides in on a comp observation, so
+    # `load_scored_comps` is non-empty whenever there is one. The `or` covers
+    # operator-supplied retail, which has no comp row behind it -- unreachable
+    # from this path today, and a silent no-price if it ever becomes reachable.
+    pricing_request = default_pricing_request(conn, sku, marketplace=marketplace)
+    if sp.load_scored_comps(conn, sku) or pricing_request.retail_cents:
         pricing = pricing_view(
-            conn, sku, default_pricing_request(conn, sku, marketplace=marketplace),
-            marketplace=marketplace,
+            conn, sku, pricing_request, marketplace=marketplace,
         )
         price_summary = pricing.summary
         low, high = pricing.band_low_cents, pricing.band_high_cents
         note = pricing.uncertainty_note
+        qualifiers = pricing.qualifiers
         options = tuple(
             PriceOption(
                 objective=s.objective, price_cents=s.price_cents,
@@ -1169,6 +1274,17 @@ def workflow_view(
         sku=sku,
         can_search=search_is_available(),
         active_run=_active_run(conn, sku),
+        listing_url=listing_url(
+            detail.listing.listing_id if detail.listing else None,
+            environment=environment,
+        ),
+        stopped_step=(str(step.step) if stopped else ""),
+        stopped_reason=(stopped.detail if stopped else ""),
+        stopped_cleanly=bool(stopped and stopped.blocked),
+        condition_id=(identification.condition_id if identification else "") or "",
+        condition_label=condition_label(
+            identification.condition_id if identification else None
+        ),
         grant_calls=GRANT_CALLS,
         grant_lookups=GRANT_LOOKUPS,
         floor_cents=_floor_for(conn, sku, marketplace=marketplace),
@@ -1187,6 +1303,7 @@ def workflow_view(
         price_low_cents=low,
         price_high_cents=high,
         price_confidence_note=note,
+        price_qualifiers=qualifiers,
         approved_price_cents=sp.approved_price_cents(conn, sku),
         listing_description=(identification.description if identification else "") or "",
         purchase_cost_cents=detail.purchase_cost_cents,
@@ -1205,6 +1322,7 @@ class InventoryRow:
     actor: str
     summary: str
     photo_count: int
+    first_photo_position: int | None
     open_questions: int
     pending_candidates: int
     comps: int
@@ -1274,6 +1392,7 @@ def inventory(
             actor=str(step.actor),
             summary=step.summary,
             photo_count=summary.photo_count,
+            first_photo_position=summary.first_photo_position,
             open_questions=summary.open_question_count,
             pending_candidates=len(sp.pending_comp_candidates(conn, summary.sku)),
             comps=len(sp.load_scored_comps(conn, summary.sku)),
@@ -1402,9 +1521,15 @@ def correction_form(
             f"{category_id} accepts, so publishing will be refused"
         )
 
-    title_problem = ""
+    # An empty field is not a fault, and conflating the two is what put "something
+    # needs fixing" on the screen of someone watching the agent write their
+    # listing. Nothing had gone wrong: the title was empty because drafting had
+    # not run yet. A `problem` means the value that exists cannot be published --
+    # a title over eBay's limit, a condition the category rejects. "Not written
+    # yet" is a state, and it belongs in the help text.
+    title_problem, title_help = "", ""
     if not title.strip():
-        title_problem = "a listing needs a title"
+        title_help = refused_help or "the agent has not written one yet"
     elif len(title) > EBAY_TITLE_MAX:
         title_problem = f"{len(title)} characters, over eBay's {EBAY_TITLE_MAX}"
 
@@ -1415,7 +1540,7 @@ def correction_form(
                 name="title", label="title", value=title or refused_title,
                 help_text=(
                     f"{len(title)}/{EBAY_TITLE_MAX} characters" if title
-                    else refused_help
+                    else title_help
                 ),
                 problem=title_problem,
             ),
@@ -1496,6 +1621,26 @@ DISTINCTIVE_ASPECTS = (
 )
 GENERIC_ASPECTS = ("Type",)
 IDENTITY_ASPECTS = DISTINCTIVE_ASPECTS + GENERIC_ASPECTS
+
+
+def _stopped_run(conn, sku: str):
+    """The last run on this item, if it stopped without finishing the work.
+
+    A blocked run and a run that never started look identical from the item's
+    state -- the step is owed either way -- so the difference has to come from
+    the run record. Without it the screen offers "Carry on" on an item that has
+    already been tried and could not get through, which reads as if nothing has
+    happened yet.
+    """
+    from resell.runs import latest_run_for
+
+    try:
+        run = latest_run_for(conn, sku)
+    except Exception:  # noqa: BLE001 - a card without this beats no card
+        return None
+    if run is None or run.running or run.status == "done":
+        return None
+    return run
 
 
 def _active_run(conn, sku: str) -> str | None:

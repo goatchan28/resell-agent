@@ -684,6 +684,12 @@ deleting the sentence. Do not attach a citation that does not actually support w
 the sentence says -- that is a worse failure than the one you were asked to fix.
 - If the only honest repair is to say less, say less. A shorter accurate listing \
 beats a longer one that gets refused again.
+- Where a problem comes with a count, treat the count as the instruction. "Remove \
+at least 16 characters to reach 80" is not a suggestion about tone: 80 is a hard \
+limit and a title of 81 is refused exactly as one of 96 is. Cut, then count what is \
+left. Fixing a second problem by making the first one worse -- expanding "40R" into \
+"Size 40 Regular" on a title that was already too long -- is not a repair, and it \
+is rejected and sent back.
 - The description stays at three sentences or fewer. Removing a phrase never needs \
 a new sentence to replace it, and a repair that grows the copy has stopped being a \
 repair.
@@ -705,6 +711,7 @@ def repair_stage(
     aspects: str,
     observations: str,
     condition: str,
+    arithmetic: str = "",
     max_output_tokens: int = 2000,
 ) -> StageRequest:
     """Build a targeted repair request for a draft the review refused.
@@ -722,7 +729,9 @@ def repair_stage(
 
     instruction = (
         f"The review refused this draft for these reasons:\n\n{problems}\n\n"
-        f"--- the draft, to repair ---\n\n"
+        + (f"Counts, already worked out for you:\n\n{arithmetic}\n\n"
+           if arithmetic else "")
+        + f"--- the draft, to repair ---\n\n"
         f"TITLE:\n{previous_title}\n\n"
         f"DESCRIPTION:\n{previous_description}\n\n"
         f"CLAIMS AND THEIR CITATIONS:\n{previous_claims or '(none)'}\n\n"
@@ -905,13 +914,43 @@ listing. A judgement citing only the listing is a description of a web page.
 was actually resolved; if it was not, this claim is refused downstream and your \
 judgement is discarded with it.
   `same_family_variant` -- same product line, different variant, colour or year.
-  `category_attribute` -- the same kind of thing with comparable attributes.
+  `category_attribute` -- the same kind of thing with comparable attributes. This is \
+also where a *sibling* of the item lands: same brand, same kind of object, same \
+material, but a different fit, cut, sub-line or trim level.
   `superficial` -- it merely resembles it. Retained, contributes nothing.
   `excluded` -- must not count at all. Say why: a bundle, a broken unit sold for \
 parts, a wholesale lot, an obvious misdescription.
+- Work through this in order, and stop at the first line that applies.
+  1. More than one article in the price? A suit is a jacket and trousers; a body \
+sold with a lens is two things; a set is a set. `excluded`, naming the extra \
+item. Every bundle admitted \
+drags the whole band upwards and the seller prices above the market without being \
+told why.
+  2. A different material or cloth? Linen, corduroy, seersucker, tweed and cashmere \
+are different markets from a wool blend, whoever made them. `excluded`, naming \
+the cloth.
+  3. A different kind of object? An accessory, a part, a lot, another garment \
+entirely. `excluded`, naming what it is.
+  4. Otherwise it is the same object in a different version, and it goes on the \
+ladder. A different fit, cut, sub-line, sub-brand or diffusion line is a step down \
+to `category_attribute` -- not an exclusion. Brands divide one garment into a dozen \
+named fits, and second-hand those names do not sell for wildly different money: what \
+a buyer pays for is the brand, the cloth and the cut. A Brooks Brothers Regent navy \
+check wool jacket tells you something real about what a Brooks Brothers Explorer \
+Slim navy check wool jacket fetches, and so does a 346 or a 1818 Madison one.
+- Every `excluded` carries its reason in `excluded_reason`, every time. The record \
+is checked on the way in and a reasonless exclusion is thrown away -- so the listing \
+ends up neither counted nor accounted for, which is the one outcome worse than \
+either judging it or excluding it.
+- Two ways to be wrong, and both are worth checking before you answer. Keeping one \
+listing out of twenty-four leaves the pricing layer nothing to work from, and the \
+answer to a sparse market is a wider band, not an empty one. Keeping almost \
+everything usually means a bundle or a different cloth got in.
 - Resemblance is not sameness. Mass-produced goods have many near-twins, and the \
 differences that matter -- generation, colourway, capacity -- are often invisible in a \
-listing photograph. When in doubt, drop a rung.
+listing photograph. When in doubt, drop a rung. Dropping a rung is the whole \
+mechanism: `category_attribute` still counts, `superficial` is kept and counts for \
+nothing, and `excluded` is a claim that this listing says nothing at all.
 - A listing in a different condition is still comparable. Condition is recorded \
 separately and the pricing layer stratifies by it; do not exclude a listing for being \
 worn, and do not silently treat it as equivalent either.

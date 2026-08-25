@@ -1,0 +1,28 @@
+{# The empty state, which is the front door. One control until there is
+   something to decide, and then the two things only the seller knows: which
+   photos, and what they paid. #}
+<section class="c-hero">
+  <div class="c-hero-art" aria-hidden="true">
+    <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round">
+      <path d="M6 17a3 3 0 0 1 3-3h5l3-4h14l3 4h5a3 3 0 0 1 3 3v18a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3z"/>
+      <circle cx="24" cy="26" r="7"/>
+    </svg>
+  </div>
+  <h1 class="c-hero-title">Sell something</h1>
+  {# "Take a few photos" is the button's job. #}
+  <p class="c-hero-sub">We work out what it is, what it is worth, and write the
+    listing.</p>
+
+  <div class="c-hero-form">
+    {% with action = url_for('create_item'), with_cost = true,
+            pick_label = 'Take or choose photos', submit_label = 'Start' %}
+      {% include "consumer/_photo_picker.html" %}
+    {% endwith %}
+    {# One sentence, and it is this one because a tag is where the brand, the
+       model, the material and the size are written down. MP-000041's owner was
+       asked for four of those; three were on the item and one was on a tag. #}
+    <p class="c-hero-note" data-hide-when-picked>Include a photo of the tag or
+      label if there is one.</p>
+  </div>
+</section>

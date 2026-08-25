@@ -1,0 +1,24 @@
+{# Only reachable when candidates are already pending. The agent judges its own
+   comparables now, so this is a fallback rather than a normal step -- kept
+   because an item part-way through the old flow still has to be finishable. #}
+<p class="c-sub c-pinned">Are these the same sort of thing?</p>
+<div class="c-scroll">
+{% for comp in task.candidates %}
+  <div class="c-comp">
+    <span class="c-comp-price">{{ comp.price_cents | money }}</span>
+    <span class="c-comp-title">{{ comp.title | shorten(70) }}</span>
+    <span class="c-comp-buttons">
+      <form method="post"
+            action="{{ url_for('accept_candidate', candidate_id=comp.candidate_id) }}">
+        <input type="hidden" name="sku" value="{{ task.sku }}">
+        <button type="submit" class="c-secondary-button">Yes</button>
+      </form>
+      <form method="post"
+            action="{{ url_for('reject_candidate', candidate_id=comp.candidate_id) }}">
+        <input type="hidden" name="sku" value="{{ task.sku }}">
+        <button type="submit" class="c-secondary-button">No</button>
+      </form>
+    </span>
+  </div>
+{% endfor %}
+</div>

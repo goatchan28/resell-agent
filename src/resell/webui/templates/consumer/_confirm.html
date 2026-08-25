@@ -1,0 +1,16 @@
+{# A human checkpoint the agent cannot pass on its own. Consumer wording, same
+   gate: the agent only stops here when it could not work the item out.
+
+   The name appears here and nowhere else on this screen. It used to be above
+   the card as well, under the photo, so the question and its subject were
+   printed twice. #}
+<div class="c-scroll"><p class="c-value">{{ task.name }}</p></div>
+<div class="c-actions">
+  <form method="post" action="{{ url_for('confirm_identity', sku=task.sku) }}"
+        data-long>
+    <button type="submit" class="c-big-button" data-busy="One moment…">
+      Yes, that is it
+    </button>
+  </form>
+  <p class="c-quiet-note">Not quite? Change it under More below.</p>
+</div>

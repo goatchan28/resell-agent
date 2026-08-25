@@ -1,0 +1,132 @@
+{# Choosing a price by dragging, without changing what a price means.
+
+   The slider has one stop per pricing strategy and submits `objective` -- the
+   same field the operator's three buttons submit, to the same endpoint, with the
+   same evidence behind the resulting proposal. It is a different control for an
+   unchanged decision.
+
+   A continuous slider was the other option and is the reason this one snaps: an
+   arbitrary number has to go through `set_price`, which records
+   `operator_judgement` and no comparable evidence. That would quietly strip the
+   evidence basis off every price that had one. Typing a number is still offered,
+   underneath -- it just costs the evidence, and the seller should reach it on
+   purpose rather than by dragging. #}
+{% set default = task.default_option %}
+<div class="c-slider c-fill" data-count="{{ task.price_options | length }}">
+  {# The amount and the three labels are the whole readout. Nothing explains
+     them, in either direction.
+
+     Two sentences have been tried here and removed. "A fair price that still
+     moves" said what "Balanced" already says. A confidence line -- how thin the
+     evidence was, whether these were asks or sales -- was true and useful to an
+     operator and wrong here: it asked the seller to audit the recommendation
+     before accepting it, on a screen whose only two answers are "yes" and "I
+     will pick my own". The qualifiers are all still recorded, and /ops still
+     shows them; this screen is a choice, not a report. #}
+  <div class="c-scroll">
+    <output class="c-amount" id="price-amount">{{ default.price_cents | money }}</output>
+  </div>
+
+  <form class="c-pinned" method="post"
+        action="{{ url_for('approve_price', sku=task.sku) }}"
+        data-long id="price-form">
+    <input type="hidden" name="objective" id="price-objective"
+           value="{{ default.objective }}">
+
+    {# Only when the stops are actually different prices. The floor can clamp all
+       three together, and a slider whose amount never changes reads as broken --
+       so it is left out, and the one price stands on its own. #}
+    {% if task.price_is_a_range %}
+      <input type="range" class="c-range" id="price-range"
+             min="0" max="{{ task.price_options | length - 1 }}" step="1"
+             value="{{ task.price_options.index(default) }}"
+             aria-label="Price">
+
+      <div class="c-range-ends">
+        <span>{{ task.price_options[0].price_cents | money }}</span>
+        <span>{{ task.price_options[-1].price_cents | money }}</span>
+      </div>
+
+      <ul class="c-range-labels" aria-hidden="true">
+        {% for option in task.price_options %}
+          <li>{{ option.label }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+
+    <button type="submit" class="c-big-button" data-busy="One moment…">
+      Use this price
+    </button>
+    <button type="button" class="c-quiet-link" id="price-own-toggle">
+      Set your own price
+    </button>
+  </form>
+
+  {# Every stop's numbers, read by the slider script. No fetch and no arithmetic
+     on the client: these are the values the pricing engine already produced. #}
+  <script type="application/json" id="price-stops">
+    {{ task.price_options
+       | map('mapping', 'objective', 'price_cents')
+       | list | tojson }}
+  </script>
+</div>
+
+{# The same typed-price form the no-comps screen uses, and the same consequence:
+   it posts to `set_price`, which records operator judgement instead of evidence.
+   Hidden until asked for, and it takes the screen when it is -- one viewport,
+   one decision. #}
+<div class="c-own-price c-fill" id="price-own" hidden>
+  {% include "consumer/_set_price.html" %}
+  {# The way back. Without it a seller who taps "Set your own price" to see what
+     it does has thrown away the researched price until they reload the page. #}
+  <button type="button" class="c-quiet-link" id="price-own-cancel">
+    Use the suggested price instead
+  </button>
+</div>
+
+<script>
+(function () {
+  var toggle = document.getElementById("price-own-toggle");
+  var own = document.getElementById("price-own");
+  var market = document.querySelector(".c-slider");
+  var cancel = document.getElementById("price-own-cancel");
+  if (toggle && own && market) {
+    toggle.addEventListener("click", function () {
+      market.hidden = true;
+      own.hidden = false;
+      var field = own.querySelector("input[name=price]");
+      if (field) { field.focus(); }
+    });
+  }
+  if (cancel && own && market) {
+    cancel.addEventListener("click", function () {
+      own.hidden = true;
+      market.hidden = false;
+    });
+  }
+
+  var range = document.getElementById("price-range");
+  if (!range) return;
+  var stops = JSON.parse(document.getElementById("price-stops").textContent);
+  var amount = document.getElementById("price-amount");
+  var labels = Array.prototype.slice.call(
+    document.querySelectorAll(".c-range-labels li"));
+  var objective = document.getElementById("price-objective");
+
+  function money(cents) {
+    return "$" + (cents / 100).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  }
+  function show() {
+    var stop = stops[Number(range.value)];
+    if (!stop) return;
+    amount.textContent = money(stop.price_cents);
+    objective.value = stop.objective;
+    labels.forEach(function (li, i) {
+      li.classList.toggle("is-chosen", i === Number(range.value));
+    });
+  }
+  range.addEventListener("input", show);
+  range.addEventListener("change", show);
+  show();
+})();
+</script>

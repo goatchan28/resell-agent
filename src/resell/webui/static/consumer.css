@@ -1,67 +1,761 @@
-/* The seller's screen. Deliberately plain: the operator UI is a dashboard, this
-   is one thing to do at a time. */
-.c-top { display: flex; align-items: baseline; gap: 1.4rem; padding: 1rem 0;
-         border-bottom: 1px solid var(--line); margin-bottom: 1.6rem; }
-.c-brand { font-weight: 600; font-size: 1.1rem; text-decoration: none;
-           color: var(--ink); }
-.c-top nav { display: flex; gap: 1rem; }
-.c-top nav a { color: var(--muted); text-decoration: none; font-size: .92rem; }
-.c-top nav a:hover { color: var(--ink); }
-.c-main { max-width: 46rem; margin: 0 auto; padding: 0 1rem 4rem; }
+/* The seller's screen, sized for a phone held in one hand.
 
-.c-task { display: flex; gap: 1.2rem; background: var(--panel);
-          border: 1px solid var(--line); border-radius: 10px; padding: 1.2rem;
-          margin-bottom: 1.2rem; }
-.c-photo img, .c-photo-empty { width: 7rem; height: 7rem; object-fit: cover;
-          border-radius: 8px; background: var(--line); display: block; }
-.c-body { flex: 1; min-width: 0; }
-.c-body h2 { font-size: 1rem; font-weight: 500; margin: 0 0 .3rem;
-             color: var(--muted); }
-.c-headline { font-size: 1.25rem; font-weight: 600; margin: 0 0 .3rem; }
-.c-hint { color: var(--muted); margin: 0 0 .8rem; font-size: .92rem; }
-.c-progress { display: flex; align-items: center; gap: .5rem; color: var(--muted); }
-.c-quote { font-size: 1.05rem; margin: .4rem 0 .8rem; }
-.c-band { font-size: 1.5rem; font-weight: 600; margin: .2rem 0 .8rem; }
-.c-copy { color: var(--muted); font-size: .92rem; line-height: 1.5; }
+   Mobile-first: every rule here is the phone rule, and the single media query at
+   the bottom widens things for a desktop browser. The previous stylesheet was
+   the other way round and had no media query at all, so the layout was a desktop
+   one that happened to reflow -- 30px buttons, and text inputs with an 11rem
+   minimum that pushed rows off a 375px screen.
 
-.c-prices { display: flex; gap: .6rem; flex-wrap: wrap; }
-.c-price { display: flex; flex-direction: column; align-items: flex-start;
-           padding: .7rem 1rem; height: auto; }
-.c-price-amount { font-size: 1.15rem; font-weight: 600; }
-.c-price-label { font-size: .8rem; opacity: .75; }
-.c-price-entry { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+   Three numbers do most of the work:
+     --tap    44px, the smallest thing a thumb hits reliably
+     --gutter 20px, the side margin everything shares
+     --radius 18px, large enough to read as a card rather than a box
+*/
 
-.c-comp { display: flex; align-items: center; gap: .8rem; padding: .5rem 0;
-          border-bottom: 1px solid var(--line); }
-.c-comp-price { font-weight: 600; min-width: 4.5rem; }
-.c-comp-title { flex: 1; min-width: 0; font-size: .9rem; }
-.c-comp-buttons { display: flex; gap: .4rem; }
+:root {
+  --tap: 44px;
+  --gutter: 20px;
+  --radius: 18px;
+  --radius-sm: 12px;
+  --lift: 0 1px 2px rgba(0, 0, 0, .04), 0 8px 24px rgba(0, 0, 0, .06);
+}
 
-.c-working { margin: 1.4rem 0; }
-.c-working-row { display: flex; align-items: center; gap: .6rem; margin: .3rem 0;
-                 color: var(--muted); font-size: .92rem; }
-.c-add { border-top: 1px solid var(--line); padding-top: 1.4rem; margin-top: 2rem; }
-.c-add h2 { font-size: .95rem; font-weight: 600; margin: 0 0 .7rem; }
-.c-add form { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
-.c-empty { color: var(--muted); font-style: italic; padding: 2.5rem 0;
-           text-align: center; }
+/* iOS zooms a text field whose font is under 16px when it takes focus, and the
+   page never zooms back. Every input on this surface is 17px for that reason. */
+.c-main input,
+.c-main select,
+.c-main textarea,
+.c-main button { font-size: 17px; }
 
-.c-fix { margin-top: 1rem; }
-.c-fix summary { cursor: pointer; color: var(--muted); font-size: .88rem; }
-.c-field { display: block; margin: .7rem 0; }
-.c-field span { display: block; font-size: .82rem; color: var(--muted);
-                margin-bottom: .2rem; }
-.c-field input, .c-field select, .c-field textarea { width: 100%; }
-.c-field.wrong input, .c-field.wrong select { border-color: #c0392b; }
+/* --- the one-screen shell ----------------------------------------------- */
 
-.c-shelf { width: 100%; border-collapse: collapse; }
-.c-shelf th { text-align: left; font-size: .8rem; color: var(--muted);
-              font-weight: 500; padding: .4rem .6rem; }
-.c-shelf td { padding: .5rem .6rem; border-top: 1px solid var(--line);
-              font-size: .92rem; }
-.c-shelf .n { text-align: right; }
-.c-thumb img { width: 2.6rem; height: 2.6rem; object-fit: cover;
-               border-radius: 5px; display: block; }
-.c-needs { background: #fffbf0; }
-.c-flag { font-size: .72rem; background: var(--ink); color: var(--bg);
-          border-radius: 3px; padding: .1rem .35rem; margin-left: .4rem; }
+/* `svh` rather than `dvh`. `svh` is the viewport with Safari's chrome fully
+   expanded -- the smallest it ever gets -- so a layout that fits it can never
+   be cut off, and it does not reflow while the chrome animates the way `dvh`
+   does. The cost is a little slack at the bottom once the URL bar retracts,
+   which is a better trade than the whole page resizing under a thumb.
+   The `vh` line before it is the fallback for WebKit without `svh`. */
+/* `--shell` is normally unset and the height falls back to `svh`. While a
+   software keyboard is up, the script at the foot of base.html sets it to the
+   visible height, because `svh` describes the browser's chrome and knows
+   nothing about a keyboard: with the keyboard open the Continue button on an
+   answer screen sat 45px below the fold on a page that `overflow: hidden`
+   forbade from scrolling, and there was no way to reach it. */
+body.c-fixed {
+  height: 100vh;
+  height: 100svh;
+  height: var(--shell, 100svh);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  /* iOS still rubber-bands a non-scrolling document without this. */
+  overscroll-behavior: none;
+}
+body.c-fixed .c-main {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  padding-bottom: calc(env(safe-area-inset-bottom) + 12px);
+}
+/* A decision card is as tall as what is in it, and sits in the middle of the
+   screen. Stretching it to fill was the previous attempt, and it made a card
+   with three lines in it look like a mistake -- great slabs of white between
+   the heading, the number and the button.
+
+   The reason centring looked wrong the first time was width, not height: an
+   `auto` margin on a stretched flex item had collapsed the whole column to
+   243px, so a *narrow* content-sized card really was marooned. Fixed there, a
+   full-width one reads correctly. */
+body.c-fixed .c-main:not(:has(.c-item)) { justify-content: center; }
+/* Your items is a list, and a list may be longer than a screen. */
+body.c-scrolls { min-height: 100vh; min-height: 100svh; }
+
+/* --- chrome ------------------------------------------------------------- */
+
+.c-top {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: calc(env(safe-area-inset-top) + 14px) var(--gutter) 14px;
+  background: var(--bg);
+  position: sticky; top: 0; z-index: 5;
+  flex: none;
+}
+/* Short screens buy back the header's padding first: it is the least useful
+   height on the page. */
+@media (max-height: 700px) {
+  .c-top { padding-top: calc(env(safe-area-inset-top) + 9px); padding-bottom: 9px; }
+  .c-brand { font-size: 1.05rem; }
+}
+.c-brand {
+  font-weight: 650; font-size: 1.15rem; letter-spacing: -.01em;
+  text-decoration: none; color: var(--ink);
+}
+.c-nav {
+  color: var(--muted); text-decoration: none; font-size: .95rem;
+  min-height: var(--tap); display: flex; align-items: center;
+}
+.c-nav:active { color: var(--ink); }
+
+.c-main {
+  /* `width: 100%` is load-bearing. `.c-main` is a flex item of the shell, and an
+     `auto` margin on a stretched flex item takes the free space and collapses
+     the item to its content width -- so on a decision screen with no photograph
+     the whole column shrank to 243px of a 375px phone and the card looked
+     marooned. The margin still centres it once `max-width` bites. */
+  width: 100%; max-width: 34rem; margin: 0 auto;
+  padding: 0 var(--gutter) calc(env(safe-area-inset-bottom) + 48px);
+}
+
+/* --- the empty state, which is the front door --------------------------- */
+
+/* The hero fills whatever the shell gives it rather than asking for a fraction
+   of the viewport, so it centres correctly at any height. */
+.c-hero {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; text-align: center; gap: 6px;
+  overflow: hidden;
+}
+.c-hero-form { flex: 0 1 auto; min-height: 0; display: flex;
+               flex-direction: column; }
+.c-picker { display: flex; flex-direction: column; min-height: 0; }
+.c-picked { flex: 1 1 auto; min-height: 0; overflow-y: auto;
+            -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+.c-hero-art { color: var(--muted); opacity: .38; width: 64px; height: 64px; }
+.c-hero-art svg { width: 100%; height: 100%; }
+.c-hero-title {
+  font-size: 1.9rem; font-weight: 650; letter-spacing: -.02em;
+  margin: 18px 0 0;
+}
+.c-hero-sub {
+  color: var(--muted); margin: 0; max-width: 22rem; line-height: 1.5;
+  font-size: 1.02rem;
+}
+.c-hero-form { width: 100%; margin-top: 30px; }
+
+/* --- picking photos ----------------------------------------------------- */
+
+.c-picked { margin-top: 22px; text-align: left; }
+/* One row that scrolls sideways. Ten photos wrapped to three rows and pushed
+   the cost field and the Start button off the bottom of the screen. */
+.c-thumbs {
+  list-style: none; margin: 0 0 10px; padding: 0 0 2px;
+  display: flex; gap: 8px; flex-wrap: nowrap;
+  overflow-x: auto; -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x proximity;
+}
+.c-thumbs li { scroll-snap-align: start; }
+.c-thumbs li {
+  width: 68px; height: 68px; border-radius: var(--radius-sm);
+  overflow: hidden; background: var(--line); flex: none;
+}
+.c-thumbs img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.c-picked .c-field { margin: 20px 0 0; }
+.c-picked .c-big-button { margin-top: 20px; }
+.c-hero-note {
+  color: var(--muted); font-size: .87rem; margin: 12px 0 0;
+}
+
+/* --- the item ----------------------------------------------------------- */
+
+/* The photo is sized by the height available, not by the width of the screen.
+   A full-width 4:3 image was 251px of a 553px viewport -- 45% of an iPhone SE
+   spent on one picture, before the decision had any room at all.
+
+   It only appears while the agent is working and on the finished item. A
+   decision screen has no photograph at all -- a second size for it existed and
+   the answer turned out to be that a cropped thumbnail helped nobody decide
+   anything. */
+/* The photo gives way before anything else does. Its clamp is what it *wants*;
+   the shrink factor is what happens when the card and the action together want
+   more than the screen has. Twenty against the card's one means the picture
+   absorbs almost all of it, down to a floor where it is still a photograph. */
+.c-item {
+  /* The floor is stated rather than left to `auto`. An automatic minimum
+     measures a flex item by its *specified* height, and the photo has one -- so
+     `auto` read this box's minimum as the photo's full 210px, refused to shrink
+     it at all, and squeezed the card instead until the progress checklist was
+     15px tall. Naming the floor puts the shrinking back where it belongs. */
+  flex: 0 20 auto; min-height: 116px; margin: 4px 0 18px;
+  display: flex; flex-direction: column;
+}
+.c-shot { flex: 1 1 auto; min-height: 84px; height: clamp(180px, 47svh, 420px); }
+/* Buttons never squash: they are the one thing on the screen with a minimum
+   size that matters. */
+.c-actions { flex: none; }
+.c-shot img, .c-shot-empty {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+  border-radius: var(--radius); background: var(--line); box-shadow: var(--lift);
+}
+
+.c-name {
+  font-size: 1.28rem; font-weight: 600; letter-spacing: -.015em;
+  margin: 14px 0 0; line-height: 1.3; flex: none;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* One line where two would cost the action its room. */
+@media (max-height: 700px) {
+  .c-name { font-size: 1.12rem; margin-top: 10px; -webkit-line-clamp: 1; }
+}
+.c-page-title {
+  font-size: 1.7rem; font-weight: 650; letter-spacing: -.02em; margin: 6px 0 22px;
+}
+
+/* --- progress ----------------------------------------------------------- */
+
+/* Cards take the height that is left, and never more.
+
+   The card is a fixed frame: a region that scrolls, and an action that does
+   not. Two other arrangements were tried and both failed in a way worth
+   recording. Hiding the card's overflow clipped the action on the screens whose
+   fixed parts were already taller than the space -- a button you cannot reach.
+   Making the card itself scroll with a `position: sticky` action leaked the
+   tail of the scrolled text out below the button, because sticky shifts an
+   element up without removing the room it left behind.
+
+   So: `.c-scroll` is the one region that moves, `.c-pinned` never does, and the
+   card clips nothing because nothing overflows it. Content that is genuinely
+   unbounded -- eBay offers 204 model values for an action camera, a description
+   has a sentence limit and no length limit -- is contained by construction. */
+.c-status, .c-ask {
+  /* The floor is the question and its button. Below that the card has stopped
+     being a card and started being a clipped one, so anything else on the
+     screen yields first. */
+  flex: 0 1 auto; min-height: 140px;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+/* Forms are flex columns too. Without this the scrolling region inside the
+   answer form was not a flex child of anything that could constrain it, so the
+   chips kept their full height and the card clipped the way out. */
+/* Flex columns, but with their automatic minimum left alone. `min-height: 0`
+   here removed the content floor and let the form shrink to 62px around a 118px
+   input-and-button, which then spilled and was clipped by the card -- the exact
+   trap `.c-item` fell into. `auto` is the right floor for both branches: a
+   child with `overflow: auto` contributes nothing to it, so the scrolling chip
+   list still gives ground, while the box you type in does not. */
+.c-ask > form, .c-status > form { display: flex; flex-direction: column; }
+.c-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+}
+.c-pinned, .c-ask > .c-actions, .c-status > .c-actions { flex: none; }
+/* The prompt above the answer form is a sibling of it, so it is the flex child
+   that has to be allowed to shrink. */
+.c-ask > .c-scroll { flex: 1 1 auto; min-height: 0; }
+
+.c-status {
+  background: var(--panel); border-radius: var(--radius); padding: 22px;
+  box-shadow: var(--lift);
+}
+.c-status-head {
+  display: flex; align-items: center; gap: 10px; margin: 0 0 18px;
+  font-size: 1.08rem; font-weight: 600;
+}
+.c-status-done .c-status-head { margin-bottom: 8px; }
+
+/* The completed card, when there is a listing to open. A whole-card target
+   rather than a small link: it is the only thing on the screen to press. */
+.c-status-link {
+  display: flex; flex-direction: column; text-decoration: none; color: var(--ink);
+  -webkit-tap-highlight-color: transparent;
+}
+.c-status-link:active { opacity: .85; }
+.c-status-link .c-status-head { display: flex; }
+.c-status-go {
+  display: block; margin-top: 10px; color: var(--ask); font-weight: 550;
+  min-height: var(--tap); line-height: var(--tap);
+}
+.c-phases { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+.c-phase {
+  display: flex; align-items: center; gap: 12px;
+  color: var(--muted); font-size: 1rem;
+}
+.c-phase.is-done { color: var(--ink); }
+.c-phase.is-now { color: var(--ink); font-weight: 550; }
+.c-tick {
+  width: 22px; text-align: center; flex: none; font-size: 1rem;
+  color: var(--muted);
+}
+.c-phase.is-done .c-tick { color: var(--ok); }
+/* `.run-spinner` is a bare span, and a span is inline: width and height did
+   nothing to it, so all that rendered was a 2px border on a zero-sized box --
+   the deformed circle. It used to sit directly in a flex row, where being a
+   flex item made it block-level and the size applied. Inside the tick column it
+   has to say so itself. */
+.c-tick .run-spinner {
+  display: block; margin: 0 auto; width: 15px; height: 15px; border-width: 2px;
+}
+.c-phase.is-now .c-tick { color: var(--ink); }
+
+/* --- a decision --------------------------------------------------------- */
+
+.c-ask {
+  background: var(--panel); border-radius: var(--radius); padding: 24px 22px;
+  box-shadow: var(--lift);
+}
+/* The price card is 58px over on an iPhone SE, and every one of those pixels is
+   spacing rather than content. Compressing them is a better answer than making
+   a slider something you have to scroll to reach. */
+@media (max-height: 700px) {
+  .c-tradeoff { min-height: 0; margin-bottom: 10px; }
+  .c-range-labels { margin: 6px 0 10px; }
+  .c-range { height: 34px; }
+  .c-slider .c-amount { font-size: 1.95rem; margin-bottom: 0; }
+  .c-slider .c-question { margin-bottom: 4px; }
+}
+/* The price readout takes its natural height and only gives ground if there is
+   genuinely none left. Stretching it to fill was squeezing the number itself
+   into a scrolling box, which is absurd for the one figure being chosen.
+
+   No scrollbar here even so: it is two lines that will fit in all but absurd
+   conditions, and a scroll track beside the price reads as an error. The other
+   scrolling regions keep theirs, because there the bar is the only sign that
+   more text is below. */
+.c-slider > .c-scroll { flex: 1 1 auto; }
+
+/* Where the content is bounded -- a status line, a price, a tick -- the region
+   is a safety net rather than a place to scroll, and a visible track beside the
+   number reads as an error. The regions holding genuinely unbounded content
+   keep their scrollbar, because there it is the only sign that more is below. */
+.c-slider > .c-scroll,
+.c-status .c-scroll { scrollbar-width: none; }
+.c-slider > .c-scroll::-webkit-scrollbar,
+.c-status .c-scroll::-webkit-scrollbar { display: none; }
+.c-tradeoff { margin-bottom: 6px; }
+@media (max-height: 620px) {
+  .c-range-ends { display: none; }
+}
+
+@media (max-height: 700px) {
+  .c-ask { padding: 18px 18px; }
+  .c-status { padding: 18px; }
+  .c-question { font-size: 1.22rem; }
+  .c-amount { font-size: 2.1rem; }
+  .c-actions { margin-top: 16px; }
+  .c-value { margin-bottom: 16px; }
+  .c-sub { margin-bottom: 14px; }
+}
+.c-question {
+  font-size: 1.4rem; font-weight: 650; letter-spacing: -.02em;
+  margin: 0 0 8px; line-height: 1.25;
+}
+.c-question-text { font-size: 1.05rem; margin: 0 0 18px; }
+.c-sub { color: var(--muted); margin: 0 0 20px; line-height: 1.5; }
+.c-value {
+  font-size: 1.22rem; font-weight: 600; margin: 4px 0 24px; line-height: 1.35;
+}
+.c-amount {
+  display: block; font-size: 2.6rem; font-weight: 660; letter-spacing: -.03em;
+  margin: 4px 0 4px; font-variant-numeric: tabular-nums;
+}
+.c-copy {
+  color: var(--ink); line-height: 1.6; margin: 0 0 24px; font-size: 1rem;
+}
+.c-actions { margin-top: 22px; display: grid; gap: 12px; }
+
+/* --- controls ----------------------------------------------------------- */
+
+.c-big-button {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; min-height: 54px; padding: 0 20px;
+  background: var(--ink); color: #fff; border: none;
+  border-radius: var(--radius-sm);
+  font-size: 1.05rem; font-weight: 600; cursor: pointer;
+  text-decoration: none; text-align: center;
+  -webkit-tap-highlight-color: transparent;
+}
+.c-big-button:active { transform: scale(.985); opacity: .9; }
+.c-big-button[disabled] { opacity: .5; }
+.c-big-button input[type=file] {
+  position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;
+}
+.c-big-link { box-sizing: border-box; }
+
+.c-secondary-button {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; min-height: var(--tap); padding: 0 18px; margin-top: 12px;
+  background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  font-weight: 550; cursor: pointer;
+}
+.c-quiet-button {
+  min-height: var(--tap); padding: 0 4px; background: none; border: none;
+  color: var(--err); font-weight: 550; cursor: pointer; text-align: left;
+}
+.c-quiet-link {
+  display: block; text-align: center; min-height: var(--tap);
+  line-height: var(--tap); color: var(--muted); text-decoration: none;
+  /* Also used on a <button> -- "Set your own price" under the slider. The shared
+     stylesheet gives every button a panel background and a border, which turned
+     a quiet way out into a second primary action. */
+  width: 100%; background: none; border: none; padding: 0;
+  font: inherit; font-weight: 500; cursor: pointer;
+}
+.c-quiet-note {
+  color: var(--muted); font-size: .87rem; line-height: 1.45; margin: 10px 0 0;
+}
+
+/* Chips: the answer form's whole point. Tapping one submits it, so each is a
+   real target rather than a label beside a radio. */
+.c-chips { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 6px; }
+.c-chip {
+  min-height: var(--tap); padding: 0 18px;
+  background: var(--panel); color: var(--ink);
+  border: 1.5px solid var(--line); border-radius: 999px;
+  font-size: 1rem; font-weight: 500; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.c-chip:active { background: var(--ink); color: #fff; border-color: var(--ink); }
+.c-chip.is-suggested { border-color: var(--ink); font-weight: 600; }
+/* One of the choices, not an escape hatch below them. A dashed edge says "this
+   one is different" without demoting it to a secondary control. */
+.c-chip-other { border-style: dashed; color: var(--muted); }
+.c-chip-other:active { color: #fff; }
+
+.c-toggle {
+  display: flex; align-items: center; gap: 12px;
+  min-height: var(--tap); color: var(--muted); font-size: .95rem;
+  cursor: pointer;
+}
+.c-toggle input { width: 22px; height: 22px; accent-color: var(--ink); }
+
+.c-other { margin-top: 6px; }
+/* The box and the button were flush against each other, so a thumb aiming at
+   one edge of either hit the other. */
+.c-typed input[type=text] { margin-bottom: 12px; }
+.c-other input[type=text] { width: 100%; margin-bottom: 12px; }
+
+.c-main input[type=text],
+.c-main textarea,
+.c-main select {
+  min-width: 0; width: 100%; min-height: var(--tap);
+  padding: 12px 14px; border: 1px solid var(--line);
+  border-radius: var(--radius-sm); background: var(--panel);
+  -webkit-appearance: none; appearance: none;
+}
+.c-main textarea { min-height: 120px; line-height: 1.5; }
+
+/* One control, with the sign inside the box rather than floating beside it.
+   The selectors carry `.c-main` because the generic input rule above does, and
+   without it the border and background there won the cascade -- which drew a
+   heavy white box around the number and left the "$" outside it. */
+.c-money-field {
+  display: flex; align-items: center;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--panel); padding: 0 14px;
+}
+.c-money-field > span { color: var(--muted); font-weight: 500; flex: none; }
+.c-main .c-money-field input[type=text] {
+  border: none; background: none; padding: 12px 8px; min-height: var(--tap);
+  font-weight: 550;
+}
+.c-main .c-money-field input[type=text]:focus { outline: none; }
+.c-money-field:focus-within { border-color: var(--ink); }
+
+/* On the pricing screen the number *is* the decision, so it is the size of one. */
+.c-money-field.is-large { padding: 0 18px; }
+.c-money-field.is-large > span { font-size: 1.9rem; font-weight: 600; }
+.c-main .c-money-field.is-large input[type=text] {
+  font-size: 1.9rem; font-weight: 650; letter-spacing: -.02em; padding: 10px 8px;
+}
+
+/* --- the price slider --------------------------------------------------- */
+
+.c-slider { text-align: center; }
+/* The readout takes the room above the controls and centres the number in it;
+   the slider and its button sit at the bottom, where the thumb is. */
+.c-fill { flex: 0 1 auto; min-height: 0; display: flex;
+          flex-direction: column; justify-content: center; }
+/* `display: flex` beats the user-agent `[hidden] { display: none }`, so a
+   `.c-fill` region hidden by script stayed on screen. Both price regions are
+   `.c-fill` -- without this, asking to type a price showed the slider and the
+   text field at once, each with its own "Use this price". */
+.c-fill[hidden] { display: none; }
+.c-slider > .c-scroll {
+  display: flex; flex-direction: column; justify-content: center;
+}
+.c-tradeoff { margin: 0 0 22px; min-height: 2.6em; }
+.c-range {
+  /* The shared stylesheet gives every `input` a border and padding, which drew a
+     box around the track. A range is not a text field. */
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 40px; background: none;
+  margin: 0; padding: 0; border: none;
+}
+.c-range::-webkit-slider-runnable-track {
+  height: 6px; border-radius: 3px; background: var(--line);
+}
+.c-range::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 32px; height: 32px; margin-top: -13px;
+  border-radius: 50%; background: var(--panel);
+  border: 1px solid rgba(0, 0, 0, .1);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .2); cursor: grab;
+}
+.c-range::-moz-range-track { height: 6px; border-radius: 3px; background: var(--line); }
+.c-range::-moz-range-thumb {
+  width: 32px; height: 32px; border-radius: 50%; background: var(--panel);
+  border: 1px solid rgba(0, 0, 0, .1); box-shadow: 0 1px 4px rgba(0, 0, 0, .2);
+}
+.c-range-ends, .c-range-labels {
+  display: flex; justify-content: space-between; list-style: none;
+  margin: 0; padding: 0; color: var(--muted); font-size: .82rem;
+}
+/* One line each. "Sell quickly" wrapped to two and pushed the row out of
+   alignment with the other two, which read as a layout fault rather than a
+   label. */
+.c-range-labels { margin: 8px 0 26px; white-space: nowrap; font-size: .78rem; }
+.c-range-labels li { flex: 1; }
+.c-range-labels li:first-child { text-align: left; }
+.c-range-labels li:last-child { text-align: right; }
+/* The end labels sit under the track ends, so they get about a third of a 375px
+   screen each. Anything longer wraps and shoves the button down the page. */
+.c-range-labels li { padding: 0 2px; }
+/* Which of the three you are on, now that the sentence naming it is gone. */
+.c-range-labels li.is-chosen { color: var(--ink); font-weight: 600; }
+
+.c-price-entry { flex: 0 1 auto; min-height: 0; margin-bottom: 4px; }
+
+/* How much the number is worth trusting, under the number. Smaller than the
+   amount and larger than a footnote: it is only ever shown when it changes what
+   the seller should do with the price. */
+.c-note {
+  color: var(--muted); font-size: .9rem; line-height: 1.45;
+  margin: 10px auto 0; max-width: 30em;
+}
+/* Said in place of the track when the floor has clamped all three stops onto the
+   same number, so that a missing slider reads as an answer and not as a fault. */
+.c-one-price { margin-bottom: 22px; }
+
+/* Typing a price from the slider screen. It replaces the slider rather than
+   sitting under it -- one viewport, one decision.
+
+   The `[hidden]` rule is not redundant: `display: flex` beats the user-agent
+   `[hidden] { display: none }`, so without it the panel rendered under the
+   slider from the start and the screen offered two prices at once. */
+.c-own-price { display: flex; flex-direction: column; }
+.c-own-price[hidden] { display: none; }
+
+/* --- comparables, kept only for items part-way through the old flow ------ */
+
+.c-comp {
+  display: flex; align-items: center; gap: 12px; padding: 14px 0;
+  border-top: 1px solid var(--line); text-align: left;
+}
+.c-comp-price { font-weight: 600; flex: none; font-variant-numeric: tabular-nums; }
+.c-comp-title { flex: 1; min-width: 0; font-size: .92rem; color: var(--muted); }
+.c-comp-buttons { display: flex; gap: 8px; flex: none; }
+.c-comp-buttons .c-secondary-button { width: auto; margin: 0; padding: 0 14px; }
+
+/* --- Review Listing, the one workflow screen that is a page -------------- */
+
+/* Everywhere else the card is a fixed frame with a scrolling region inside it,
+   which is right when the screen is asking one question. Here the seller is
+   reading what goes to eBay, and a box to scroll inside a screen that cannot
+   scroll made the final check feel like another form to clear. */
+body.c-review .c-main { display: block; padding-bottom: calc(env(safe-area-inset-bottom) + 40px); }
+.c-listing { padding-top: 4px; }
+
+/* `contain`, not `cover`. Every other photograph in the product is cropped to
+   fill its box because there it is decoration. This is the last look at what a
+   buyer will be sent, so the whole frame is shown even when that leaves space
+   at the sides. */
+.c-carousel {
+  display: flex; gap: 10px; overflow-x: auto; margin: 0 calc(var(--gutter) * -1);
+  padding: 0 var(--gutter) 4px;
+  scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+.c-slide {
+  flex: 0 0 100%; margin: 0; scroll-snap-align: center;
+  background: var(--panel); border-radius: var(--radius);
+  box-shadow: var(--lift); overflow: hidden;
+}
+.c-slide img {
+  width: 100%; height: clamp(220px, 42svh, 420px);
+  object-fit: contain; display: block; background: var(--panel);
+}
+.c-carousel-hint { text-align: center; margin-top: 8px; }
+
+.c-listing-title {
+  font-size: 1.32rem; font-weight: 650; letter-spacing: -.018em;
+  line-height: 1.3; margin: 22px 0 10px;
+}
+.c-listing-facts {
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 0 0 18px;
+}
+.c-listing-price {
+  font-size: 1.75rem; font-weight: 660; letter-spacing: -.02em;
+  font-variant-numeric: tabular-nums;
+}
+.c-listing-condition {
+  color: var(--muted); font-size: .95rem;
+  border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px;
+}
+.c-listing-copy {
+  line-height: 1.6; margin: 0 0 28px; font-size: 1.02rem;
+}
+.c-listing-approve { margin-bottom: 8px; }
+
+/* --- the More sheet ----------------------------------------------------- */
+
+/* The sheet is a summary that stays put and a body that scrolls when opened.
+   Open, it is 597px of form on its own -- more than a whole iPhone SE viewport
+   -- so it cannot be allowed to push the page. */
+/* Never shrunk. Closed it is a 44px tap target and nothing else -- it was being
+   squeezed to 27px, which is both a clipped box and a target too small to hit.
+   Open, its own body carries the cap. */
+.c-more { margin-top: 14px; flex: none; }
+.c-more[open] { padding-bottom: 4px; }
+/* With the sheet open the photograph is not what anyone is looking at, and on a
+   320x480 screen it is the difference between the form fitting and not. Hidden
+   rather than shrunk: at that point it would be a 40px smear of a picture. */
+body:has(.c-more[open]) .c-item { display: none; }
+/* The cap lives here rather than on the `<details>`, and that is not a style
+   preference: a `<details>` lays its opened content out through an anonymous
+   box, so a flex height set on the element never reached this div -- it kept
+   its full 553px and the sheet clipped 385px of a form. Capping the scrolling
+   box itself works regardless of how the disclosure is implemented.
+
+   38svh leaves the card above it something to be, and the card shrinks and
+   scrolls to fit whatever is left. */
+.c-more-body {
+  max-height: 34svh; overflow-y: auto;
+  -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+}
+/* Below any current iPhone, but the sheet still has to yield rather than clip
+   the question above it. */
+@media (max-height: 520px) { .c-more-body { max-height: 26svh; } }
+
+/* Keyboard height. An iPhone SE leaves about 253px above the keyboard and a
+   14 about 328px, so this band is "something is covering the screen" rather
+   than "someone has a small phone". The generic heading goes first -- on an
+   answer screen "We need one more detail" sits directly above the question
+   that says what the detail is -- and the card stops insisting on a floor it
+   no longer has room for. */
+@media (max-height: 420px) {
+  .c-ask, .c-status { min-height: 0; padding: 14px 16px; }
+  .c-question { font-size: 1.06rem; margin-bottom: 6px; }
+  .c-question-text { font-size: .98rem; margin-bottom: 12px; }
+  .c-actions { margin-top: 12px; }
+  .c-typed input[type=text] { margin-bottom: 8px; }
+}
+.c-more > summary {
+  min-height: var(--tap); display: flex; align-items: center;
+  color: var(--muted); cursor: pointer; font-size: .95rem;
+  list-style: none;
+}
+.c-more > summary::-webkit-details-marker { display: none; }
+.c-more > summary::after { content: " ›"; margin-left: 4px; }
+.c-more[open] > summary::after { content: " ⌄"; }
+.c-fix { margin: 8px 0 20px; }
+.c-field { display: block; margin-bottom: 18px; }
+.c-field-name {
+  display: block; font-size: .84rem; color: var(--muted); margin-bottom: 6px;
+}
+.c-field-problem {
+  display: block; font-size: .84rem; color: var(--err); margin-top: 6px;
+}
+.c-field.is-wrong input, .c-field.is-wrong select { border-color: var(--err); }
+.c-aside { padding-top: 14px; border-top: 1px solid var(--line); }
+
+/* --- Your items --------------------------------------------------------- */
+
+.c-cards { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.c-card {
+  background: var(--panel); border-radius: var(--radius);
+  box-shadow: var(--lift); overflow: hidden;
+}
+.c-card.needs-you { box-shadow: var(--lift), inset 3px 0 0 var(--ink); }
+.c-card-link {
+  display: flex; align-items: center; gap: 14px; padding: 12px 16px 12px 12px;
+  text-decoration: none; color: var(--ink); min-height: 72px;
+}
+.c-card-shot {
+  width: 60px; height: 60px; flex: none; border-radius: var(--radius-sm);
+  background: var(--line); overflow: hidden;
+}
+.c-card-shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.c-card-text { flex: 1; min-width: 0; display: grid; gap: 3px; }
+.c-card-name {
+  /* Two lines, not one with an ellipsis. On a 375px screen the name column is
+     about 150px once the thumbnail and the price have taken theirs, and every
+     card read "Brooks Brothers…". Two lines is the difference between a list of
+     things and a list of prefixes. */
+  font-weight: 550; font-size: 1rem; line-height: 1.3;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.c-card-status { color: var(--muted); font-size: .87rem; }
+.c-card-flag {
+  display: inline-block; background: var(--ink); color: var(--bg);
+  border-radius: 999px; padding: 1px 8px; font-size: .72rem; margin-left: 4px;
+  vertical-align: 1px;
+}
+.c-card-money { text-align: right; flex: none; display: grid; gap: 3px;
+                align-content: center; }
+.c-card-price { font-weight: 600; font-variant-numeric: tabular-nums; }
+.c-card-profit { font-size: .82rem; color: var(--ok); }
+.c-card-profit.is-neg { color: var(--err); }
+
+.c-empty {
+  color: var(--muted); text-align: center; padding: 44px 0 20px;
+  font-size: 1.02rem;
+}
+
+/* --- flashes and the live run line -------------------------------------- */
+
+.c-main .flashes { list-style: none; margin: 0 0 18px; padding: 0; display: grid; gap: 8px; }
+.c-main .flash {
+  border-radius: var(--radius-sm); padding: 12px 16px; font-size: .95rem;
+  line-height: 1.45;
+}
+.c-carry-on { margin-top: 22px; }
+/* The elapsed clock: a pulse, not a focal point. Muted and smaller than the
+   phase label it sits beside, so it reads as "still going" rather than as a
+   figure to watch climb. */
+.c-elapsed { color: var(--muted); font-weight: 400; font-size: .88rem; }
+/* Reassurance, and it has to compete with a number that ticks. Full ink rather
+   than muted, and the first three words carry the weight -- still no border, no
+   background and no icon, because it is good news and not a warning. */
+.c-wait {
+  margin: 20px 0 0; color: var(--ink); font-size: .95rem; line-height: 1.5;
+  /* One flowing paragraph rather than two lines split by a `<br>`. A forced
+     break left the first sentence wrapping anyway, so the block read as three
+     ragged lines instead of a sentence. `balance` evens them out where it is
+     supported and is ignored where it is not. */
+  text-align: center; text-wrap: balance;
+}
+/* Said plainly and without alarm. Nothing is lost when a stage does not
+   complete -- the item is exactly where it was -- so this is a sentence, not a
+   red banner. */
+.c-stuck { margin: 18px 0 0; color: var(--muted); line-height: 1.5; }
+.c-status > .c-carry-on, .c-status > .c-wait { flex: none; }
+.c-status > .c-phases { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+
+/* --- one widening, for a desktop browser -------------------------------- */
+
+@media (min-width: 40rem) {
+  :root { --gutter: 28px; }
+  .c-main { padding-top: 8px; }
+  .c-hero-form { max-width: 22rem; }
+  .c-shot img, .c-shot-empty { aspect-ratio: 16 / 10; }
+  .c-big-button, .c-secondary-button { width: auto; min-width: 15rem; margin-inline: auto; }
+  .c-actions { justify-items: center; }
+  .c-actions form { width: 100%; display: flex; justify-content: center; }
+}
+
+/* Short screens: the decoration goes before anything you can press. */
+@media (max-height: 700px) {
+  .c-hero-art { width: 46px; height: 46px; }
+  .c-hero-title { font-size: 1.6rem; margin-top: 12px; }
+  .c-hero-sub { font-size: .95rem; }
+  .c-hero-form { margin-top: 20px; }
+  .c-thumbs li { width: 56px; height: 56px; }
+}
+@media (max-height: 600px) {
+  .c-hero-art { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .c-big-button:active { transform: none; }
+}

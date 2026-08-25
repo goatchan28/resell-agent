@@ -43,6 +43,10 @@ class Phase:
     STORING = "storing"
     DONE = "done"
     FAILED = "failed"
+    # A required stage that did not clear on retry. Not `FAILED`: the run stopped
+    # on purpose, the item is exactly where it was, and pressing it again is a
+    # reasonable thing to do.
+    BLOCKED = "blocked"
 
 
 @dataclass(frozen=True)

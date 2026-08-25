@@ -376,3 +376,69 @@ def test_the_correction_form_offers_it_back(tmp_path):
     assert fields["title"].value == "A vintage paperback"
     assert fields["description"].value == "Lovely copy."
     assert "the reviewer stopped it" in fields["title"].help_text
+
+
+# --- a repair that goes the wrong way ------------------------------------------------
+
+
+def test_a_measured_violation_carries_its_arithmetic():
+    """"over eBay's 80 limit" leaves the reader to subtract, and the reader is a
+    language model that got exactly that wrong: told a title was 89 characters it
+    answered with 96."""
+    from resell.reasoning.listing import Measure
+
+    assert Measure(96, 80, "characters").arithmetic("title") == (
+        "title is 96 characters; remove at least 16 to reach 80"
+    )
+
+
+def test_a_repair_that_makes_the_count_worse_is_a_regression():
+    from resell.reasoning.listing import DraftReview, Measure
+
+    before = DraftReview(measures={"title": Measure(89, 80, "characters")})
+    after = DraftReview(measures={"title": Measure(96, 80, "characters")})
+    assert "title" in after.regressions(before)
+
+
+def test_landing_inside_the_limit_is_never_a_regression():
+    """Even if the number went up. 74 is not worse than 70 when the limit is 80."""
+    from resell.reasoning.listing import DraftReview, Measure
+
+    before = DraftReview(measures={"title": Measure(70, 80, "characters")})
+    after = DraftReview(measures={"title": Measure(74, 80, "characters")})
+    assert after.regressions(before) == {}
+
+
+def test_getting_closer_is_progress_even_while_still_over():
+    from resell.reasoning.listing import DraftReview, Measure
+
+    before = DraftReview(measures={"title": Measure(96, 80, "characters")})
+    after = DraftReview(measures={"title": Measure(84, 80, "characters")})
+    assert after.regressions(before) == {}
+
+
+def test_the_next_repair_is_told_it_went_backwards():
+    from resell.reasoning.drafting import RepairOutcome
+    from resell.reasoning.listing import ListingDraft, Measure
+
+    outcome = RepairOutcome(
+        outcome=None, previous=ListingDraft(), preserved_ratio=1.0,
+        regressed={"title": (Measure(89, 80, "characters"),
+                             Measure(96, 80, "characters"))},
+    )
+    assert outcome.went_backwards
+    said = outcome.what_went_backwards()[0]
+    assert "went from 89 to 96 characters" in said
+    assert "do not solve another problem by adding length" in said
+
+
+def test_a_title_over_the_limit_is_measured_and_not_just_described():
+    from resell.reasoning.listing import ListingDraft, review_draft
+
+    review = review_draft(
+        ListingDraft(title="x" * 96, description="A thing."),
+        supported_text="x", valid_evidence_ids={1}, available_support=frozenset(),
+    )
+    assert review.measures["title"].value == 96
+    assert review.measures["title"].limit == 80
+    assert review.measures["title"].excess == 16

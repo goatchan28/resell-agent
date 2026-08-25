@@ -106,10 +106,32 @@ class RunReport:
     sku: str
     ran: list[str] = field(default_factory=list)
     stopped_at: NextStep | None = None
+    # What stopped work. Only failures nothing recovered from: an attempt that a
+    # retry then fixed is in `retried` instead.
+    #
+    # MP-000044 is why the two are separate. Comp research failed its first
+    # attempt, the retry completed the stage, the item advanced to the price
+    # screen and listed for $324 -- and the run was recorded as `failed` with a
+    # traceback, because the recovered attempt was still sitting in this list and
+    # the web layer raises on anything in it. The retry worked; the report threw
+    # the fact away.
     errors: list[str] = field(default_factory=list)
+    # Attempts that failed and were then recovered by a retry of the same stage.
+    # Kept because a stage that needed two goes is worth knowing about even when
+    # the run succeeded -- but it is history, not a failure, and nothing should
+    # fail a run over it. The run-step trail records these too, with timings.
+    retried: list[str] = field(default_factory=list)
     # Ordinary stops, kept apart from failures so the UI can say "that is as far
     # as this item's budget goes" rather than showing a red line.
     halts: list[str] = field(default_factory=list)
+    # A required agent stage that failed and did not clear on retry.
+    #
+    # Not the same as an error and not the same as a skip. The step is still
+    # owed: nothing was stepped over, the item is exactly where it was, and the
+    # only thing that changed is that this run stopped trying. Whoever is looking
+    # at it can retry, and a retry is a fresh attempt at the same stage.
+    blocked: NextStep | None = None
+    blocked_attempts: int = 0
 
     @property
     def progressed(self) -> bool:
@@ -475,6 +497,28 @@ def _record_refused_draft(conn: sqlite3.Connection, sku: str, outcome) -> None:
 DRAFT_REFUSED = "draft_refused"
 
 
+class CompRoundIncomplete(RuntimeError):
+    """A comp round stopped before every retrieved listing had a verdict.
+
+    Kept apart from every other stop because of what must not happen next: an
+    unfinished round says nothing about whether the market has comparables, so it
+    cannot be allowed to conclude the stage. What it found is still on the record
+    -- the claims from the batches that did run are stored -- and running the
+    stage again picks up from there.
+    """
+
+    def __init__(self, sku: str, *, unjudged: int, promptable: int, reason: str = ""):
+        self.sku = sku
+        self.unjudged = unjudged
+        self.promptable = promptable
+        self.reason = reason
+        super().__init__(
+            f"comp research did not finish judging: {unjudged} of {promptable} "
+            f"listing(s) came back without a verdict"
+            + (f" ({reason})" if reason else "")
+        )
+
+
 class DraftRefused(RuntimeError):
     """The reviewer refused a draft the agent could not repair.
 
@@ -670,6 +714,31 @@ def comp_research_exhausted(conn: sqlite3.Connection, sku: str) -> tuple[bool, s
 # --- doing it ----------------------------------------------------------------
 
 
+# How many times one stage is attempted inside a single run before the run stops
+# and hands it back. Two, not more: every attempt is a model call with a real
+# cost, and a stage that fails twice in a row is usually failing for a reason
+# another identical attempt will not change. The operator's retry is a third.
+STAGE_ATTEMPTS = 2
+
+
+def _worth_retrying(exc: Exception) -> bool:
+    """Whether attempting the same stage again could plausibly do anything.
+
+    A refusal and an exhausted budget are answers, not accidents: the second
+    attempt would be refused by the same rule or stopped by the same ceiling,
+    having spent the money to find out.
+    """
+    from resell.gateway import Rejected
+    from resell.reasoning.budget import BudgetExceeded
+
+    return not isinstance(exc, (BudgetExceeded, Rejected))
+
+
+def self_says(step) -> str:
+    """The words the runner uses for a step, for a message about that step."""
+    return StageRunner.SAYS.get(str(step), str(step))
+
+
 def advance(
     conn: sqlite3.Connection,
     gateway,
@@ -677,6 +746,7 @@ def advance(
     *,
     config=None,
     max_steps: int = 8,
+    stage_attempts: int = STAGE_ATTEMPTS,
     runner=None,
 ) -> RunReport:
     """Run agent steps until one is the operator's, or nothing is left.
@@ -696,12 +766,34 @@ def advance(
         if step.actor is not Actor.AGENT:
             report.stopped_at = step
             return report
-        try:
-            detail = runner.run(conn, gateway, sku, step.step)
-        except Exception as exc:  # noqa: BLE001 - a stage failing is a normal outcome
-            report.errors.append(f"{step.step}: {exc}")
-            report.stopped_at = step
-            return report
+        # One stage, attempted more than once. A stage failing is a normal
+        # outcome and most of the ones seen in practice are transient -- a draft
+        # the reviewer would have passed on a second try, a page that timed out.
+        # What is not acceptable is the previous behaviour, where the first
+        # failure ended the run and the operator was shown a stack trace.
+        detail = None
+        for attempt in range(1, max(1, stage_attempts) + 1):
+            try:
+                detail = runner.run(conn, gateway, sku, step.step)
+                break
+            except Exception as exc:  # noqa: BLE001 - a stage failing is normal
+                if attempt >= stage_attempts or not _worth_retrying(exc):
+                    # Out of attempts, or an answer rather than an accident. This
+                    # is what stopped the run, so it is the error.
+                    report.errors.append(f"{step.step}: {exc}")
+                    report.stopped_at = step
+                    report.blocked = step
+                    report.blocked_attempts = attempt
+                    return report
+                # Another attempt is coming. Recorded, but not as a failure --
+                # whether this run failed is not knowable until that attempt has
+                # been made.
+                report.retried.append(f"{step.step}: {exc}")
+                progress.report(
+                    progress.Phase.START,
+                    f"{self_says(step.step)} did not work; trying once more",
+                    ok=False,
+                )
         report.ran.append(f"{step.step}: {detail}" if detail else str(step.step))
 
         # A step that leaves the item exactly where it was would otherwise spin.
@@ -818,9 +910,18 @@ class StageRunner:
         if chosen is None:
             raise RuntimeError(f"no category whose aspect form loads, for {query!r}")
 
+        # eBay already told us where this sits in its tree and we already built
+        # the string; keeping it is the difference between knowing an item is
+        # category 260988 and knowing it is a bag. Pricing needs the second.
+        path = next(
+            (s.get("path") for s in suggestions if s.get("categoryId") == chosen), None
+        )
+
         from resell.cli_item import merged_identification
 
-        fields, _ = merged_identification(conn, sku, category_id=chosen)
+        fields, _ = merged_identification(
+            conn, sku, category_id=chosen, category_path=path
+        )
         gateway.propose_identification(sku, **fields)
         return f"category {chosen}"
 
@@ -1056,10 +1157,18 @@ class StageRunner:
             # Each attempt is told exactly what the last one was refused for, so a
             # second is a different question rather than the same one repeated.
             attempt = None
+            carry_forward: tuple[str, ...] = ()
             for _ in range(DRAFT_REPAIR_ATTEMPTS):
                 attempt = repair_draft(
                     conn, sku, outcome, aspects=aspects, condition_id=condition_id,
+                    also_tell_it=carry_forward,
                 )
+                # A repair that made a counted violation worse is told so, in
+                # those words, before it tries again. MP-000037 fixed "40R is not
+                # in the record" by writing "Size 40 Regular" on a title that was
+                # already nine characters too long, and the next attempt had no
+                # idea that had happened.
+                carry_forward = attempt.what_went_backwards()
                 outcome = attempt.outcome
                 if outcome.review.ok:
                     break
@@ -1138,6 +1247,32 @@ class StageRunner:
             )
         except BudgetExceeded as exc:
             return f"stopped on this item's search budget: {exc}"
+
+        # The invariant this stage exists to protect.
+        #
+        # "Set a price yourself" is a statement about the *market*: we looked and
+        # there is not enough to price from. It must never be what a technical
+        # stop turns into. MP-000039 retrieved 38 listings, judged 30 of them and
+        # lost every verdict to a budget check on the 31st -- and the item came
+        # back asking its owner to name a price, as though the market had been
+        # searched and found wanting.
+        #
+        # So a round that did not finish judging raises. `advance` retries within
+        # its bound and then blocks, which is visible and can be tried again;
+        # what it cannot do is close the stage and route to a decision that
+        # claims knowledge the round never obtained.
+        if not outcome.judging_complete:
+            raise CompRoundIncomplete(
+                sku,
+                # What the judge was shown, not what the round recorded. MP-000044
+                # recorded 72 comps, 46 of which their source's licence keeps out
+                # of any prompt -- so it reported "9 of 72 came back without a
+                # verdict" about 46 listings that were never sent anywhere. The
+                # real figure was 9 of 26.
+                unjudged=len(outcome.unjudged),
+                promptable=outcome.promptable_recorded,
+                reason=outcome.incomplete_reason,
+            )
 
         found = outcome.comps_recorded
         searched = len(outcome.performed)

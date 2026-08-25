@@ -1,0 +1,45 @@
+{# Picking photos, one or many, camera or library.
+
+   `capture` is deliberately absent. With it, iOS Safari goes straight to the
+   camera, takes exactly one photo, and ignores `multiple` -- which is why the
+   first version allowed a single shot and offered no way into the library. Left
+   off, Safari shows its own sheet: Photo Library (multi-select), Take Photo, and
+   Choose File. That one control covers both things the seller might mean.
+
+   Selections accumulate rather than replace, so "Take Photo" three times leaves
+   three photos rather than the last one. The browser hands back a read-only
+   FileList each time; a DataTransfer is the only way to build a new one. Where
+   that is missing the input keeps its own last selection, which is the old
+   behaviour and still works.
+
+   Nothing submits itself. A listing has several photos and the seller decides
+   when they have taken enough. #}
+<form method="post" action="{{ action }}" enctype="multipart/form-data"
+      class="c-picker" data-long>
+  <label class="c-big-button">
+    <input type="file" name="photos" multiple accept="image/*" data-accumulate
+           required>
+    <span data-picker-label>{{ pick_label | default('Add photos') }}</span>
+  </label>
+
+  <div class="c-picked" hidden>
+    <ul class="c-thumbs" data-thumbs></ul>
+    <p class="c-quiet-note" data-count></p>
+
+    {% if with_cost %}
+      <label class="c-field">
+        <span class="c-field-name">What did you pay for it? (optional)</span>
+        <span class="c-money-field">
+          <span aria-hidden="true">$</span>
+          <input type="text" name="cost_dollars" inputmode="decimal"
+                 pattern="[0-9.,]*" placeholder="0.00" autocomplete="off">
+        </span>
+      </label>
+      <p class="c-quiet-note">Only used to work out your profit.</p>
+    {% endif %}
+
+    <button type="submit" class="c-big-button" data-busy="Uploading…">
+      {{ submit_label | default('Start') }}
+    </button>
+  </div>
+</form>

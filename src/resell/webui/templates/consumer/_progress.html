@@ -1,0 +1,113 @@
+{# What is happening, in three lines that only ever tick forwards.
+
+   The phases come from `phases_for`, which spans the orchestrator's steps in
+   execution order. What is deliberately absent: which of the nineteen steps is
+   running, which host is being read, how many search calls are left, what the
+   agent is spending. Those are facts about the machine.
+
+   The two branches matter. `task.working` means the agent *owns* the step; it
+   does not mean anything is running. An item whose run died, or that was left
+   half-done yesterday, is the agent's turn with nobody taking it -- and spinning
+   at someone forever, over work that is not happening, is worse than saying so. #}
+<section class="c-status" aria-live="polite">
+  {# One status line, not two. A headline reading "Finding a price" directly
+     above a checklist row reading "Finding market prices" is the same fact
+     twice, so the spinner moved onto the row it was describing. #}
+  <ol class="c-phases">
+    {% for phase in task.phases %}
+      <li class="c-phase {{ 'is-done' if phase.done }} {{ 'is-now' if phase.current }}">
+        <span class="c-tick" aria-hidden="true">
+          {%- if phase.done %}&#10003;
+          {%- elif phase.current and task.active_run %}<span class="run-spinner"></span>
+          {%- elif phase.current %}&#9679;{% else %}&#9675;{% endif -%}
+        </span>
+        <span>{{ phase.label }}</span>
+        {%- if phase.current and task.active_run %}
+          {# A liveness signal, not a measurement. It says the process is still
+             running, and -- the reason it earns its place -- it makes an
+             abnormal run obvious: at ten minutes something is wrong, and
+             without a clock there is no way to tell that from two. Kept small
+             and muted so it reads as a pulse rather than as a target. #}
+          <span class="c-elapsed tiny quiet"></span>
+        {%- endif %}
+      </li>
+    {% endfor %}
+  </ol>
+
+  {% if task.active_run %}
+    {# Only while something is genuinely running. On the other branch the agent
+       owns the step and nothing is happening, where "come back later" would be
+       a promise nobody is keeping.
+
+       Said emphatically rather than quietly. The counter beside the running
+       phase is a standing invitation to watch, so the sentence that says you do
+       not have to has to be at least as loud as the thing it is answering. #}
+    <p class="c-wait"><strong>No need to wait</strong> — this takes a minute or
+      two. You can leave this page and come back later.</p>
+  {% endif %}
+
+  {% if not task.active_run %}
+    {# Two different situations that used to look identical: an item nobody has
+       picked up yet, and one that was tried and could not get through. The
+       second used to offer "Carry on" with no sign anything had gone wrong, so
+       the only way to find out was to go and read the run record. #}
+    {% if task.stuck %}
+      <p class="c-stuck">{{ task.stuck }}</p>
+    {% endif %}
+    <form method="post" action="{{ url_for('run', sku=task.sku) }}"
+          class="c-carry-on" data-long>
+      <button type="submit" class="c-big-button" data-busy="Starting…">
+        {{ 'Try again' if task.stuck else 'Carry on' }}
+      </button>
+    </form>
+  {% endif %}
+</section>
+
+{% if task.active_run %}
+  {# Polls the run the page already knows about, and reloads when it finishes.
+     Deliberately not `_run.html`: that partial prints the current step and any
+     problems, which is exactly the research-stage detail this screen exists to
+     keep out. All this needs is a clock and a reload -- so that a seller who
+     *did* stay on the page is not left looking at a finished run. #}
+  <script>
+  (function () {
+    // How long the *run* has been going, not how long this page has been open.
+    // The origin comes from the run record, so reloading the page or opening it
+    // half way through shows the same number the run would show anywhere else --
+    // which is the whole point of it: a run at ten minutes is worth noticing,
+    // and a clock that restarts at zero on every reload would hide exactly that.
+    //
+    // Blank until the first poll answers, deliberately. A clock counting from
+    // page load would be a plausible wrong number, and the honest failure for a
+    // duration nobody can source yet is not to show one.
+    var elapsed = document.querySelector(".c-elapsed");
+    var started = null;
+    var clock = setInterval(function () {
+      if (started === null) return;
+      elapsed.textContent = " " + Math.round((Date.now() - started) / 1000) + "s";
+    }, 1000);
+
+    function tick(run) {
+      // Re-read on every poll rather than trusting the local clock to keep time
+      // across a backgrounded tab, where timers are throttled.
+      var began = Date.parse(run.started_at);
+      if (!isNaN(began)) {
+        started = began;
+        elapsed.textContent = " " + Math.round((Date.now() - began) / 1000) + "s";
+      }
+    }
+
+    function poll() {
+      fetch("/runs/{{ task.active_run }}", {headers: {"Accept": "application/json"}})
+        .then(function (r) { return r.json(); })
+        .then(function (run) {
+          if (run.running) { tick(run); setTimeout(poll, 1500); return; }
+          clearInterval(clock);
+          window.location = window.location.pathname;
+        })
+        .catch(function () { setTimeout(poll, 3000); });
+    }
+    poll();
+  })();
+  </script>
+{% endif %}

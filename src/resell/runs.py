@@ -29,9 +29,26 @@ from resell import progress
 from resell.db import now_iso
 
 __all__ = [
-    "RunView", "SqliteReporter", "active_run_for", "latest_run_for", "read_run",
-    "start_run",
+    "Blocked", "RunView", "SqliteReporter", "active_run_for", "latest_run_for",
+    "read_run", "start_run",
 ]
+
+
+class Blocked(Exception):
+    """A stage could not be completed, and the run is stopping cleanly.
+
+    Distinct from any other exception reaching `start_run`, which is a crash: a
+    stack trace, a red line, and nothing anyone can do about it from a phone.
+    This is the run saying it got as far as it could. The item is untouched, the
+    step is still owed, and trying again is a sensible thing to offer.
+    """
+
+    def __init__(self, message: str, *, detail: str = ""):
+        super().__init__(message)
+        # What the seller reads, and what the operator reads. The second is kept
+        # off the consumer screen and shown under /ops.
+        self.message = message
+        self.detail = detail or message
 
 # A step message the operator sees. Longer than this is a paragraph, not a status.
 MAX_MESSAGE = 200
@@ -84,13 +101,23 @@ class RunView:
         return self.status == "running"
 
     @property
+    def blocked(self) -> bool:
+        """Stopped on purpose, with the step still owed. Retrying is sensible."""
+        return self.status == "blocked"
+
+    @property
+    def broke(self) -> bool:
+        """Stopped by something nobody planned for."""
+        return self.status == "failed"
+
+    @property
     def elapsed_ms(self) -> int:
         return self.steps[-1].elapsed_ms if self.steps else 0
 
     @property
     def current(self) -> str:
         """What to put on the screen right now."""
-        if self.status == "failed":
+        if self.status in ("failed", "blocked"):
             return self.detail or "something went wrong"
         if self.status == "done":
             return self.detail or "done"
@@ -136,6 +163,12 @@ def start_run(db_path, sku: str, work) -> str:
             with progress.reporting(reporter):
                 detail = work(worker, reporter) or "done"
             status = "done"
+        except Blocked as exc:
+            # A stop, not a crash. No traceback: nothing went wrong that a person
+            # reading a log could act on, and the reason is already a sentence.
+            status = "blocked"
+            detail = exc.detail[:MAX_MESSAGE]
+            reporter.step(progress.Phase.BLOCKED, detail, ok=False)
         except Exception as exc:  # noqa: BLE001 - the run reports its own failure
             status = "failed"
             detail = f"{type(exc).__name__}: {exc}"[:MAX_MESSAGE]

@@ -1,0 +1,53 @@
+{# Everything that is not the next decision, folded away.
+
+   Two things live here: changing details the agent got wrong, and setting the
+   item aside. Both are real and both have to be reachable, but neither is what
+   the screen is asking, and putting them inline turned the workspace into a
+   form. Closed by default, and opened for you when something actually needs
+   fixing. #}
+{# Only when it is the seller's turn does a problem get announced. Everything in
+   here posts to a handler guarded by `_busy`, so while a run is in flight the
+   sheet would offer actions the server refuses -- and "something needs fixing"
+   over an item the agent is still working on reads as a failure when it is just
+   an unfinished field. #}
+{% set flag = form and form.has_problem and task.needs_you %}
+<details class="c-more" {{ 'open' if flag }}>
+  <summary>{{ 'Something needs fixing' if flag else 'More' }}</summary>
+
+  <div class="c-more-body">
+  {% if form and form.fields %}
+    <form method="post" action="{{ url_for('fix', sku=task.sku) }}" class="c-fix">
+      {% for field in form.fields %}
+        {% if field.name != 'category_id' %}
+          <label class="c-field {{ 'is-wrong' if field.problem }}">
+            <span class="c-field-name">{{ field.label }}</span>
+            {% if field.is_choice %}
+              <select name="{{ field.name }}">
+                {% for value, label in field.allowed %}
+                  <option value="{{ value }}" {{ 'selected' if value == field.value }}>{{ label }}</option>
+                {% endfor %}
+              </select>
+            {% elif field.name == 'description' %}
+              <textarea name="{{ field.name }}" rows="5">{{ field.value }}</textarea>
+            {% else %}
+              <input type="text" name="{{ field.name }}" value="{{ field.value }}"
+                     autocapitalize="words">
+            {% endif %}
+            {% if field.problem %}
+              <span class="c-field-problem">{{ field.problem }}</span>
+            {% endif %}
+          </label>
+        {% endif %}
+      {% endfor %}
+      <button type="submit" class="c-secondary-button">Save</button>
+    </form>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('abandon', sku=task.sku) }}"
+        class="c-aside">
+    <button type="submit" class="c-quiet-button">Set this aside</button>
+    <span class="c-quiet-note">Nothing is deleted. It stays under Your items and
+      you can pick it up later.</span>
+  </form>
+  </div>
+</details>

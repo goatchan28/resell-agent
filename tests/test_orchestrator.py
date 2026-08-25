@@ -371,16 +371,98 @@ def test_advance_stops_at_a_question_without_running_anything(tmp_path):
 
 
 def test_advance_stops_when_a_stage_fails(tmp_path):
+    """And tries it again first. A stage failing is a normal outcome and most of
+    them in practice are transient, so the run gets a second attempt before it
+    gives the step back."""
     conn, gateway, sku = fixture(tmp_path)
     with_photo(conn, gateway, sku)
 
     class Broken:
+        def __init__(self):
+            self.attempts = 0
+
         def run(self, *a):
+            self.attempts += 1
             raise RuntimeError("the model refused")
 
-    report = advance(conn, gateway, sku, runner=Broken())
+    broken = Broken()
+    report = advance(conn, gateway, sku, runner=broken)
+    assert broken.attempts == 2
+    # Both attempts are on the record, filed by what they turned out to be: the
+    # first was recovered from as far as anyone knew at the time, the second is
+    # what actually stopped the run.
+    assert report.retried == ["start_identification: the model refused"]
     assert report.errors == ["start_identification: the model refused"]
     assert not report.progressed
+    # and the step is still owed, not stepped over
+    assert report.blocked is not None
+    assert report.blocked.step is Step.START_IDENTIFICATION
+    assert report.blocked_attempts == 2
+
+
+def test_a_stage_that_succeeds_on_the_second_attempt_carries_on(tmp_path):
+    """The case the retry exists for. MP-000037's drafting failed, the operator
+    pressed the button again, and the very next attempt produced a 74-character
+    title."""
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+
+    class FlakyOnce:
+        def __init__(self):
+            self.attempts = 0
+
+        def run(self, conn, gateway, sku, step):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("a page timed out")
+            from resell.orchestrator import StageRunner
+
+            return StageRunner().run(conn, gateway, sku, step)
+
+    report = advance(conn, gateway, sku, runner=FlakyOnce(), max_steps=1)
+    assert report.progressed
+    assert report.blocked is None
+
+
+def test_a_refusal_is_not_retried(tmp_path):
+    """A second attempt would be refused by the same rule, having spent the
+    money to find out."""
+    from resell.gateway import Rejected
+
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+
+    class Refuses:
+        def __init__(self):
+            self.attempts = 0
+
+        def run(self, *a):
+            self.attempts += 1
+            raise Rejected("BeginIdentification", ["no photos have passed validation"])
+
+    refuses = Refuses()
+    report = advance(conn, gateway, sku, runner=refuses)
+    assert refuses.attempts == 1
+    assert report.blocked is not None
+
+
+def test_an_exhausted_budget_is_not_retried(tmp_path):
+    from resell.reasoning.budget import BudgetExceeded
+
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+
+    class Spent:
+        def __init__(self):
+            self.attempts = 0
+
+        def run(self, *a):
+            self.attempts += 1
+            raise BudgetExceeded("that is the ceiling for this stage")
+
+    spent = Spent()
+    advance(conn, gateway, sku, runner=spent)
+    assert spent.attempts == 1
 
 
 def test_a_step_that_changes_nothing_stops_rather_than_repeating(tmp_path):
@@ -979,13 +1061,21 @@ def test_a_granted_attempt_that_finds_nothing_concludes_again(tmp_path, monkeypa
 
 
 class _EmptyRound:
-    """A round that completed and produced nothing to review."""
+    """A round that completed and produced nothing to review.
+
+    `judging_complete` is the difference between this and a round that broke:
+    every listing it retrieved got a verdict, and the verdict was that none of
+    them help. That is a statement about the market, and it is the only thing
+    that may route to "decide a price without comparables"."""
 
     performed = ["a query"]
     comps_recorded = 0
     stopped = None
     stop_reason = ""
     notes: list = []
+    unjudged: list = []
+    incomplete_reason = ""
+    judging_complete = True
 
 
 # --- the two exits that actually work ---------------------------------------------

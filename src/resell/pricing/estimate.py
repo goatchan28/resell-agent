@@ -89,6 +89,13 @@ class PriceQualifier(StrEnum):
     # crossed -- and the alternative was letting one observation speak over twelve.
     POOLED_UNKNOWN_CONDITION = "pooled_unknown_condition"
     ABOVE_RETAIL_CEILING = "above_retail_ceiling"
+    # The band came from a shop price and a retention rate, because the market
+    # offered nothing. Distinct from `retail_only`, which is the older refusal --
+    # this one produced a number, and says so.
+    RETAIL_ANCHORED = "retail_anchored"
+    # Thin marketplace evidence widened by a retail-derived anchor. Both are on
+    # the record and the weighting is reported; neither was discarded.
+    ANCHOR_BLENDED = "anchor_blended"
     ADJUSTED = "adjusted"
     LONG_DAYS_ON_MARKET = "long_days_on_market"
 
@@ -177,15 +184,54 @@ class ScoredComp:
     observation: CompObservation
 
 
+# How closely a shop price has to match before it may bound or anchor a price.
+# Deliberately tighter than `Comparability.contributes`: a comp one rung down
+# still says something about *this market*, while a shop price one rung down is
+# simply another product's price tag.
+ANCHORABLE_RETAIL = (Comparability.SAME_PRODUCT, Comparability.SAME_FAMILY_VARIANT)
+
+
 @dataclass(frozen=True)
 class RetailReference:
-    """Never enters a distribution. Ceiling check and operator context only."""
+    """Never enters a distribution. Ceiling check, anchor, and operator context.
+
+    `match` is what stops a shop price for one product from pricing another.
+    Retail arrives two ways and they are not equally trustworthy:
+
+    An operator types it about *this* item. There is no page and no judge, and
+    the assertion is already about the thing in hand -- so `match` is None and it
+    is taken at its word.
+
+    Comp research finds it on the maker's own site, in which case it rides in on
+    a comp observation the judge has already graded, and `match` is that grade.
+    MP-000022 is why this exists. Researching a Bowflex SelectTech 552 reached
+    bowflex.com and recorded nine current shop prices, six of which the judge
+    excluded: a JRNY Tablet Holder at $29.99, a 5.1S Bench at $349, a bigger
+    1090 set at $699. `_current_retail` takes the lowest, so a $399 pair of
+    dumbbells anchored on a tablet holder and came out at $9.82-$12.50. The
+    judge had already done the work of noticing; nothing was reading its answer.
+    """
 
     price_cents: int
     kind: RetailKind
     as_of: datetime | None = None
     source: str | None = None
     citation: str | None = None
+    # None = asserted of this item directly. Otherwise the judge's grade for the
+    # page it was read from.
+    match: Comparability | None = None
+
+    @property
+    def prices_this_item(self) -> bool:
+        """Whether this is a shop price *for the thing being sold*.
+
+        The same product, or a variant close enough that the maker charges for
+        them as one line. A merely `category_attribute` shop price -- some other
+        backpack, some other dumbbell -- is a fact about that product, and
+        reasoning down from it would repeat MP-000041's mistake with retail
+        instead of comps.
+        """
+        return self.match is None or self.match in ANCHORABLE_RETAIL
 
 
 class EvidenceRole(StrEnum):
@@ -302,6 +348,9 @@ class PricingInput:
     sku: str
     item_condition_band: ConditionBand
     identity_resolution: str
+    # eBay's own path to the category, e.g. "Clothing, Shoes & Accessories > ...".
+    # Only the first segment is read, and only to pick a retention rate.
+    category_path: str | None = None
     comps: tuple[ScoredComp, ...] = ()
     retail: tuple[RetailReference, ...] = ()
     adjustments: tuple[ConditionAdjustment, ...] = ()
@@ -351,6 +400,11 @@ class PriceRecommendation:
     adjustments: tuple[ConditionAdjustment, ...] = ()
     qualifiers: tuple[PriceQualifier, ...] = ()
     retail_context: tuple[RetailReference, ...] = ()
+    # The resale value inferred from a current shop price, if there was one. Set
+    # whenever it could be computed, whether or not it moved the band -- evidence
+    # that was present and did nothing is exactly what this record is for.
+    retail_anchor: object | None = None
+    anchor_weight: float = 0.0
     diagnostic_confidence: float = 0.0
     # The account of how the number was reached, including the evidence that was
     # present and did nothing.
@@ -364,8 +418,21 @@ class PriceRecommendation:
         """Operator-facing one-liner. Never says "market price" for asking data."""
         if self.unpriceable:
             return f"{self.sku}: unpriceable -- {self.reason}"
+        assert self.band_central_cents is not None
         kind = self.price_kind
-        assert kind is not None and self.band_central_cents is not None
+        if kind is None:
+            # Priced from a retail-derived anchor with no marketplace
+            # distribution behind it. There is no comp count and no price kind to
+            # report, and asserting one used to crash the operator's pricing page
+            # outright on any item in this state.
+            assert self.retail_anchor is not None
+            return (
+                f"{self.sku}: no comps; "
+                f"{_money(self.band_low_cents)}-{_money(self.band_high_cents)}, "
+                f"centre {_money(self.band_central_cents)} "
+                f"[{self.retail_anchor.basis}]"
+                + (f" ({', '.join(self.qualifiers)})" if self.qualifiers else "")
+            )
         n = self.n_in_basis
         noun = "comp" if n == 1 else "comps"
         of = f" of {self.n_included}" if self.n_included != n else ""
@@ -422,16 +489,20 @@ def retail_ceiling_check(
     breach is a flag, not a refusal: discontinued and collectible items exceed
     retail legitimately, and that is the operator's call to make explicitly.
     """
-    current = [r for r in retail if r.kind is RetailKind.CURRENT]
-    if not current:
+    # The same selection the anchor uses, so the figure the price is reasoned
+    # down from and the figure that bounds it can never be different numbers.
+    # Two rules here meant a $300 ask was refused for exceeding a $199 stand
+    # while the $399 dumbbells it stands under sat in the same list.
+    chosen = _current_retail(retail)
+    if chosen is None:
         return True, "no current retail reference to check against"
-    lowest = min(r.price_cents for r in current)
-    if price_cents > lowest:
+    if price_cents > chosen.price_cents:
         return False, (
-            f"{_money(price_cents)} exceeds current retail {_money(lowest)}; "
-            "legitimate only if discontinued or collectible, and that needs saying"
+            f"{_money(price_cents)} exceeds current retail "
+            f"{_money(chosen.price_cents)}; legitimate only if discontinued or "
+            "collectible, and that needs saying"
         )
-    return True, f"below current retail {_money(lowest)}"
+    return True, f"below current retail {_money(chosen.price_cents)}"
 
 
 # --- the estimator -----------------------------------------------------------
@@ -571,13 +642,41 @@ def recommend(inp: PricingInput) -> PriceRecommendation:
         contributions=contributions,
     )
 
+    anchor = _anchor_for(inp)
+    base = _replace(base, retail_anchor=anchor)
+
     if chosen is None:
+        # A shop price for this item, and no market. That is not nothing: it is
+        # what a person would reason from, and refusing to has been sending them
+        # to type a number of their own with less information than the agent had.
+        if anchor is not None:
+            quals.add(PriceQualifier.RETAIL_ANCHORED)
+            return _replace(
+                base,
+                unpriceable=False,
+                reason=f"no marketplace comps; {anchor.basis}",
+                band_low_cents=anchor.low_cents,
+                band_central_cents=anchor.point_cents,
+                band_high_cents=anchor.high_cents,
+                anchor_weight=1.0,
+                qualifiers=_sorted(quals),
+                n_in_basis=0,
+            )
         if inp.retail:
             quals.add(PriceQualifier.RETAIL_ONLY)
-            reason = (
-                "no realized or asking comps; a retail reference is context and "
-                "cannot become a price on its own"
-            )
+            mismatched = [r for r in inp.retail if not r.prices_this_item]
+            if mismatched and len(mismatched) == len(inp.retail):
+                reason = (
+                    f"no realized or asking comps, and the {len(mismatched)} shop "
+                    "price(s) on record are for a different product; a price tag "
+                    "from the next item along cannot price this one"
+                )
+            else:
+                reason = (
+                    "no realized or asking comps, and no current shop price to "
+                    "reason down from; original retail is a marketing number and "
+                    "cannot become a price on its own"
+                )
         else:
             reason = "no comps and no retail reference; ask the operator"
         return _replace(base, reason=reason, qualifiers=_sorted(quals))
@@ -607,6 +706,20 @@ def recommend(inp: PricingInput) -> PriceRecommendation:
         quals.add(PriceQualifier.THIN_SAMPLE)
     if chosen.is_widely_dispersed:
         quals.add(PriceQualifier.WIDE_DISPERSION)
+
+    # Thin marketplace evidence and a shop price for the item itself. Both are
+    # kept: the band spans them, and the centre moves according to how much the
+    # sample deserves. MP-000041 is the case -- one `category_attribute` ask at
+    # $75 for a cheaper sub-line, against a $139 shop price for this exact model,
+    # produced $75 and asked nobody anything.
+    market_weight = _market_weight(chosen_pool)
+    if anchor is not None and market_weight < BLEND_BELOW:
+        anchor_share = 1.0 - market_weight
+        central = round(central * market_weight + anchor.point_cents * anchor_share)
+        low = min(low, anchor.low_cents)
+        high = max(high, anchor.high_cents)
+        quals.add(PriceQualifier.ANCHOR_BLENDED)
+        base = _replace(base, anchor_weight=anchor_share)
 
     ceiling_ok, _ = retail_ceiling_check(central, inp.retail)
     if not ceiling_ok:
@@ -743,12 +856,22 @@ def build_contributions(
                    "kept out of every distribution",
         ))
     if retail:
-        prices = [r.price_cents for r in retail]
-        lines.append(EvidenceContribution(
-            source="retail context", n=len(retail), role=EvidenceRole.CEILING_CHECK,
-            detail="what it costs new; bounds the answer and never joins a sample",
-            low_cents=min(prices), high_cents=max(prices),
-        ))
+        # Split, because "9 retail references" over a band built from one of them
+        # is the line that hid MP-000022's tablet holder. Evidence that was
+        # present and did nothing is reported as such rather than counted in.
+        for group, role, detail in (
+            ([r for r in retail if r.prices_this_item], EvidenceRole.CEILING_CHECK,
+             "what it costs new; bounds the answer and never joins a sample"),
+            ([r for r in retail if not r.prices_this_item], EvidenceRole.EXCLUDED,
+             "shop prices for a different product; not this item's price tag"),
+        ):
+            if not group:
+                continue
+            prices = [r.price_cents for r in group]
+            lines.append(EvidenceContribution(
+                source="retail context", n=len(group), role=role, detail=detail,
+                low_cents=min(prices), high_cents=max(prices),
+            ))
     if demand is not None and demand.n_asks:
         lines.append(EvidenceContribution(
             source="days on market", n=demand.n_with_days,
@@ -843,6 +966,99 @@ def _choose(r_comp, r_off, a_comp, a_off, r_comp_d, r_off_d, a_comp_d, a_off_d, 
         return a_off_d, PriceKind.ASKING, a_off, "condition_mismatched"
 
     return None, None, [], "none"
+
+
+# --- retail as an anchor, alongside the market rather than instead of it -----
+
+# How far a marketplace sample is trusted against a retail-derived anchor, by the
+# strongest rung in it. A listing for the identical product outweighs any
+# inference from a shop price; a listing for merely the same *kind* of thing
+# carries about half the argument, which is what MP-000041 turned on -- one
+# `category_attribute` ask for a cheaper sub-line set the price for a
+# better-specified item whose own shop price was on record.
+RUNG_WEIGHT: dict[Comparability, float] = {
+    Comparability.SAME_PRODUCT: 1.00,
+    Comparability.SAME_FAMILY_VARIANT: 0.75,
+    Comparability.CATEGORY_ATTRIBUTE: 0.50,
+}
+
+# Where a sample stops being thin. At or above this the market speaks for itself
+# and the anchor is recorded as context without touching the band.
+ENOUGH_COMPS = 3
+
+# Below this the marketplace sample is worth less than half an answer, and a
+# retail-derived anchor is allowed to speak alongside it. At or above it the
+# market is talking and the anchor is recorded as context and nothing more --
+# two same-family asks clustered above the shop price mean the thing sells above
+# the shop price, and blending that toward a depreciation rate would erase a
+# real finding to make room for a guess.
+BLEND_BELOW = 0.5
+
+
+def _market_weight(pool: list[ScoredComp]) -> float:
+    """How much of the answer the marketplace sample deserves.
+
+    Two things, multiplied: how comparable the best of it is, and how much of it
+    there is. One weak comp is not half an answer, and pretending otherwise is
+    how a single ask became a three-strategy recommendation.
+    """
+    if not pool:
+        return 0.0
+    # A listing for the identical product is a fact about this product's market.
+    # An anchor is an inference from a shop price and a retention rate. Facts are
+    # not diluted by inferences, however few of them there are: two same-product
+    # asks above the shop price mean the thing sells above the shop price, and
+    # averaging that toward a depreciation guess would erase the finding.
+    if any(c.claim.comparability is Comparability.SAME_PRODUCT for c in pool):
+        return 1.0
+    best = max(
+        (RUNG_WEIGHT.get(c.claim.comparability, 0.0) for c in pool), default=0.0
+    )
+    return best * min(len(pool), ENOUGH_COMPS) / ENOUGH_COMPS
+
+
+def median_low(ordered: list, *, key):
+    """The lower-middle element of an already-ordered list."""
+    return ordered[(len(ordered) - 1) // 2]
+
+
+def _current_retail(retail: tuple[RetailReference, ...]) -> RetailReference | None:
+    """Only a current shop price, and only for this product.
+
+    Original retail is a marketing number of unknown date. A current price for a
+    *different* product is a fact about that product -- see
+    `RetailReference.prices_this_item`, and MP-000022's tablet holder.
+    """
+    current = [r for r in retail
+               if r.kind is RetailKind.CURRENT and r.prices_this_item]
+    if not current:
+        return None
+    # An exact match beats a variant, so a `same_product` price is never diluted
+    # by the rest of the product line.
+    exact = [r for r in current if r.match is None
+             or r.match is Comparability.SAME_PRODUCT]
+    tier = exact or current
+    # Within a tier, the middle rather than the lowest. `min` looks conservative
+    # and is a systematic bias: the cheapest member of a product family sets the
+    # anchor for every item in it. MP-000022's four family-variant prices are a
+    # $199 stand and three $399 dumbbell sets, and `min` anchored a $399 pair of
+    # dumbbells on the stand they sit in.
+    #
+    # `median_low` rather than `median`, so the figure is one a page actually
+    # showed rather than the average of two.
+    return median_low(sorted(tier, key=lambda r: r.price_cents),
+                      key=lambda r: r.price_cents)
+
+
+def _anchor_for(inp: "PricingInput"):
+    from resell.pricing.retention import anchor_from_retail
+
+    current = _current_retail(inp.retail)
+    if current is None or current.price_cents <= 0:
+        return None
+    return anchor_from_retail(
+        current.price_cents, inp.category_path, inp.item_condition_band
+    )
 
 
 def _basis_for(kind: PriceKind, pool: list[ScoredComp]) -> CompBasis:

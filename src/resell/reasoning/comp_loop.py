@@ -81,6 +81,10 @@ class CompRoundOutcome:
     deferral_reason: str = ""
     listings_found: int = 0
     comps_recorded: int = 0
+    # Of those, the ones their source's licence allows into a prompt -- which is
+    # the set the judge is actually shown, and so the only honest denominator for
+    # "how many came back without a verdict".
+    promptable_recorded: int = 0
     claims_recorded: int = 0
     candidates_offered: int = 0
     refused: list[str] = field(default_factory=list)
@@ -94,6 +98,18 @@ class CompRoundOutcome:
     # The extraction budget ran out partway. Not a failure: the round keeps what
     # it retrieved, judges it, and stops searching for pages it cannot read.
     stopped_early: bool = False
+    # Listings that went into judging and came back without a verdict, and why.
+    #
+    # An empty list is the only thing that makes "no usable comparables" a
+    # statement about the market. With anything in it the round did not finish,
+    # and what it found is a partial answer -- worth keeping, never worth
+    # reporting as though the market had been searched and come up short.
+    unjudged: list[str] = field(default_factory=list)
+    incomplete_reason: str = ""
+
+    @property
+    def judging_complete(self) -> bool:
+        return not self.unjudged and not self.incomplete_reason
 
 
 def _uid(prefix: str) -> str:
@@ -105,6 +121,202 @@ STAGE_SAYS: dict[str, str] = {
     "comp_extract": "reading the listings on the page",
     "comp_judge": "deciding which are comparable",
 }
+
+
+# How many listings go into one judging call, and how much room its answer gets.
+#
+# Batching is the guarantee; the ceiling is only headroom inside a batch. A
+# judgement runs about 110 output tokens once it carries a comp id, a rung,
+# citations on both sides, a rationale and -- for an exclusion -- a reason. At
+# ten per call that is roughly 1,100 against 8,000, so a batch cannot outgrow
+# its budget however verbose one judgement turns out to be.
+#
+# Raising the ceiling alone would not have fixed anything. It defers the number
+# at which truncation returns: 4,000 broke at 35 listings, 8,000 would break at
+# 70, and the failure would look exactly the same when it came.
+# --- one round, three units ---------------------------------------------------
+#
+# `StageBudget.max_calls` is a count of physical model calls, and it was written
+# when every stage made exactly one. Three stages fan out -- search by plan size,
+# extraction by how many pages a search engine returned, judging by how many
+# listings came back -- so the same number came to mean three different things.
+# MP-000039 lost thirty verdicts to it; MP-000041 spent its whole extraction
+# allowance on the first query's three manufacturer pages and never ran searches
+# three or four.
+#
+# So three quantities, each counted in its own unit:
+#
+#   rounds    how many times the agent may go round the loop. Counted by
+#             `comp_plan` calls, which is one per round by construction, and
+#             already what `comp_research_exhausted` gates on.
+#   breadth   how far a single round may fan out: searches (LookupBudget),
+#             documents per round (EXTRACT_PER_ROUND), listings per judging
+#             batch (JUDGE_BATCH).
+#   money     `max_cost_micros`, summing every physical call whatever stage it
+#             belongs to. The real ceiling, and the only one that should stop a
+#             round in flight.
+#
+# Breadth is what keeps any one round affordable; money is what keeps the item
+# affordable. Neither is the per-call cap, which now bounds rounds alone.
+
+# Documents one round may extract from. Eight rather than three: a single query
+# returning three pages must not be able to spend the whole item's allowance, and
+# a round that reads eight pages has been given a fair chance to find a market.
+EXTRACT_PER_ROUND = 8
+
+JUDGE_BATCH = 10
+# Sized to the batch rather than to the old single-call world.
+#
+# The cost guard reserves a call's *whole* output ceiling as its worst case, so a
+# fixed 8,000 made each batch reserve about $0.12 of a $0.25 stage budget and a
+# four-batch round could not fit -- the same mistake as the call cap, one step
+# along: a number written when a round was one call, applied to each of four.
+#
+# Nine real batches of ten listings have peaked at 1,736 output tokens, so 300
+# per listing leaves roughly three-quarters again in hand while keeping the
+# reservation close to what a batch actually costs.
+JUDGE_OUTPUT_TOKENS_PER_LISTING = 300
+JUDGE_OUTPUT_FLOOR = 1500
+
+
+def judge_output_tokens(listings: int) -> int:
+    return max(JUDGE_OUTPUT_FLOOR, listings * JUDGE_OUTPUT_TOKENS_PER_LISTING)
+
+
+def _batches(items, size: int):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _round_spend(conn, sku, purpose: str):
+    """A fan-out stage's spend, counted in rounds rather than physical calls.
+
+    Rounds come from `comp_plan`, one per round by construction. Money is the
+    stage's real accumulated cost, so `max_cost_micros` still sees every batch
+    and every document.
+    """
+    from resell.reasoning.budget import StageSpend
+    from resell.reasoning.vision import spend_so_far
+
+    return StageSpend(
+        calls=spend_so_far(conn, sku, "comp_plan").calls,
+        cost_micros=spend_so_far(conn, sku, purpose).cost_micros,
+    )
+
+
+def _judging_spend(conn, sku, this_round_micros: int = 0):
+    """What judging has used, counted the way the budget means it.
+
+    `max_calls` on this stage means judging *rounds*, and it was written when a
+    round was one model call. Batching made a round several, so charging each
+    batch against the same cap made a round of four look like four rounds -- and
+    at a cap of three, MP-000039's fourth batch was refused, taking thirty
+    verdicts already paid for with it.
+
+    Rounds are counted by plans instead: exactly one `comp_plan` precedes each
+    round, and `comp_research_exhausted` already gates the stage on that same
+    number, so this is the existing bound rather than a new one.
+
+    Money is not relaxed. Every batch is ledgered as its own call and its cost is
+    summed here, so `max_cost_micros` still sees the true total -- including what
+    the current round has spent so far, which the ledger does not yet show for a
+    call that has not finished.
+    """
+    from resell.reasoning.budget import StageSpend
+    from resell.reasoning.vision import spend_so_far
+
+    return StageSpend(
+        calls=spend_so_far(conn, sku, "comp_plan").calls,
+        cost_micros=spend_so_far(conn, sku, "comp_judge").cost_micros
+        + this_round_micros,
+    )
+
+
+def _judge_in_batches(conn, sku, adapter, promptable, observations, ceiling, budget,
+                      outcome=None):
+    """Judge every retrieved listing, in chunks small enough to answer in full.
+
+    One listing is judged exactly once: the batches partition the list, and each
+    call is told only its own ids -- so a judgement naming a comp from another
+    batch is refused by the parser exactly as an invented one is.
+
+    Everything else is unchanged. Same schema, same citation requirements on
+    both sides, same ladder, same ceiling enforced at recording. Merging is
+    ordered by batch and then by the order the model answered in, so the same
+    listings in the same order produce the same claims.
+    """
+    from dataclasses import replace
+
+    from resell.reasoning.tools import CompJudgements
+
+    # The estimate that bounds worst-case cost has to match what the request
+    # actually asks for, or the budget check is measuring the wrong thing.
+    # Per batch, because the batches differ in size and the last one is usually
+    # short. Reserving the largest batch's ceiling for a batch of one is what
+    # made a round of four unaffordable.
+    def budget_for(size: int):
+        return replace(budget, max_output_tokens=judge_output_tokens(size))
+    valid_item_evidence = {row["id"] for row in observations}
+    identification = render_identification(conn, sku)
+    rendered_observations = render_observations(observations)
+
+    merged = CompJudgements()
+    seen: set[str] = set()
+    batches = list(_batches(list(promptable), JUDGE_BATCH))
+    for number, batch in enumerate(batches, start=1):
+        if len(batches) > 1:
+            progress.report(
+                progress.Phase.JUDGING,
+                f"weighing listings {number} of {len(batches)}",
+            )
+        batch_budget = budget_for(len(batch))
+        request = comp_judging_stage(
+            identification=identification,
+            observations=rendered_observations,
+            comps=render_retrieved(batch),
+            identity_ceiling=str(ceiling),
+            max_output_tokens=batch_budget.max_output_tokens,
+        )
+        try:
+            result = _run_stage(
+                conn, sku, adapter, request, purpose="comp_judge",
+                budget=batch_budget, spent=_judging_spend(conn, sku),
+            )
+        except (BudgetExceeded, CompLoopError) as exc:
+            # Whatever the earlier batches decided is kept. Thirty verdicts that
+            # cost real money are not thrown away because the thirty-first could
+            # not be asked for -- and the listings that never got a verdict are
+            # named, so nothing downstream can mistake this for a finished round.
+            merged.malformed.append(f"batch {number} of {len(batches)}: {exc}")
+            if outcome is not None:
+                outcome.incomplete_reason = str(exc)
+            break
+        judged = parse_comp_judge_tool_input(
+            result.tool_input,
+            valid_item_evidence=valid_item_evidence,
+            valid_comp_ids={obs.comp_id for obs in batch},
+        )
+        merged.malformed.extend(judged.malformed)
+        for judgement in judged.judgements:
+            if judgement.comp_id in seen:
+                merged.malformed.append(
+                    f"{judgement.comp_id} judged more than once; keeping the first"
+                )
+                continue
+            seen.add(judgement.comp_id)
+            merged.judgements = merged.judgements + (judgement,)
+
+    # Every listing that went in should have come back with a verdict. Saying so
+    # is the difference between "the judge considered it and said nothing" and
+    # "it never got there", which is the distinction this whole change is about.
+    unjudged = [obs.comp_id for obs in promptable if obs.comp_id not in seen]
+    if unjudged:
+        merged.malformed.append(
+            f"{len(unjudged)} listing(s) came back without a verdict"
+        )
+        if outcome is not None:
+            outcome.unjudged = unjudged
+    return merged
 
 
 def _run_stage(conn, sku, adapter: ModelAdapter, request, *, purpose: str,
@@ -127,13 +339,31 @@ def _run_stage(conn, sku, adapter: ModelAdapter, request, *, purpose: str,
         finalize_call(conn, call_id, status=CallStatus.PROVIDER_ERROR, error=str(exc)[:2000])
         raise CompLoopError(str(exc)) from exc
 
+    # A response cut off at the ceiling is not a short answer, it is half an
+    # answer: the tool call's JSON stops mid-structure and parses to nothing.
+    # Downstream that was indistinguishable from a model that considered every
+    # listing and rejected all of them, so MP-000038's judging was truncated
+    # twice and the item slid to "decide a price without comparables" with
+    # seventeen perfectly good comps already on disk.
+    #
+    # Billed as `parse_failed`: the money was spent and the answer is unusable,
+    # which is exactly what that status is for.
+    truncated = result.stop_reason == "max_tokens"
     finalize_call(
-        conn, call_id, status=CallStatus.COMPLETED,
+        conn, call_id,
+        status=CallStatus.PARSE_FAILED if truncated else CallStatus.COMPLETED,
         input_tokens=result.usage.input_tokens, output_tokens=result.usage.output_tokens,
         cost_micros=rates.cost_micros(result.usage.input_tokens, result.usage.output_tokens),
         latency_ms=result.latency_ms, response=result.raw_response,
         raw_usage=result.usage.raw,
+        error=(f"{purpose}: the answer was cut off at "
+               f"{result.usage.output_tokens} output tokens" if truncated else None),
     )
+    if truncated:
+        raise CompLoopError(
+            f"{said} was cut off at {result.usage.output_tokens} output tokens; "
+            f"the answer is incomplete and cannot be read as a result"
+        )
     return result
 
 
@@ -318,6 +548,9 @@ def run_comp_round(
     # --- retrieve and extract --------------------------------------------------
     recorded: list[CompObservation] = []
     planned_total = len(plan.lookups[: allocation.allowed])
+    # Counted across the round rather than per query, so one search returning ten
+    # pages cannot consume what the other three were going to need.
+    extracted_this_round = 0
     for index, planned in enumerate(plan.lookups[: allocation.allowed], start=1):
         progress.report(
             progress.Phase.SEARCHING,
@@ -346,7 +579,14 @@ def run_comp_round(
                 f"reading listing {position}/{len(documents)} from "
                 f"{document.marketplace}",
             )
+            if extracted_this_round >= EXTRACT_PER_ROUND:
+                outcome.notes.append(
+                    f"stopped extracting after {EXTRACT_PER_ROUND} page(s) this round"
+                )
+                outcome.stopped_early = True
+                break
             try:
+                extracted_this_round += 1
                 found = _comps_from_document(
                     conn, sku, document, planned, model_adapter, stage_budget, outcome
                 )
@@ -444,6 +684,7 @@ def run_comp_round(
         obs for obs in recorded
         if obs.model_visibility is ModelVisibility.FULL
     ]
+    outcome.promptable_recorded = len(promptable)
     outcome.withheld_from_model = [
         obs.comp_id for obs in recorded if obs.model_visibility is not ModelVisibility.FULL
     ]
@@ -472,21 +713,9 @@ def run_comp_round(
         progress.Phase.JUDGING,
         f"weighing {len(promptable)} listing(s) against this item",
     )
-    judge_request = comp_judging_stage(
-        identification=render_identification(conn, sku),
-        observations=render_observations(observations),
-        comps=render_retrieved(promptable),
-        identity_ceiling=str(ceiling),
-        max_output_tokens=stage_budget.max_output_tokens,
-    )
-    judge_result = _run_stage(
-        conn, sku, model_adapter, judge_request, purpose="comp_judge",
-        budget=stage_budget, spent=_stage_spend(conn, sku, "comp_judge"),
-    )
-    judged = parse_comp_judge_tool_input(
-        judge_result.tool_input,
-        valid_item_evidence={row["id"] for row in observations},
-        valid_comp_ids={obs.comp_id for obs in promptable},
+    judged = _judge_in_batches(
+        conn, sku, model_adapter, promptable, observations, ceiling, stage_budget,
+        outcome=outcome,
     )
     outcome.notes.extend(f"judge: {note}" for note in judged.malformed)
 
@@ -620,9 +849,12 @@ def _comps_from_document(
         page_text=page_text, url=document.url, query=planned.query,
         seeking=planned.seeking, max_output_tokens=stage_budget.max_output_tokens,
     )
+    # Rounds, not calls -- see the note above `EXTRACT_PER_ROUND`. Breadth within
+    # the round is bounded by the caller, which counts documents; money is bounded
+    # here as it always was, against the stage's real accumulated cost.
     result = _run_stage(
         conn, sku, model_adapter, request, purpose="comp_extract",
-        budget=stage_budget, spent=_stage_spend(conn, sku, "comp_extract"),
+        budget=stage_budget, spent=_round_spend(conn, sku, "comp_extract"),
     )
     extracted = parse_comp_extract_tool_input(
         result.tool_input, page_text=page_body_for_extraction(page_text)

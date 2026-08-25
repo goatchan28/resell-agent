@@ -12,6 +12,8 @@ value the category permits.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -654,14 +656,65 @@ VALUE_SYNONYMS: dict[str, tuple[str, ...]] = {
 }
 
 
+# Two words for one word, where the difference is how it is written rather than
+# what it means. Kept apart from VALUE_SYNONYMS above, which pairs *different*
+# words for the same referent -- elastane and spandex are two names, grey and
+# gray are two spellings. Applied in both directions to both sides.
+SPELLING_VARIANTS: dict[str, str] = {
+    "grey": "gray",
+    "colour": "color",
+    "aluminium": "aluminum",
+    "jewellery": "jewelry",
+    "fibre": "fiber",
+}
+
+_SPELLING = re.compile(
+    r"\b(" + "|".join(sorted(SPELLING_VARIANTS, key=len, reverse=True)) + r")\b"
+)
+_NOT_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def _same_spelling(text: str) -> str:
+    """One spelling of each word, so grey and gray compare equal."""
+    return _SPELLING.sub(lambda m: SPELLING_VARIANTS[m.group(1)], text.casefold())
+
+
+def _letters_only(text: str) -> str:
+    return _NOT_ALNUM.sub("", text.casefold())
+
+
 def value_appears_in(value: str, text: str) -> str | None:
-    """Whether a value is present in some text, directly or under another name."""
+    """Whether a value is present in some text, directly or under another name.
+
+    Four ways, in order of how much they assume. The first two are the original
+    ones. The last two exist because MP-000041 asked its owner for a brand and a
+    colour that were printed on the item and already written down:
+
+      Brand `XD Design` cited from an observation reading "XDDESIGN"
+      Color `Gray` cited from "the overall colour scheme is grey and black"
+
+    Both were refused, both are the same value written differently, and both cost
+    a person a question. What is *not* accepted is anything that changes the
+    referent: elastane and elastodiene are still different fibres, Beats and
+    Apple are still different brands, and Gray is still not Black.
+    """
     folded = text.casefold()
     if value.casefold() in folded:
         return value
     for alias in VALUE_SYNONYMS.get(value.casefold(), ()):
         if alias in folded:
             return alias
+    # The same word, spelled the other way.
+    if _same_spelling(value) in _same_spelling(text):
+        return value
+    # The same words, run together or split apart. Only for a value that has a
+    # space in it, so this asks one question -- "is this multi-word value written
+    # as one word?" -- and cannot start matching single tokens inside longer
+    # ones, where "Gap" would find itself in "flagship".
+    if " " in value.strip():
+        squeezed = _letters_only(value)
+        if squeezed and squeezed in _letters_only(text):
+            return value
     return None
 
 
@@ -778,6 +831,40 @@ def detect_uncited_value(
         f"states the value; a fact about a related thing only supports it if you "
         f"already know how the two connect, and that knowledge is not in evidence."
     )
+
+
+def supported_generalisation(
+    value: str, cited_text: str, allowed_values: tuple[str, ...]
+) -> str | None:
+    """The same value with the unsupported part removed, if the evidence has it.
+
+    MP-000041 proposed Material = `100% Polyester` citing a tag that reads
+    "Polyester". Refusing that is right -- "100%" is a composition claim and
+    nothing observed it -- but the aspect was answerable all along, and instead a
+    person was asked and typed "recycled origin", which is worse than the value
+    the machine already had.
+
+    Strictly narrower, never a different value: the fallback has to be an allowed
+    value that the proposal *contains* and that the cited evidence names. So
+    `100% Polyester` may fall back to `Polyester`, and `Gray` may not fall back
+    to `Black` -- that is a swap, and `detect_value_substitution` is right to
+    refuse it rather than quietly answer a different question.
+
+    The longest such value wins, so `Full Grain Leather` prefers `Grain Leather`
+    over `Leather` when the evidence supports both.
+    """
+    if not allowed_values:
+        return None
+    proposed = value.casefold()
+    weaker = [
+        allowed for allowed in allowed_values
+        if allowed.casefold() != proposed
+        and allowed.casefold() in proposed
+        and value_appears_in(allowed, cited_text)
+    ]
+    if not weaker:
+        return None
+    return max(weaker, key=len)
 
 
 def missing_synonyms(cited_text: str, allowed_values: tuple[str, ...],

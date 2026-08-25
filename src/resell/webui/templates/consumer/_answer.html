@@ -1,0 +1,81 @@
+{# One question at a time, answered by tapping rather than typing.
+
+   The operator's form for this shows eBay's value list, the count, and a
+   checkbox reading "not in eBay's list, and I am overriding it". All three are
+   facts about the marketplace's taxonomy; none of them helps someone who is
+   looking at the object. So the same values become chips.
+
+   "None of these" is a chip too, and that is the fix rather than the styling: it
+   used to be a checkbox under the row, and someone whose answer was not on the
+   list did not realise there was another way to answer. It is one of the
+   choices because it is one of the choices.
+
+   What does not change: the value posted is still one string on a field named
+   `answer`, `value_not_listed` is still a separate explicit flag, and
+   `Gateway.answer_question` still validates against `allowed_values` where the
+   marketplace binds them. Only the first question is shown -- one decision at a
+   time is the whole design, and the rest come back round as their own screens. #}
+{% set question = task.questions[0] %}
+{# One short line, built from the aspect's name by `question_prompt` -- never the
+   operator's question, which explains *why* the agent could not settle it.
+   "Nothing observed supports a value for Material. Can you supply it, or point
+   to where on the item it appears?" is a good sentence on /ops and three lines
+   of preamble in front of the object. The instruction is the same either way:
+   look at the thing and say. #}
+<div class="c-scroll"><p class="c-question-text">{{ question | ask }}</p></div>
+
+<form method="post" action="{{ url_for('answer', question_id=question.id) }}"
+      class="c-answer" data-long>
+  <input type="hidden" name="sku" value="{{ question.sku }}">
+  <input type="hidden" name="next" value="item">
+
+  {% if question.choices %}
+    <div class="c-chips c-scroll">
+      {% for value in question.choices[:8] %}
+        <button type="submit" name="answer" value="{{ value }}"
+                class="c-chip {{ 'is-suggested' if value in (question.resolved_value or []) or value == question.suggested_answer | default('') }}"
+                data-busy="…">{{ value }}</button>
+      {% endfor %}
+      {# Same shape, same weight, last in the row. #}
+      <button type="button" class="c-chip c-chip-other" data-reveals="c-other">
+        None of these
+      </button>
+    </div>
+
+    {# `disabled` matters, and is not decoration. A hidden-but-enabled text box
+       would submit a second, empty `answer` alongside the chip that was tapped,
+       and the route would have two values where the operator form guarantees
+       one. Disabled controls are not submitted at all. #}
+    <div class="c-other c-pinned" hidden>
+      <label class="c-field">
+        <span class="c-field-name">{{ question | ask_typed }}</span>
+        <input type="text" name="answer" inputmode="text" autocomplete="off"
+               autocapitalize="words" enterkeyhint="send" disabled>
+      </label>
+      {% if question.allowed_values %}
+        {# Genuinely constrained: the marketplace checks this one, so the flag
+           goes on the record and the validation is left exactly as it was. The
+           sentence that used to explain that is gone -- a seller finds out by
+           being told the answer was not accepted, which is one message instead
+           of a caveat on every attempt, most of which are fine. #}
+        <input type="hidden" name="value_not_listed" value="1" disabled>
+      {% endif %}
+      <button type="submit" class="c-big-button" data-busy="One moment…">
+        Continue
+      </button>
+    </div>
+  {% else %}
+    <div class="c-typed c-pinned">
+      <input type="text" name="answer" required autocomplete="off"
+             autocapitalize="words" enterkeyhint="send"
+             value="{{ question.resolved_value | join(', ') if question.resolved_value else '' }}"
+             placeholder="Type your answer">
+      <button type="submit" class="c-big-button" data-busy="One moment…">
+        Continue
+      </button>
+    </div>
+  {% endif %}
+</form>
+
+{# The count lives in the heading now -- "We need 3 more details" -- so saying
+   it again down here was the same fact twice on a screen with room for one. #}

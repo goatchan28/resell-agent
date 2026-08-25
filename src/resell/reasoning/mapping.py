@@ -255,7 +255,13 @@ def map_aspects(
     # Before resolving, two checks on the citations themselves. Both must happen
     # here rather than at publish: by then a bad citation has been approved and
     # looks like a decision.
-    from resell.reasoning.gaps import detect_uncited_value, detect_value_substitution
+    from dataclasses import replace
+
+    from resell.reasoning.gaps import (
+        detect_uncited_value,
+        detect_value_substitution,
+        supported_generalisation,
+    )
 
     allowed_by_aspect = {spec.name: spec.allowed_values for spec in specs}
     # Everything a candidate is allowed to cite, so a citation check can read what
@@ -303,6 +309,26 @@ def map_aspects(
                 name, candidate.value, cited_text, allowed_by_aspect.get(name, ())
             )
             if swap:
+                # Before the refusal costs someone a question: is there a weaker
+                # version of this same value that the evidence does support?
+                #
+                # MP-000041 proposed `100% Polyester` from a tag reading
+                # "Polyester". Refusing the composition claim is right; asking a
+                # person for a value already sitting in the citation is not, and
+                # the person answered "recycled origin", which is worse than what
+                # was refused. Narrowing is never a different value -- see
+                # `supported_generalisation` -- so `Gray` still cannot become
+                # `Black` this way.
+                weaker = supported_generalisation(
+                    candidate.value, cited_text, allowed_by_aspect.get(name, ())
+                )
+                if weaker:
+                    proposal.malformed.append(
+                        f"{name}: {candidate.value!r} narrowed to {weaker!r}, which "
+                        f"is what the cited evidence supports"
+                    )
+                    kept.append(replace(candidate, value=weaker))
+                    continue
                 proposal.malformed.append(swap)
                 continue
             kept.append(candidate)

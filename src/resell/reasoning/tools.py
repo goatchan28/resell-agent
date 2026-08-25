@@ -1546,9 +1546,12 @@ COMP_JUDGE_TOOL_SCHEMA: dict[str, Any] = {
                             "description": (
                                 "same_product: the identical product. "
                                 "same_family_variant: same line, different variant. "
-                                "category_attribute: same kind of thing. "
+                                "category_attribute: same kind of thing, including a "
+                                "sibling -- same brand and material, different fit or "
+                                "sub-line. "
                                 "superficial: merely resembles it. "
-                                "excluded: must not count, and say why."
+                                "excluded: a different object entirely -- other "
+                                "material, bundle, accessory, part, lot. Say why."
                             ),
                         },
                         "item_evidence_ids": {
@@ -1570,7 +1573,13 @@ COMP_JUDGE_TOOL_SCHEMA: dict[str, Any] = {
                         "rationale": {"type": "string"},
                         "excluded_reason": {
                             "type": "string",
-                            "description": "Required when comparability is excluded.",
+                            "description": (
+                                "Required when comparability is excluded, and the "
+                                "judgement is discarded without it -- so the listing "
+                                "ends up neither counted nor explained. One short "
+                                "phrase: what the extra item was, which cloth it is, "
+                                "what kind of thing it turned out to be."
+                            ),
                         },
                     },
                     "required": ["comp_id", "comparability", "item_evidence_ids",

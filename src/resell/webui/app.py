@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from uuid import uuid4
 
 from flask import (
     Flask,
@@ -76,6 +77,23 @@ def create_app(*, config=None) -> Flask:
     app.jinja_env.filters["shorten"] = _shorten
     app.jinja_env.filters["micros"] = _micros
 
+    # Only the consumer templates call this. The operator UI keeps the messages
+    # the handlers actually wrote, SKU and all, because that is what makes them
+    # useful when something has gone wrong.
+    app.jinja_env.globals["seller_flashes"] = _seller_flashes
+
+    # The same split for the questions themselves. /ops renders `q.question`,
+    # which says why the identification run could not settle the aspect and is
+    # what a person diagnosing that run needs; the consumer screen renders this,
+    # which is derived from the aspect name and says only what to do.
+    app.jinja_env.filters["ask"] = views_consumer.question_prompt
+    app.jinja_env.filters["ask_typed"] = views_consumer.question_entry_label
+
+    # Turns a dataclass into a plain dict of the named fields, for embedding as
+    # JSON. Explicit fields rather than `__dict__` so a template cannot leak a
+    # value simply because someone added it to the projection later.
+    app.jinja_env.filters["mapping"] = _mapping
+
     @app.before_request
     def _open_database() -> None:
         g.config = app.config["RESELL_CONFIG"] or load_config(require_credentials=False)
@@ -114,36 +132,31 @@ def _register_routes(app: Flask) -> None:
 
     @app.get("/")
     def home():
-        """Whatever needs doing next, and nothing else.
+        """The one item being sold, or the way to start one.
 
-        One item at a time is the whole design: a seller with four items in
-        flight wants to know which one wants them, not to read four status
-        reports. Items the agent is still working on appear as a quiet line.
+        Strictly one at a time. A seller is not running a queue; they have a thing
+        they want to sell, and until it is listed or set aside it is *the* thing.
+        Which item that is comes from `active_sku`, derived from the rows below --
+        there is no active-item state in the database and this does not add one.
+
+        When something is active the upload control is not rendered at all. That
+        is the requirement, and it is presentation only: `create_item` is shared
+        with the operator UI, whose own intake form is unaffected.
         """
         rows = views.inventory(
             g.conn, marketplace=g.config.marketplace_id,
             environment=g.config.env.name,
         )
-        waiting = [r for r in rows if r.actor == "operator"]
-        working = [r for r in rows if r.actor == "agent"]
-        tasks = [views_consumer.task_view(_workflow(r.sku)) for r in waiting]
-        return render_template(
-            "consumer/home.html",
-            tasks=tasks,
-            working=views_consumer.shelf_rows(working, net_of=_net_of),
-            forms={t.sku: _correction_form(t.sku) for t in tasks},
-            run=_run_in_view([r.sku for r in rows]),
-        )
+        sku = views_consumer.active_sku(rows)
+        if sku is None:
+            return render_template("consumer/workspace.html", task=None, run=None)
+        return _workspace(sku)
 
     @app.get("/items/<sku>")
     def item(sku: str):
-        """One item's task, on its own."""
+        """One item's workspace, reached from Your items or after an action."""
         _require_item(sku)
-        task = views_consumer.task_view(_workflow(sku))
-        return render_template(
-            "consumer/home.html", tasks=[task], working=[],
-            forms={sku: _correction_form(sku)}, run=_run_in_view([sku]),
-        )
+        return _workspace(sku)
 
     @app.get("/items")
     def shelf():
@@ -311,6 +324,12 @@ def _register_routes(app: Flask) -> None:
             "running": view.running,
             "current": view.current,
             "elapsed_ms": view.elapsed_ms,
+            # When the run began, so a page opened part-way through can show how
+            # long it has actually been going rather than how long it has been
+            # watched. `elapsed_ms` cannot do this job: it is the last *recorded
+            # step's* elapsed, so it stands still during a long step and a clock
+            # synced to it would tick backwards.
+            "started_at": view.started_at,
             "problems": list(view.problems),
             "steps": [
                 {"phase": s.phase, "message": s.message,
@@ -728,6 +747,41 @@ def _register_routes(app: Flask) -> None:
 # --- helpers -----------------------------------------------------------------
 
 
+def _mapping(obj, *fields: str) -> dict:
+    return {name: getattr(obj, name) for name in fields}
+
+
+def _seller_flashes() -> list[tuple[str, str]]:
+    """Flashed messages, translated for the seller and with the mute list applied."""
+    from flask import get_flashed_messages
+
+    out = []
+    for category, message in get_flashed_messages(with_categories=True):
+        text = views_consumer.seller_flash(message, category)
+        if text:
+            out.append((category, text))
+    return out
+
+
+def _workspace(sku: str):
+    """Render one item's workspace. The only consumer page with an item on it.
+
+    The correction form is built only when the screen can show it. That is not
+    just tidiness: `correction_form` fetches eBay's condition list for the
+    category, so on a question screen -- which does not offer corrections -- it
+    was a network round trip per page load for a form nobody would see.
+    """
+    task = views_consumer.task_view(_workflow(sku))
+    shows_more = not task.is_done and not task.active_run \
+        and task.action != "answer_questions"
+    return render_template(
+        "consumer/workspace.html",
+        task=task,
+        form=_correction_form(sku) if shows_more else None,
+        run=_run_in_view([sku]),
+    )
+
+
 def _busy(sku: str) -> str | None:
     """The run holding this item, if one is. Routes that change state ask first.
 
@@ -737,6 +791,25 @@ def _busy(sku: str) -> str | None:
     under itself.
     """
     return runs.active_run_for(g.conn, sku)
+
+
+# What the seller is told when a stage will not complete. One line per stage, in
+# the language of the thing being attempted: the technical reason is kept on the
+# run record and shown under /ops, where it is useful.
+BLOCKED_SAYS: dict[str, str] = {
+    "observe": "We could not read the photos.",
+    "suggest_category": "We could not work out what kind of thing this is.",
+    "research_identity": "We could not work out what this is.",
+    "map_aspects": "We could not fill in the details.",
+    "grade_condition": "We could not judge the condition.",
+    "draft": "We could not write the listing.",
+    "comp_research": "We could not find prices for this.",
+    "propose_listing": "We could not put the listing together.",
+}
+
+
+def blocked_message(step) -> str:
+    return BLOCKED_SAYS.get(str(step), "We got stuck on this one.")
 
 
 def _start_agent(sku: str) -> tuple[str, bool]:
@@ -763,6 +836,17 @@ def _start_agent(sku: str) -> tuple[str, bool]:
             environment=config.env.name, fees=FeeModel(),
         )
         report = advance(conn, gateway, sku, config=config)
+        if report.blocked:
+            # This line is where a handled stage failure used to become a run
+            # crash. `advance` had already caught the exception, kept the item
+            # where it was and named the step -- and then this re-raised it as a
+            # RuntimeError, which produced a stack trace, a failed run, and a
+            # screen offering "Carry on" with no hint that anything had gone
+            # wrong. Stopping cleanly says the same thing without the wreckage.
+            raise runs.Blocked(
+                blocked_message(report.blocked.step),
+                detail=report.errors[-1] if report.errors else str(report.blocked.step),
+            )
         if report.errors:
             raise RuntimeError(report.errors[0])
         if report.halts:
@@ -886,14 +970,10 @@ def _propose_price(sku: str, objective) -> str:
     request_values = views.default_pricing_request(
         g.conn, sku, marketplace=g.config.marketplace_id
     )
-    scored = sp.load_scored_comps(g.conn, sku)
-    rec = recommend(PricingInput(
-        sku=sku,
-        item_condition_band=_band(request_values.condition_band),
-        identity_resolution=request_values.identity_resolution,
-        comps=tuple(scored),
-        window_days=request_values.window_days,
-    ))
+    # The same assembly the screen used. Building a second one here is how the
+    # displayed price and the approved price came apart -- see `views.pricing_input`.
+    built, scored = views.pricing_input(g.conn, sku, request_values)
+    rec = recommend(built)
     if rec.unpriceable:
         raise ValueError(f"unpriceable: {rec.reason}")
 
@@ -1006,6 +1086,21 @@ def _now():
 
 
 def _attach_uploads(sku: str, uploads) -> tuple[int, list[str]]:
+    """Save each upload under a name taken from its content, then attach it.
+
+    Not under the name the browser sent. iOS calls every camera capture
+    `image.jpg`, so three photos taken in one go all arrived as `image.jpg` and
+    each save overwrote the last. That left three rows in the photo table, one
+    file on disk, and a recorded digest for the first two describing bytes that
+    no longer existed anywhere. Nothing noticed until publish, where the
+    integrity check compares each file against the hash the approval covers and
+    refused -- correctly, and far too late for the photographs to be recovered.
+
+    A content-addressed name cannot collide, and re-uploading a file the item
+    already has lands on the same path rather than making a second copy. The
+    staging name is random so that two uploads racing on the same digest cannot
+    read a half-written file.
+    """
     directory = Path(g.config.db_path).parent / "uploads" / sku
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -1014,10 +1109,22 @@ def _attach_uploads(sku: str, uploads) -> tuple[int, list[str]]:
         name = Path(upload.filename or "").name
         if not name:
             continue
-        destination = directory / name
-        upload.save(destination)
-        facts = inspect(destination)
-        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        staged = directory / f".incoming-{uuid4().hex}"
+        upload.save(staged)
+        digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+        # Extension from the sniffed format, not from the name the browser sent.
+        # Safari calls a HEIC capture `image.jpg`, and a file holding HEIC bytes
+        # under a .jpg extension is mislabelled to everything downstream that
+        # trusts the extension -- `send_file` guesses its Content-Type that way.
+        facts = inspect(staged)
+        suffix = f".{facts.image_format}" if facts.image_format else (
+            Path(name).suffix.lower() or ".bin"
+        )
+        destination = directory / f"{digest[:16]}{suffix}"
+        if destination.exists():
+            staged.unlink()
+        else:
+            staged.replace(destination)
         try:
             g.gateway.attach_photo(
                 sku, source_path=str(destination.resolve()),

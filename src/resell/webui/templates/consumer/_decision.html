@@ -1,0 +1,47 @@
+{# The one thing being asked, and nothing else on the screen.
+
+   The branches key off `task.action`, which is the orchestrator's own step name
+   carried as an identifier and never rendered. That is what keeps this a
+   presentation layer: `next_step` decided what comes next before this template
+   ran, and this only chooses the words. #}
+{% if task.action == 'approve_listing' %}
+  {# Not a card. The final review is a page, and it carries its own heading. #}
+  {% include "consumer/_review.html" %}
+{% else %}
+<section class="c-ask">
+  <h2 class="c-question">{{ task.headline }}</h2>
+  {% if task.hint %}<p class="c-sub">{{ task.hint }}</p>{% endif %}
+
+  {% if task.action == 'answer_questions' %}
+    {% include "consumer/_answer.html" %}
+
+  {% elif task.action == 'confirm_identity' %}
+    {% include "consumer/_confirm.html" %}
+
+  {% elif task.action == 'review_comps' %}
+    {% include "consumer/_comps.html" %}
+
+  {% elif task.action == 'approve_price' and task.has_price %}
+    {% include "consumer/_price.html" %}
+
+  {% elif task.action in ('approve_price', 'price_without_comps') %}
+    {# `approve_price` with no options reaches here. A screen that asks for a
+       decision must always offer one, so it falls through to typing a price
+       rather than rendering an empty heading. #}
+    {% if task.action == 'approve_price' %}
+      <p class="c-sub">We could not work out a price from what we found. You can
+        set one yourself.</p>
+    {% endif %}
+    {% include "consumer/_set_price.html" %}
+
+  {% elif task.action == 'publish' %}
+    {% include "consumer/_publish.html" %}
+
+  {% elif task.action == 'attach_photos' %}
+    {% with action = url_for('add_photos', sku=task.sku),
+            pick_label = 'Take or choose photos', submit_label = 'Add these' %}
+      {% include "consumer/_photo_picker.html" %}
+    {% endwith %}
+  {% endif %}
+</section>
+{% endif %}

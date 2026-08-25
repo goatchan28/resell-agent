@@ -22,6 +22,18 @@ from typing import Any
 # executescript() issues an implicit COMMIT before it runs, which would silently
 # end the surrounding transaction and leave a half-applied migration if a later
 # statement failed.
+# A migration whose first statement is this marker runs outside a transaction.
+#
+# Almost none should. The one that does rebuilds a table another table points at,
+# and the only way to do that safely is `PRAGMA foreign_keys = OFF` -- which
+# SQLite silently ignores inside a transaction, and whose in-transaction
+# substitute (`defer_foreign_keys`) leaves the deferred-violation counter tripped
+# by the DROP even when `foreign_key_check` reports the database clean. The
+# documented recipe is to turn enforcement off around the whole rebuild, so this
+# says so out loud rather than hiding a pragma that quietly does nothing.
+NO_TRANSACTION = "-- outside a transaction"
+
+
 MIGRATIONS: tuple[tuple[str, ...], ...] = (
     # 1 -- credentials and the audit log
     (
@@ -589,7 +601,8 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         CREATE TABLE agent_run (
             run_id      TEXT PRIMARY KEY,
             sku         TEXT NOT NULL REFERENCES item(sku),
-            status      TEXT NOT NULL CHECK (status IN ('running','done','failed')),
+            status      TEXT NOT NULL
+                CHECK (status IN ('running','done','failed','blocked')),
             started_at  TEXT NOT NULL,
             finished_at TEXT,
             detail      TEXT NOT NULL DEFAULT ''
@@ -608,6 +621,49 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         """,
         "CREATE INDEX idx_run_step ON agent_run_step (run_id, id)",
         "CREATE INDEX idx_run_sku ON agent_run (sku, started_at)",
+    ),
+    # `blocked`: a required stage did not complete and the run stopped cleanly.
+    # Distinct from `failed`, which is for something nobody planned for -- the
+    # difference is whether pressing the button again is a reasonable thing to
+    # offer, and it is only reasonable for the first.
+    #
+    # SQLite cannot widen a CHECK constraint in place, so the table is rebuilt --
+    # and `agent_run_step` points at it, so enforcement has to be off across the
+    # swap. See NO_TRANSACTION below for why that cannot happen inside one.
+    (
+        NO_TRANSACTION,
+        "PRAGMA foreign_keys = OFF",
+        "BEGIN IMMEDIATE",
+        """
+        CREATE TABLE agent_run_new (
+            run_id      TEXT PRIMARY KEY,
+            sku         TEXT NOT NULL REFERENCES item(sku),
+            status      TEXT NOT NULL
+                CHECK (status IN ('running','done','failed','blocked')),
+            started_at  TEXT NOT NULL,
+            finished_at TEXT,
+            detail      TEXT NOT NULL DEFAULT ''
+        )
+        """,
+        "INSERT INTO agent_run_new SELECT run_id, sku, status, started_at, "
+        "finished_at, detail FROM agent_run",
+        "DROP TABLE agent_run",
+        "ALTER TABLE agent_run_new RENAME TO agent_run",
+        "CREATE INDEX idx_run_sku ON agent_run (sku, started_at)",
+        "COMMIT",
+        "PRAGMA foreign_keys = ON",
+    ),
+    # eBay's own path to the chosen category, e.g.
+    #   "Clothing, Shoes & Accessories > Men > Men's Bags > Backpacks"
+    #
+    # The taxonomy already returns it and `suggest_categories` already builds the
+    # string; nothing kept it, so an item knew it was category 260988 and nothing
+    # more. What that costs: how much of its retail price a thing keeps when it is
+    # resold depends enormously on what kind of thing it is, and the top level of
+    # this path is the most defensible answer to that question available -- eBay's
+    # own grouping rather than one we invented.
+    (
+        "ALTER TABLE identification ADD COLUMN category_path TEXT",
     ),
 )
 
@@ -643,9 +699,17 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     for index, statements in enumerate(MIGRATIONS[version:], start=version + 1):
+        if statements and statements[0] == NO_TRANSACTION:
+            for statement in statements[1:]:
+                conn.execute(statement)
+            conn.execute(f"PRAGMA user_version = {index}")
+            continue
         with transaction(conn):
             for statement in statements:
                 conn.execute(statement)

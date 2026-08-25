@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+from dataclasses import replace
 import sys
 import uuid
 from collections.abc import Callable
@@ -155,19 +156,25 @@ def cmd_claim(args, conn: sqlite3.Connection) -> int:
 
 
 def _build(args, conn: sqlite3.Connection):
-    scored = sp.load_scored_comps(conn, args.sku)
-    retail = tuple(
-        RetailReference(price_cents=c, kind=RetailKind(args.retail_kind or "retail_original"))
-        for c in (args.retail_cents or [])
-    )
-    return recommend(PricingInput(
-        sku=args.sku,
-        item_condition_band=ConditionBand(args.condition_band),
+    """Through `views.pricing_input`, so the CLI and the UI price identically.
+
+    The category path is read from the record rather than taken as a flag: it is
+    eBay's own path, chosen at identification, and it selects the retention rate
+    an anchored price is reasoned down with. Typing it by hand would be a second
+    opinion about a fact the record already holds.
+    """
+    from resell import views
+
+    request = replace(
+        views.default_pricing_request(conn, args.sku, marketplace=args.marketplace),
+        condition_band=args.condition_band,
         identity_resolution=args.identity_resolution,
-        comps=tuple(scored),
-        retail=retail,
         window_days=args.window_days,
-    )), scored
+        retail_cents=tuple(args.retail_cents or ()),
+        retail_kind=args.retail_kind,
+    )
+    built, scored = views.pricing_input(conn, args.sku, request)
+    return recommend(built), scored
 
 
 def _brand(args) -> BrandSignal:

@@ -1037,24 +1037,30 @@ def test_a_budget_stop_mid_round_keeps_what_was_already_extracted(tmp_path):
         ],
     }
     model = CompModel(plan, [SOLD], [])
+    from resell.reasoning.comp_loop import EXTRACT_PER_ROUND
+
     adapter = SuppliedUrlsMarketplaceAdapter(
-        ["https://poshmark.com/a", "https://poshmark.com/b", "https://poshmark.com/c"],
+        [f"https://poshmark.com/{n}" for n in range(EXTRACT_PER_ROUND + 3)],
         fetcher=PageFetcher(client=FakeClient(FakeResponse(BODY)), respect_robots=False),
         echo=lambda *a: None,
+        max_urls=EXTRACT_PER_ROUND + 3,
     )
     _ACTIVE_CONN["conn"] = conn
-    # Two calls: one plan, one extraction. The second extraction is refused, which
-    # is what used to destroy the round.
+    # Stopped on breadth, which is what now bounds a round in flight. The call cap
+    # used to do this and no longer can: it counts rounds, because a round makes
+    # as many extraction calls as the search engine returns pages. Money still
+    # bounds the item, but with equal-cost calls it either refuses the first or
+    # allows them all -- it cannot express "this far and no further".
     outcome = run_comp_round(
         conn, gateway, sku, model_adapter=model, research_adapter=adapter,
-        stage_budget=StageBudget(max_calls=2, max_cost_micros=9_000_000),
+        stage_budget=StageBudget(max_calls=9, max_cost_micros=9_000_000),
         lookup_budget=LookupBudget(scope="pricing", max_lookups=9),
         propose_only=True,
     )
 
     assert outcome.stopped_early
     assert outcome.comps_recorded > 0, "the round discarded what it had already read"
-    assert any("extraction stopped" in n for n in outcome.notes)
+    assert any("stopped extracting" in n for n in outcome.notes)
     assert conn.execute("SELECT COUNT(*) FROM comp_observation").fetchone()[0] > 0
 
 
@@ -1089,21 +1095,25 @@ def test_it_stops_searching_once_it_cannot_read_what_it_finds(tmp_path):
             return 0
 
         def search(self, query):
+            slug = query.query.replace(" ", "-")
             return [MarketplaceDocument(
-                url=f"https://poshmark.com/{query.query.replace(' ', '-')}",
+                url=f"https://poshmark.com/{slug}-{n}",
                 marketplace="poshmark.com", authority=SourceAuthority.RESELLER,
                 page_text=BODY.decode(), title="listings",
-            )]
+            ) for n in range(3)]
 
     model = CompModel(plan, [SOLD], [])
     _ACTIVE_CONN["conn"] = conn
+    # Stopped on breadth now rather than on the call cap: a round may extract
+    # from EXTRACT_PER_ROUND pages, and past that another query buys pages
+    # nothing is going to read.
     outcome = run_comp_round(
         conn, gateway, sku, model_adapter=model, research_adapter=EndlessPages(),
-        stage_budget=StageBudget(max_calls=2, max_cost_micros=9_000_000),
+        stage_budget=StageBudget(max_calls=9, max_cost_micros=9_000_000),
         lookup_budget=LookupBudget(scope="pricing", max_lookups=9),
         propose_only=True,
     )
-    assert len(outcome.performed) < 5, "kept searching for pages it could not read"
+    assert len(outcome.performed) < 9, "kept searching for pages it could not read"
     assert any("stopped searching" in n for n in outcome.notes)
 
 

@@ -1,38 +1,292 @@
-{# The seller's chrome. No environment badge, no marketplace id, no SKU: those
-   are facts about the system, and this screen is about their things. #}
+{# The seller's chrome, built for a phone held in one hand.
+
+   No environment badge, no marketplace id, no SKU: those are facts about the
+   system, and this screen is about their thing. The only navigation is Your
+   items, because there is only one other place to be.
+
+   `viewport-fit=cover` plus the safe-area insets in the stylesheet are what keep
+   the bottom action bar clear of the iPhone home indicator. Without them a
+   primary button sits underneath it and is unpressable. #}
 <!doctype html>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f7f7f5">
+{# Standalone mode, for a seller who adds this to their home screen. #}
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <title>{% block title %}Sell{% endblock %}</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='consumer.css') }}">
+
+{# `c-fixed` is the one-screen shell: the page is exactly one viewport tall and
+   never scrolls, and anything that will not fit gets a scrolling region of its
+   own inside a card. Your items overrides this with `c-scrolls`, because an
+   inventory is a list and a list is allowed to be longer than a screen. #}
+<body class="{% block body_class %}c-fixed{% endblock %}">
+
 <header class="c-top">
-  {# The brand is the way home, so a "Next" link beside it went where the word
-     next to it already went. Two controls for one destination is one too many. #}
   <a class="c-brand" href="{{ url_for('home') }}">Sell</a>
-  <nav>
-    <a href="{{ url_for('shelf') }}">Your items</a>
-  </nav>
+  <a class="c-nav" href="{{ url_for('shelf') }}">Your items</a>
 </header>
+
 <main class="c-main">
-  {% with messages = get_flashed_messages(with_categories=true) %}
-    {% if messages %}
-      <ul class="flashes">
-        {% for category, message in messages %}
-          <li class="flash flash-{{ category }}">{{ message }}</li>
-        {% endfor %}
-      </ul>
-    {% endif %}
-  {% endwith %}
+  {# Translated in the projection layer, not here: the shared POST handlers keep
+     the wording the operator UI needs, and `seller_flashes` turns it into the
+     seller's. A message that is purely an operator instruction is dropped. #}
+  {% set notes = seller_flashes() %}
+  {% if notes %}
+    <ul class="flashes">
+      {% for category, text in notes %}
+        <li class="flash flash-{{ category }}">{{ text }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
   {% block content %}{% endblock %}
 </main>
+
 <script>
+// The shell follows the visual viewport while a keyboard is up.
+//
+// `100svh` is the viewport with the browser's chrome fully expanded, and that
+// is all it knows about -- iOS does not resize the layout viewport for the
+// software keyboard, it just covers the bottom of the page with it. On a
+// question with a text box that put Continue 45px below the fold, on a page
+// whose whole point is that it does not scroll. Nothing was broken server-side;
+// the button simply could not be reached.
+(function () {
+  var vv = window.visualViewport;
+  if (!vv) return;
+  var root = document.documentElement;
+
+  function fit() {
+    // Only while something is genuinely covering the page. Tracking it always
+    // would fight Safari's own chrome animation, which is the reason this
+    // layout uses `svh` and not `dvh` in the first place.
+    var covered = window.innerHeight - vv.height;
+    if (covered > 120) {
+      root.style.setProperty("--shell", vv.height + "px");
+    } else {
+      root.style.removeProperty("--shell");
+    }
+  }
+  vv.addEventListener("resize", fit);
+  vv.addEventListener("scroll", fit);
+  document.addEventListener("focusout", function () { setTimeout(fit, 50); });
+})();
+
+// Every form that starts real work is marked `data-long`. Disabling on submit is
+// the double-tap guard: on a phone a primary button is easy to hit twice, and the
+// second tap used to start a second run.
+//
+// The submitter's own name and value have to be copied out first. A form's entry
+// list is built *after* the submit event, and disabled controls are excluded from
+// it -- so disabling the button that was pressed silently dropped its value. The
+// answer chips are `<button name="answer" value="...">`, which meant tapping one
+// posted no answer at all. Typing an answer worked, because that value comes from
+// an <input> and the guard only touches buttons.
 document.addEventListener("submit", function (event) {
   var form = event.target;
   if (!form.matches("[data-long]")) return;
+
+  var pressed = event.submitter ||
+    (form.contains(document.activeElement) ? document.activeElement : null);
+  if (pressed && pressed.name && !form.querySelector('[data-submitter-value]')) {
+    var carried = document.createElement("input");
+    carried.type = "hidden";
+    carried.name = pressed.name;
+    carried.value = pressed.value;
+    carried.setAttribute("data-submitter-value", "");
+    form.appendChild(carried);
+  }
+
   Array.prototype.forEach.call(form.querySelectorAll("button"), function (b) {
     b.disabled = true;
     if (b.dataset.busy) { b.textContent = b.dataset.busy; }
   });
 }, true);
+
+// "None of these" reveals the text field and enables it. Enabling is the point:
+// see the comment in _answer.html -- a hidden enabled input submits an empty
+// second value under the same name.
+document.addEventListener("click", function (event) {
+  var trigger = event.target.closest("[data-reveals]");
+  if (!trigger) return;
+  var panel = trigger.form && trigger.form.querySelector("." + trigger.dataset.reveals);
+  if (!panel) return;
+  panel.hidden = false;
+  trigger.hidden = true;
+  // Enabling is the point: see the comment in _answer.html -- a hidden but
+  // enabled input submits an empty second value under the same name.
+  panel.querySelectorAll("input, textarea").forEach(function (field) {
+    field.disabled = false;
+  });
+  var first = panel.querySelector("input[type=text]");
+  if (first) { first.focus(); }
+}, false);
+
+// Photos are shrunk in the browser before they are sent, then accumulate across
+// selections instead of replacing each other.
+//
+// Two things were making a library upload slow. Safari hands back what the
+// library holds -- 5712x4284, 24.5 megapixels, about 5 MB each -- while a photo
+// taken through the same control comes back at 4032x3024 and under 2 MB. Pick
+// four from the library and that is 17.6 MB on the wire where a single capture
+// was 1.8 MB. The server's share of that request is 10 ms; the rest is a phone
+// pushing bytes over Wi-Fi.
+//
+// Nothing downstream wants those pixels. The model sees 1568px. eBay asks for
+// 1600px on the longest side for zoom. 2048px clears both, and on the measured
+// batch it turns 17.6 MB into 3.3 MB.
+//
+// The trade, stated plainly: the file kept on disk is the 2048px one. The
+// original stays in the phone's library and is not uploaded.
+(function () {
+  var MAX_EDGE = 2048;      // above eBay's 1600 and the model's 1568
+  var QUALITY = 0.85;
+  var SKIP_UNDER = 900 * 1024;   // already small enough to be not worth re-encoding
+  var kept = new WeakMap();
+
+  function keyOf(file) {
+    return file.name + ":" + file.size + ":" + file.lastModified;
+  }
+
+  // `imageOrientation: "from-image"` is what keeps a portrait photo portrait: a
+  // canvas draw otherwise ignores the EXIF rotation and every upright picture
+  // arrives on its side. Where `createImageBitmap` is missing the original file
+  // is sent untouched -- a slow upload is a far better failure than a sideways
+  // photograph.
+  function shrink(file) {
+    if (!file.type || file.type.indexOf("image/") !== 0) return Promise.resolve(file);
+    if (file.size < SKIP_UNDER) return Promise.resolve(file);
+    if (typeof createImageBitmap !== "function") return Promise.resolve(file);
+
+    return createImageBitmap(file, {imageOrientation: "from-image"})
+      .then(function (bitmap) {
+        var longest = Math.max(bitmap.width, bitmap.height);
+        if (longest <= MAX_EDGE) { bitmap.close && bitmap.close(); return file; }
+        var scale = MAX_EDGE / longest;
+        var canvas = document.createElement("canvas");
+        canvas.width = Math.round(bitmap.width * scale);
+        canvas.height = Math.round(bitmap.height * scale);
+        canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close && bitmap.close();
+        return new Promise(function (resolve) {
+          canvas.toBlob(function (blob) {
+            // Anything unexpected and the original goes instead. Sending more
+            // bytes is recoverable; sending a broken photo is not.
+            if (!blob || blob.size >= file.size) { resolve(file); return; }
+            resolve(new File([blob], file.name.replace(/\.[^.]+$/, "") + ".jpg",
+                             {type: "image/jpeg", lastModified: file.lastModified}));
+          }, "image/jpeg", QUALITY);
+        });
+      })
+      .catch(function () { return file; });
+  }
+
+  function merge(input, files) {
+    if (typeof DataTransfer === "undefined") return input.files;
+    var bag = new DataTransfer();
+    (kept.get(input) || []).concat(files).forEach(function (f) { bag.items.add(f); });
+    kept.set(input, Array.prototype.slice.call(bag.files));
+    input.files = bag.files;
+    return bag.files;
+  }
+
+  function paint(form, files) {
+    var panel = form.querySelector(".c-picked");
+    var thumbs = form.querySelector("[data-thumbs]");
+    var count = form.querySelector("[data-count]");
+    var label = form.querySelector("[data-picker-label]");
+    if (panel) { panel.hidden = false; }
+    if (label) { label.textContent = "Add more photos"; }
+    document.querySelectorAll("[data-hide-when-picked]").forEach(function (el) {
+      el.hidden = true;
+    });
+    if (thumbs) {
+      thumbs.innerHTML = "";
+      Array.prototype.forEach.call(files, function (file) {
+        var li = document.createElement("li");
+        var img = document.createElement("img");
+        img.alt = "";
+        img.src = URL.createObjectURL(file);
+        img.onload = function () { URL.revokeObjectURL(img.src); };
+        li.appendChild(img);
+        thumbs.appendChild(li);
+      });
+    }
+    if (count) {
+      count.textContent = files.length === 1 ? "1 photo" : files.length + " photos";
+    }
+  }
+
+  document.addEventListener("change", function (event) {
+    var input = event.target;
+    if (!input.matches("input[type=file][data-accumulate]")) return;
+    if (!input.files || !input.files.length) return;
+
+    var form = input.form;
+    var submit = form.querySelector("button[type=submit]");
+    // Re-picking the same photo from the library is not a second photo, and the
+    // check has to happen on the file as chosen: shrinking changes its size.
+    var seen = {};
+    (kept.get(input) || []).forEach(function (f) { seen[f.originalKey || keyOf(f)] = true; });
+    var fresh = Array.prototype.slice.call(input.files).filter(function (f) {
+      var k = keyOf(f);
+      if (seen[k]) return false;
+      seen[k] = true;
+      f.pickedKey = k;
+      return true;
+    });
+    if (!fresh.length) { paint(form, kept.get(input) || input.files); return; }
+
+    // Said on the control the seller just pressed, not on the Start button --
+    // Start lives in a panel that is still hidden at this point, so a label
+    // changed there would announce the wait to nobody. Four 24-megapixel photos
+    // take a couple of seconds to decode and re-encode, and silence for two
+    // seconds after a tap reads as a dropped tap.
+    var label = form.querySelector("[data-picker-label]");
+    var before = label ? label.textContent : "";
+    if (label) { label.textContent = "Preparing photos…"; }
+    if (submit) { submit.disabled = true; }
+    input.disabled = true;
+
+    function restore() {
+      // A disabled file input is not submitted at all, so whatever happens the
+      // control has to come back. Leaving it disabled would turn a slow resize
+      // into a Start button that uploads nothing.
+      input.disabled = false;
+      if (label) { label.textContent = before; }
+      if (submit) { submit.disabled = false; }
+    }
+
+    Promise.all(fresh.map(shrink)).then(function (ready) {
+      ready.forEach(function (f, i) { f.originalKey = fresh[i].pickedKey; });
+      restore();
+      paint(form, merge(input, ready));
+    }).catch(function () {
+      restore();
+      paint(form, merge(input, fresh));
+    });
+  }, false);
+})();
+
+// "None of these" reveals the text field and enables it. Enabling is the point:
+// see the comment in _answer.html -- a hidden enabled input submits an empty
+// second value under the same name.
+document.addEventListener("change", function (event) {
+  var box = event.target;
+  if (!box.matches("input[type=checkbox][data-reveals]")) return;
+  var panel = box.form && box.form.querySelector("." + box.dataset.reveals);
+  if (!panel) return;
+  panel.hidden = !box.checked;
+  panel.querySelectorAll("input, textarea").forEach(function (field) {
+    field.disabled = !box.checked;
+  });
+  if (box.checked) {
+    var first = panel.querySelector("input[type=text]");
+    if (first) { first.focus(); }
+  }
+}, false);
+
 </script>

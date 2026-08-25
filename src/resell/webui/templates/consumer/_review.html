@@ -1,0 +1,52 @@
+{# The finished listing, read the way a buyer will read it.
+
+   This is the one workflow screen that scrolls like a page. Everywhere else the
+   card is a fixed frame with a scrolling region inside it, which is right when
+   the screen is asking one question. It is wrong here: this is the last look at
+   what goes to eBay, and squeezing it into a box made the final check feel like
+   another small form to clear.
+
+   The photographs are shown whole, not cropped to a card. `object-fit: contain`
+   on a fixed-height strip is what does that -- every other photograph in the
+   product is `cover`, because there it is decoration and here it is the thing
+   being checked. #}
+<section class="c-listing">
+  {% if task.photo_positions %}
+    <div class="c-carousel" role="group" aria-label="Listing photos">
+      {% for position in task.photo_positions %}
+        <figure class="c-slide">
+          <img src="{{ url_for('photo', sku=task.sku, position=position) }}"
+               alt="" loading="{{ 'eager' if loop.first else 'lazy' }}">
+        </figure>
+      {% endfor %}
+    </div>
+    {% if task.photo_positions | length > 1 %}
+      <p class="c-quiet-note c-carousel-hint">
+        {{ task.photo_positions | length }} photos — swipe to see them all
+      </p>
+    {% endif %}
+  {% endif %}
+
+  <h1 class="c-listing-title">{{ task.name }}</h1>
+
+  <p class="c-listing-facts">
+    <span class="c-listing-price">{{ task.approved_price_cents | money }}</span>
+    {% if task.condition_label %}
+      <span class="c-listing-condition">{{ task.condition_label }}</span>
+    {% endif %}
+  </p>
+
+  {% if task.listing_description %}
+    <p class="c-listing-copy">{{ task.listing_description }}</p>
+  {% endif %}
+
+  <div class="c-listing-approve">
+    <form method="post" action="{{ url_for('approve_listing', sku=task.sku) }}"
+          data-long>
+      <button type="submit" class="c-big-button" data-busy="One moment…">
+        Looks good
+      </button>
+    </form>
+    <p class="c-quiet-note">Want to change the wording? It is under More below.</p>
+  </div>
+</section>

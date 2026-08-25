@@ -17,6 +17,7 @@ import json
 import sqlite3
 from enum import StrEnum
 
+from resell import progress
 from resell.db import now_iso
 
 
@@ -59,12 +60,16 @@ def begin_call(
     """
     cursor = conn.execute(
         "INSERT INTO model_call (sku, purpose, provider, model, called_at, "
-        "estimated_cost_micros, rate_basis, request, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "estimated_cost_micros, rate_basis, request, status, run_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             sku, purpose, provider, model, now_iso(),
             estimated_cost_micros, rate_basis, json.dumps(request_key),
             str(CallStatus.ATTEMPTED),
+            # Which run this call belongs to. The ledger knew the item and not
+            # the run, so two attempts at one stage -- what a retry-and-recover
+            # produces -- were indistinguishable afterwards.
+            progress.current_run_id(),
         ),
     )
     return cursor.lastrowid

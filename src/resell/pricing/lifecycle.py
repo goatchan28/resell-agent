@@ -99,6 +99,17 @@ class PriceProposal:
     objective: SellerObjective | None = None
     anchor_statistic: str | None = None
     anchor_value_cents: int | None = None
+    # How the number was arrived at. Recorded, never consulted: nothing reads
+    # these back into a decision, and `content_hash` ignores them, so a proposal
+    # is the same proposal whether or not they were captured.
+    #
+    # `qualifiers` already said *that* an anchor blended; it never said how much,
+    # so 3% and 45% looked identical afterwards. And only the objective the
+    # seller pressed became a proposal, so "were the three strategies actually
+    # distinct" could not be answered for any item once the page had closed.
+    market_confidence: float | None = None
+    anchor_weight: float | None = None
+    strategy_prices: dict | None = None
 
     def content_hash(self) -> str:
         """SHA-256 over the decision-bearing content, same pattern as elsewhere.

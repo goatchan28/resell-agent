@@ -848,7 +848,50 @@ def run_comp_round(
          "kinds": outcome.kinds, "refused": len(outcome.refused)},
         item_id=sku,
     )
+    _record_round_detail(conn, sku, outcome)
     return outcome
+
+
+def _record_round_detail(conn, sku: str, outcome: "CompRoundOutcome") -> None:
+    """Everything the round noticed, kept where it can be read afterwards.
+
+    `outcome.notes` was the whole diagnostic trail and it went to a browser flash
+    or a terminal and then nowhere -- "read as a shop, no product price found",
+    "not admitted: no schema.org Product with an offer", "a quotation is not in
+    the page; dropped", "stopped extracting after 8 page(s)". Reconstructing
+    MP-000047 meant re-running its searches and re-fetching its pages, because
+    nothing recorded that a page carrying the answer had been seen and skipped.
+
+    Summary counts already live in `round_complete`. This is the reasons.
+
+    Purely additive: it is written after every decision the round made, reads
+    only the outcome, and nothing downstream consults it.
+    """
+    log_event(
+        conn, "comp_research.round_detail",
+        {
+            "run_id": progress.current_run_id(),
+            "notes": [n[:400] for n in outcome.notes][:120],
+            "stopped": outcome.stopped,
+            "stop_reason": outcome.stop_reason[:400],
+            "stopped_early": outcome.stopped_early,
+            "promptable_recorded": outcome.promptable_recorded,
+            "withheld_from_model": outcome.withheld_from_model[:40],
+            "downgraded": outcome.downgraded[:40],
+            "unjudged": list(outcome.unjudged)[:40],
+            "incomplete_reason": outcome.incomplete_reason[:400],
+            # Retail research had no event of its own at all, so after a run you
+            # could not tell which items even attempted it, let alone why it
+            # found nothing.
+            "retail": {
+                "query": outcome.retail_query,
+                "pages_read": outcome.retail_pages_read,
+                "recorded": outcome.retail_recorded,
+                "skipped": outcome.retail_skipped,
+            },
+        },
+        item_id=sku,
+    )
 
 
 def _offer_withheld(conn, sku, withheld, ceiling, outcome, propose_only: bool) -> int:

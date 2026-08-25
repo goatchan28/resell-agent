@@ -772,6 +772,20 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "CREATE INDEX idx_retail_sku ON retail_observation (sku, observed_at)",
         "CREATE INDEX idx_retail_claim_sku ON retail_claim (sku)",
     ),
+    # Observability. Nothing here changes what the agent decides; it records what
+    # it decided with, so a thirty-item evaluation can be read afterwards instead
+    # of re-run.
+    #
+    # `model_call.run_id`: the ledger knew which item a call belonged to and not
+    # which run, so two attempts at one stage were indistinguishable after the
+    # fact -- exactly what a retry-and-recover produces.
+    #
+    # The matching pricing columns live in `migrate.py`, because `price_proposal`
+    # belongs to the pricing schema and is created after this runs.
+    (
+        "ALTER TABLE model_call ADD COLUMN run_id TEXT",
+        "CREATE INDEX idx_model_call_run ON model_call (run_id)",
+    ),
 )
 
 

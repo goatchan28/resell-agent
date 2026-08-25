@@ -99,6 +99,19 @@ def report(phase: str, message: str, *, ok: bool = True) -> None:
         return None
 
 
+def current_run_id() -> str | None:
+    """The run a call is happening inside, or None outside one.
+
+    Read from the bound reporter rather than threaded through every stage
+    signature: the reporter already knows, and a parameter added to twelve
+    call sites is a parameter somebody will forget on the thirteenth.
+    """
+    try:
+        return getattr(_CURRENT.get(), "run_id", None)
+    except Exception:  # noqa: BLE001 - provenance must never break the work
+        return None
+
+
 @contextmanager
 def reporting(reporter: ProgressReporter):
     token = _CURRENT.set(reporter)

@@ -189,6 +189,12 @@ CREATE TABLE IF NOT EXISTS price_proposal (
     sample_exclusions_json TEXT NOT NULL DEFAULT '[]',
     uncertainty_note      TEXT NOT NULL DEFAULT '',
     sold_evidence_note    TEXT NOT NULL DEFAULT '',
+    -- Observability only. Nothing reads these back into a decision and
+    -- `content_hash` ignores them: how the number was reached, recorded beside
+    -- what the number was.
+    market_confidence     REAL,
+    anchor_weight         REAL,
+    strategy_prices_json  TEXT,
     content_hash          TEXT NOT NULL,
     created_at            TEXT NOT NULL
 );

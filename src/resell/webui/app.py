@@ -1132,6 +1132,16 @@ def _propose_price(sku: str, objective) -> str:
         objective=objective,
         anchor_statistic=str(chosen.anchor.statistic),
         anchor_value_cents=chosen.anchor.value_cents,
+        # Observability only, and none of it is read back. All three prices,
+        # because the one the seller pressed is the only one that would otherwise
+        # survive -- and "were the three actually distinct" is the question an
+        # evaluation most wants to ask afterwards.
+        market_confidence=rec.market_confidence,
+        anchor_weight=rec.anchor_weight,
+        strategy_prices={
+            str(objective): strategies.get(objective).price_cents
+            for objective in type(objective)
+        },
     )
     sp.record_proposal(
         g.conn, proposal,

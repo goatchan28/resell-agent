@@ -62,6 +62,20 @@ COLUMN_ADDITIONS: tuple[ColumnAddition, ...] = (
                    "TEXT NOT NULL DEFAULT ''"),
     ColumnAddition("002_pricing_strategy", "price_proposal", "sold_evidence_note",
                    "TEXT NOT NULL DEFAULT ''"),
+    # How the number was arrived at, rather than only what it was.
+    #
+    # `qualifiers_json` already recorded *that* a retail anchor blended into a
+    # price; it never recorded how much, so a proposal at 3% anchor and one at
+    # 45% were indistinguishable afterwards. And only the objective the seller
+    # pressed became a proposal at all -- so "were the three strategies actually
+    # distinct and useful", the question a functional evaluation most wants to
+    # ask, could not be answered for any item once the page had closed.
+    ColumnAddition("003_pricing_observability", "price_proposal",
+                   "market_confidence", "REAL"),
+    ColumnAddition("003_pricing_observability", "price_proposal",
+                   "anchor_weight", "REAL"),
+    ColumnAddition("003_pricing_observability", "price_proposal",
+                   "strategy_prices_json", "TEXT"),
     # Added with comp research. An operator who reads a listing and types its
     # price is the witness to it; a model reading fetched HTML is not, so an
     # automatically extracted comp carries the text its numbers came from. Same

@@ -365,8 +365,9 @@ def record_proposal(
                adjustments_json, qualifiers_json, fee_schedule_version, fee_basis,
                net_proceeds_cents, floor_ok, rationale, objective, anchor_statistic,
                anchor_value_cents, uncertainty_note, sold_evidence_note,
-               sample_exclusions_json, content_hash, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               sample_exclusions_json, content_hash, created_at,
+               market_confidence, anchor_weight, strategy_prices_json)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (p.proposal_id, p.sku, str(p.reason), p.price_cents, p.previous_price_cents,
          p.supersedes, str(p.basis) if p.basis else None,
          str(p.price_kind) if p.price_kind else None, p.comp_set_id, p.comp_set_hash,
@@ -378,7 +379,9 @@ def record_proposal(
          str(p.objective) if p.objective else None, p.anchor_statistic,
          p.anchor_value_cents, uncertainty_note, sold_evidence_note,
          json.dumps(list(sample_exclusions)),
-         p.content_hash(), p.created_at.isoformat()),
+         p.content_hash(), p.created_at.isoformat(),
+         p.market_confidence, p.anchor_weight,
+         json.dumps(p.strategy_prices) if p.strategy_prices else None),
     )
     if p.supersedes:
         conn.execute(

@@ -101,3 +101,44 @@ Publish an item in a category whose ladder is not the general one — 15709 will
 do — and assert that every grade eBay lists is offered to the agent, and that the
 grade chosen is one the category accepts. V1's tests only ever exercised
 categories where the global table happened to be right.
+
+---
+
+## 2. Set Aside must reach across the eBay boundary
+
+**From [F4](../eval/FINDINGS.md).**
+
+### The assumption that failed
+
+> Item state is ours, so changing it is a local write.
+
+It is not, once the item has created resources on someone else's system.
+`gateway.abandon()` voids approvals, deactivates the local listing row and
+changes state — and leaves a priced, quantity-one, **publishable** offer sitting
+on the seller account that no code path in the system will ever remove. There is
+no `withdrawOffer`, `deleteOffer` or `deleteInventoryItem` call anywhere in V1.
+
+The application cannot republish such an item; `next_step` refuses. The hazard
+comes from the other side, where eBay's own UI or bulk tooling can publish an
+unpublished offer — listing an item the seller set aside, at the price they set
+aside it at.
+
+### Intended semantics
+
+**Set Aside withdraws any existing offer and preserves the inventory item.**
+Restore then recreates the selling offer.
+
+That is the combination that resolves the tension. Deleting the inventory item
+would clean the account but make Restore expensive, since it would have to
+recreate the product, aspects and images. Leaving the offer keeps Restore cheap
+and leaves the hazard. Withdrawing the offer and keeping the item does both jobs.
+
+### The wider rule
+
+Every state transition should be explicit about which side of the boundary it
+acts on. V1 has exactly one direction of travel — it creates remote resources
+when publishing and never removes them — which is why a spike from the first
+week left a **live** listing on the account that the application never knew
+existed. A reconciliation path that can answer *"what does eBay think we have?"*
+belongs in V2 as a first-class operation, not as an investigation someone runs by
+hand after noticing something odd in a UI.

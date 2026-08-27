@@ -115,6 +115,40 @@ seller set aside, at the price they set aside. In Sandbox it is clutter; in
 production it is a live hazard, and orphaned inventory accumulates on the account
 indefinitely.
 
+#### Cleanup performed 2026-08-27 — Sandbox only, no application code changed
+
+Done through the eBay API directly, after the table above was committed.
+Inventory items were **preserved deliberately**, matching the intended V2
+semantics below: the hazard is a publishable offer, not the inventory item, and
+keeping the item is what makes Restore cheap.
+
+| action | target | result |
+|---|---|---|
+| `withdrawOffer` | `SPIKE-001` offer `11460608010` | HTTP 200 — listing `110590224174` now `ENDED`, `soldQuantity: 0` |
+| `deleteOffer` | `SPIKE-001` `11460608010` | HTTP 204 |
+| `deleteOffer` | MP-000052 `11484260010` | HTTP 204 |
+| `deleteOffer` | MP-000053 `11484407010` | HTTP 204 |
+| `deleteOffer` | MP-000054 `11484418010` | HTTP 204 |
+
+Verified afterwards: all four SKUs hold **0 offers** and their inventory items
+still exist. `MP-000049` and `MP-000051` are untouched and still
+`PUBLISHED` / `ACTIVE` on listings `110590242829` and `110590242864`.
+
+**Nothing is publishable that should not be.** No abandoned offer remains on the
+account.
+
+Two things deliberately left alone, both harmless and both worth a decision
+rather than a reflex:
+
+- **`SPIKE-001`'s inventory item still exists** and still has no local record —
+  eBay reports 36 inventory items against 35 local. It carries no offer now, so
+  it cannot become a listing, but it is the one genuinely orphaned object on the
+  account.
+- **The local database was not edited.** `listing.offer_id` still holds the four
+  deleted offer ids. That is a true record of what happened and reconciliation
+  should be a code path, not a manual `UPDATE` — noted for V2 rather than patched
+  by hand.
+
 #### Intended V2 semantics — not implemented
 
 **Set Aside should withdraw any existing eBay offer and preserve the inventory

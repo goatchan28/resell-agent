@@ -223,6 +223,60 @@ MP-000053 it is positively excluded, since `NEW_OTHER` demonstrably publishes in
 either way, so it remains open for that item alone; but the simplest explanation
 covering both failures is environmental.
 
+#### MP-000055 — the fresh-token test, 2026-08-27T22:01
+
+A new item, published with a user token refreshed eight minutes earlier.
+
+```
+21:53:06  oauth.access_token_refreshed        <- fresh token
+22:01:10  PUT  inventory_item/MP-000055  -> 204   new inventory item
+22:01:10  GET  offer?sku=MP-000055       -> 404   correctly none
+22:01:11  POST offer                     -> 201   new offer 11485522010
+22:01:12  POST offer/11485522010/publish -> 500   [25002]
+```
+
+**Token expiration is ruled out.** The token was minutes old, zero 401/403 has
+ever been recorded, and the same token returned 204 and 201 in the two seconds
+before the 500.
+
+Also ruled out by this attempt: orphaned state (the account had just been
+cleaned), the offer payload (field-by-field identical to MP-000049's published
+offer — same `listingPolicies`, `merchantLocationKey`, `FIXED_PRICE`, `GTC`,
+quantity 1, `tax.applyTax false`), and the category — 31388 has published **8
+times out of 8** historically.
+
+#### The failure is isolated to `publishOffer`
+
+Every other eBay write continues to succeed. Since the failures began:
+
+| operation | attempts | result |
+|---|---|---|
+| `createImageFromFile` | 4 | 201 |
+| `PUT inventory_item` | 4 | 204 |
+| `POST offer` (createOffer) | 4 | 201 |
+| `withdrawOffer` | 1 | 200 |
+| `deleteOffer` | 4 | 204 |
+| **`publishOffer`** | **8** | **500 every time** |
+
+The account is not suspended, not read-only and not out of credentials. One
+endpoint fails, deterministically, across four items in four different
+categories at prices from $99.99 to $375.36.
+
+#### Hypothesis, not conclusion: a monthly selling limit
+
+Cumulative value listed on this account is **$5,254.58 across 33 listings**, and
+the total crossed **$5,000 on 2026-08-25 at MP-000046**. A $5,000/month ceiling is
+a common eBay selling-limit tier, and eBay counts what was *listed* in the
+period — withdrawing does not return allowance, which would explain why removing
+`SPIKE-001` changed nothing.
+
+**Recorded as a hypothesis and nothing more.** Two things argue against calling
+it: three listings published *after* the total crossed $5,000 (MP-000047,
+MP-000049, MP-000051), and `getPrivileges` returns only
+`{"sellerRegistrationCompleted": false}` with **no `sellingLimit` object** — the
+one field that would confirm or kill it. A correlate with a two-day lag is not a
+mechanism.
+
 #### The decisive test
 
 Publish one item in a category-and-condition pair that succeeded *before* the

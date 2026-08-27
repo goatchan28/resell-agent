@@ -48,9 +48,87 @@ Written at review time, from the report and the run notes.
 
 | id | class | sku | phase | what happened | evidence |
 |---|---|---|---|---|---|
-| **F1** | **A — internal blocker** | MP-000052 | publish | Sneakers in an apparel category cannot be published: our condition table assumes an eBay condition ID means the same thing everywhere. Deterministic — four identical attempts. Abandoned in the app afterwards. **Not fixed; V1 is frozen.** See below. | `events` 2232/2239/2247/2254, all HTTP 500; offer `11484260010` `UNPUBLISHED` |
+| **F1** | **latent defect — real; not established as the cause of the publish failure** | MP-000052 | condition | Our condition table assumes an eBay condition ID means the same thing in every category. eBay offers six grades for 15709; the agent is shown four. Verifiable independently of any publish attempt. Cause of the 500s: **see F3**. | `events` 2232/2239/2247/2254; the recorded `condition` prompt |
 
-| **F2** | **A — internal blocker** | MP-000053 | publish | Recurrence of F1 in **clothing** (category 3001). Not sneaker-specific: every category on eBay's apparel condition ladder fails. Three attempts, all HTTP 500. **Not fixed; V1 is frozen.** | `events` for MP-000053 15:41:11/18/29; offer `11484407010` |
+| **F2** | **unclassified — cause not established** | MP-000053 | publish | Three HTTP 500s. Originally attributed to the apparel condition ladder; **that attribution is withdrawn** — see F3. | `events` 15:41:11/18/29; offer `11484407010` |
+| **F3** | **reconciliation** | MP-000052, MP-000053 | publish | The apparel-ladder explanation is refuted by the history. The real boundary is **temporal, at `publishOffer`**. Cause still unknown; a decisive test is proposed. | 18 successes → 7 failures; see below |
+
+### F3 — the apparel-ladder explanation does not survive the history
+
+**Withdrawn: "every category on eBay's apparel condition ladder fails."** It was
+inferred from four items and it is wrong.
+
+**Category 3001 has published eight times** — MP-000001, 3, 35, 36, 37, 38, 40,
+43 — and **four of those used `NEW_OTHER`**, the exact category-and-condition pair
+MP-000053 failed with. Last success `2026-08-25T03:31:33`. The one before it,
+MP-000043, is the same category, same condition, same brand, and effectively the
+same garment as MP-000053.
+
+#### The actual boundary
+
+`publishOffer` had **never** returned 500 before 2026-08-27.
+
+| | |
+|---|---|
+| 18 consecutive successes | `2026-08-24T03:25:06` → `2026-08-26T01:02:53` |
+| **gap — no publish attempted** | ~38 hours |
+| 7 consecutive failures | `2026-08-27T15:20:59` → `2026-08-27T15:41:29` |
+
+No mixed period in either direction. **The divergence is temporal, and it is at
+the `publishOffer` call itself** — every step before it behaves identically in
+both eras.
+
+#### What is excluded
+
+| candidate | evidence against |
+|---|---|
+| condition / category | 3001 + `NEW_OTHER` published 4× before; `USED_EXCELLENT` published in 12 distinct categories |
+| the offer payload | MP-000043 vs MP-000053 differ in nothing structural: same category, condition, brand, policies, location, format |
+| required aspects | all seven for 3001 supplied |
+| the token | zero 401/403 ever recorded; the same user token returned 204 and 201 within seconds either side of every 500 |
+| policies / location | `6245052000`, `6245050000`, `6245051000`, `resell-primary` all verified live and present |
+| earlier 500s | the only prior 500s were six `GET /location` calls during setup on 2026-08-19, unrelated and self-resolving |
+| our code | `src/` unchanged since `aa21801`, which predates the successful era |
+
+#### The reasoning error
+
+Determinism was read as evidence of an internal defect: *"it fails identically
+every time, so it cannot be the sandbox."* That is wrong. Determinism separates a
+transient blip from a **sustained** condition; it says nothing about whether the
+sustained condition is ours or theirs. A provider outage that has been going for
+a day also fails identically every time.
+
+Both wrong diagnoses came from the same habit — taking the first correlation that
+fit the visible sample and not checking it against the ~50 items already on
+record. The history was there the whole time.
+
+#### What still stands
+
+The condition-table defect is **real and independently verifiable**, and is not
+affected by any of the above: eBay offers six grades for 3001 and for 15709, the
+agent is shown four, and `USED_EXCELLENT (Pre-owned - Good)` is a
+self-contradiction in text we generate ourselves. It is a genuine latent bug and
+stays on the V2 list.
+
+**It is simply not established as the cause of these failures** — and for
+MP-000053 it is positively excluded, since `NEW_OTHER` demonstrably publishes in
+3001. For MP-000052 (`USED_EXCELLENT` in 15709) there is no historical precedent
+either way, so it remains open for that item alone; but the simplest explanation
+covering both failures is environmental.
+
+#### The decisive test
+
+Publish one item in a category-and-condition pair that succeeded *before* the
+boundary — `USED_EXCELLENT` in `31388` published 8 times out of 8.
+
+- **fails** → the environment changed; class **E**, and MP-000052/53 are not
+  agent failures.
+- **succeeds** → something genuinely item-specific is happening; class **A**, and
+  the search reopens with the environment excluded.
+
+Not run: it creates a real Sandbox listing, and that is the operator's call.
+
+### F1 — condition IDs are not global, and our table assumes they are
 
 ### F2 — the same defect, and it is not an edge case
 

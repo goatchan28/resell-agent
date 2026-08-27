@@ -9,15 +9,21 @@ category.
 
 ## 1. Condition: eBay's category options are the source of truth
 
-**From [F1 and F2](../eval/FINDINGS.md) — MP-000052 (shoes, 15709) and MP-000053
-(clothing, 3001).** V1 could not publish either, deterministically, and V1 is
-frozen with both stuck.
+**From [F1](../eval/FINDINGS.md) — surfaced by MP-000052 (shoes, 15709) and
+MP-000053 (clothing, 3001).** Both items are stuck, though for reasons that are
+[not yet established](../eval/FINDINGS.md) and may be environmental. The defect
+below is real regardless of what stopped those two publishing.
 
-**Scope: every category on eBay's apparel condition ladder.** The baseline
-correlates exactly — 20614 and 177765 use the standard ladder and published;
-15709 and 3001 use the apparel ladder (`1000,1500,1750,2990,3000,3010`) and both
-failed. That is all clothing and all footwear, which for a reselling app is a
-large share of everything people own. This is not an edge case to special-case.
+> **Scope correction.** An earlier version of this note claimed every
+> apparel-ladder category fails to publish, inferred from a four-item sample.
+> [F3](../eval/FINDINGS.md) refutes it: category 3001 has published eight times,
+> four of them with the same `NEW_OTHER` that later failed. **The publish
+> failures are a separate, still-unexplained problem** with a temporal boundary,
+> and are not evidence for anything in this section.
+>
+> What follows stands on its own evidence — the grades eBay returns for a
+> category versus the grades the agent is shown — which is verifiable without
+> publishing anything.
 
 ### The assumption that failed
 
@@ -72,18 +78,19 @@ translate into a global one.**
   against the fetched options at proposal time turns a publish-time 500 into a
   legible refusal.
 
-### Deliberately not done in V1 — and the patch would not have worked anyway
+### Deliberately not done in V1
 
-Adding `2990 -> PRE_OWNED_EXCELLENT` and `3010 -> PRE_OWNED_FAIR` is two lines
-and would unstick MP-000052. It is not being applied, on purpose: it special-cases
-sneakers while leaving the global-semantics assumption exactly where it is, so
-the next category with its own ladder fails the same way.
+Adding `2990 -> PRE_OWNED_EXCELLENT` and `3010 -> PRE_OWNED_FAIR` is two lines.
+It is not being applied: V1 is frozen, and it would restore the
+global-semantics assumption rather than remove it.
 
-**MP-000053 then proved that concretely.** It fails on `1500` — an id the table
-already contains — because in clothing 1500 is "New without tags" and the enum
-the table pairs with it is the general ladder's. A patch that adds missing ids
-does not address a table whose *existing* entries mean different things in
-different categories. `DECISIONS.md` had
+Note it would also **not** have unstuck either item — which is a reason to be
+careful about this whole line of reasoning, not a reason to be pleased with it.
+The publish failures are unexplained; see [F3](../eval/FINDINGS.md).
+
+What justifies the redesign is narrower and firmer: for both 3001 and 15709, eBay
+returned six grades and the agent was shown four, and the fourth was labelled
+`USED_EXCELLENT (Pre-owned - Good)`. Neither fact depends on a publish attempt. `DECISIONS.md` had
 already recorded that condition IDs are category-dependent, and clothing's reuse
 of 1000/1500 was in a comment above the very table that got this wrong — a note
 warning about the bug sat directly above the bug.

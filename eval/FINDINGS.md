@@ -55,6 +55,77 @@ Written at review time, from the report and the run notes.
 | **F2** | **unclassified — cause not established** | MP-000053 | publish | Three HTTP 500s. Originally attributed to the apparel condition ladder; **that attribution is withdrawn** — see F3. | `events` 15:41:11/18/29; offer `11484407010` |
 | **F3** | **reconciliation** | MP-000052, MP-000053 | publish | The apparel-ladder explanation is refuted by the history. The real boundary is **temporal, at `publishOffer`**. Cause still unknown; a decisive test is proposed. | 18 successes → 7 failures; see below |
 
+| **F4** | **B — correctness** | MP-000052, MP-000053, MP-000054 | set aside | Setting an item aside is local-only. eBay keeps the inventory item **and a priced, publishable offer**, which nothing in the codebase ever removes. Separate from F3. | offers `11484260010`, `11484407010`, `11484418010`, all `UNPUBLISHED` |
+
+### F4 — "set aside" stops at the boundary we do not own
+
+**The publish failures are not this.** F3 is unresolved and stays unresolved; this
+is a defect the 500s merely *exposed*, by causing items to be set aside after
+they had already reached the offer stage. The two are independent.
+
+#### What reconciled, and what did not
+
+All 35 items holding an eBay offer were checked against eBay directly. Every
+`listed` item is `PUBLISHED` / `ACTIVE` with a matching `listingId`; every set
+aside item is `UNPUBLISHED`. **No ghost listings, no duplicates, no
+half-published state — the seven HTTP 500s published nothing.**
+
+The chain diverges one step earlier:
+
+```
+local workflow state   abandoned            ✓ correct
+      ↓
+eBay inventory item    EXISTS, quantity 1   ← FIRST DIVERGENCE
+      ↓
+eBay offer             UNPUBLISHED, priced  ← also divergent
+      ↓
+published listing      none                 ✓ consistent again
+```
+
+#### Cause
+
+`gateway.abandon()` does three things, all local: voids approvals, sets
+`listing.active = 0`, transitions to `ABANDONED`. The codebase contains **no
+`withdrawOffer`, `deleteOffer` or `deleteInventoryItem` call anywhere.** The
+system creates remote resources when publishing and has no path that removes
+them, ever.
+
+#### State preserved before cleanup
+
+Recorded 2026-08-27, read from eBay, before anything was changed:
+
+| sku | local state | inventory item | offer id | offer status | price | qty | category |
+|---|---|---|---|---|---|---|---|
+| MP-000052 | abandoned | EXISTS | `11484260010` | `UNPUBLISHED` | $120.00 | 1 | 15709 |
+| MP-000053 | abandoned | EXISTS | `11484407010` | `UNPUBLISHED` | $99.99 | 1 | 3001 |
+| MP-000054 | abandoned | EXISTS | `11484418010` | `UNPUBLISHED` | $375.36 | 1 | 31388 |
+| **SPIKE-001** | **no local record at all** | EXISTS | `11460608010` | **`PUBLISHED` / ACTIVE** | $19.99 | 1 | 261186 |
+
+`SPIKE-001` is the worse case and was found while sweeping: a **live** Sandbox
+listing left from the original spike, which the application has never known
+about. eBay reported 36 inventory items against 35 local ones.
+
+#### Risk
+
+The application cannot republish these — `next_step` returns
+`done / nobody / "abandoned"` and the gateway would refuse. The exposure is
+entirely from the other side: **a priced, quantity-1, unpublished offer can be
+published by eBay's own UI or by bulk tooling.** That would list an item the
+seller set aside, at the price they set aside. In Sandbox it is clutter; in
+production it is a live hazard, and orphaned inventory accumulates on the account
+indefinitely.
+
+#### Intended V2 semantics — not implemented
+
+**Set Aside should withdraw any existing eBay offer and preserve the inventory
+item**, so that Restore can recreate the selling offer without ever leaving an
+abandoned offer publishable.
+
+That resolves the tension in the current design: `restore()` is cheap today
+precisely *because* remote state is left in place, so deleting the inventory item
+would make restoring expensive. Withdrawing the offer removes the hazard and
+keeps restore cheap. Carried to [V2_NOTES](../docs/V2_NOTES.md).
+
 ### F3 — the apparel-ladder explanation does not survive the history
 
 **Withdrawn: "every category on eBay's apparel condition ladder fails."** It was

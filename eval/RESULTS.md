@@ -184,3 +184,136 @@ around the same judgement.**
   sensible reading.
 - Three items never published, so listing quality for them is judged on the
   drafted text rather than a live listing.
+
+---
+
+# Independent pricing audit
+
+All five items, per [PROTOCOL](PROTOCOL.md) §7. With a cohort of five the
+protocol's "five control items" is the whole set, so every item was audited, not
+only the one judged wrong.
+
+Evidence gathered independently of the agent's own comps — retailer pricing, used
+dealer inventory, and the manufacturer's retail — deliberately **not** the same
+listings the agent priced from, which would have been circular. eBay pages were
+not fetched, per the standing policy in `DECISIONS.md`.
+
+| item | fast | balanced | aggressive | **chosen** | independent range | verdict |
+|---|---|---|---|---|---|---|
+| MP-000049 Roomba | $40.00 | **$114.49** | $166.94 | $114.49 | — | **indeterminate** |
+| MP-000051 Neutrogena | $9.79 | **$11.91** | $16.00 | $11.91 | $6–$10 | **above** |
+| MP-000052 Jordan 1 | $30.00 | $100.00 | **$120.00** | $120.00 | $70–$130 | **within range** |
+| MP-000053 Brooks Brothers | $19.00 | $69.99 | **$99.99** | $99.99 | $120–$210 | **below** |
+| MP-000054 Canon T6i | $58.99 | $296.00 | **$375.36** | $375.36 | $250–$320 | **above** |
+
+**One of five priced defensibly.** Three land outside a defensible range and one
+cannot be ranged at all.
+
+## Per item
+
+**MP-000049 — Roomba — indeterminate.** The model was never identified. The
+`17070` dock in the description is compatible with 500/600/700/800/900 *and* the
+e/i/j series — a decade of robots — so it identifies nothing. Used 600/700/800
+units with a dock trade around $30–90; newer i-series considerably more. A
+defensible range cannot be established for an unidentified product, which is the
+finding rather than an evasion of one. On the agent's own guess of "likely
+800-series", $114.49 is above market.
+
+**MP-000051 — Neutrogena — above.** Walmart sells this exact 1.7 oz product
+**new for $11.97**. The agent priced the second-hand unit at **$11.91** — 99.5%
+of new retail from a mass retailer, before eBay's ~13% fees. Nobody buys a used
+moisturiser to save six cents.
+
+**MP-000052 — Jordan 1 — within range.** Retail $180 at release; a used pair with
+the scuffing and insole staining the listing itself describes sits at roughly
+40–60% of that. $120 is the top of the defensible band — aggressive, but the
+seller chose the aggressive strategy, so the system did what was asked.
+
+**MP-000053 — Brooks Brothers — below.** Confirms the operator's judgement. Used
+Explorer jackets trade $75–$210; a size-41 Explorer Slim was listed around $208;
+current retail starts at $155.99. For a new-without-tags Explorer Slim in 40R,
+$99.99 is under the floor — and it was the *aggressive* price.
+
+**MP-000054 — Canon T6i — above.** MPB, a used-camera dealer, sells T6i **bodies
+alone** at $239–$374, with "Excellent" clustering at $329–$354 **and a six-month
+warranty**. A private sale of a body plus kit lens with no warranty belongs below
+that, around $250–$320. $375.36 asks more than a dealer charges with a guarantee.
+
+## Research selection, or the estimator?
+
+**Overwhelmingly the research.** The estimator behaved sensibly given what it was
+handed; what it was handed was the problem.
+
+### The clearest case: MP-000053
+
+Of 33 contributing comps, **31 are `category_attribute`** — generic Brooks
+Brothers 346, 1818, Madison and Regent blazers, mostly used, $19–$150. Only
+**two** are `same_family_variant`, the actual Explorer Slim, at **$310 and
+$449.99**.
+
+The on-target evidence was outnumbered **31 to 2** by a cheaper product line, and
+the median of that mixture is $69.99. The estimator took a defensible position in
+a distribution that was measuring the wrong garment. **No change to the estimator
+would fix this**; it would need the comp set not to be 94% off-target.
+
+### The correlation holds across the set
+
+| item | on-target share (`same_family_variant` ÷ contributing) | audit verdict |
+|---|---|---|
+| MP-000053 | **6%** (2/33) | below |
+| MP-000049 | **25%** (2/8) | indeterminate / likely above |
+| MP-000054 | 62% (15/24) | above |
+| MP-000052 | 74% (14/19) | within range |
+| MP-000051 | 86% (6/7) | above (different cause — see below) |
+
+The two worst-priced items are the two with the least on-target evidence. Price
+quality tracks comp selection, not arithmetic.
+
+### The systemic cause: there is no sold evidence, anywhere
+
+Across all five items, of **91 contributing comps:**
+
+- **91 are `asking` prices. Zero are sold.**
+- **91 have `condition_band = unknown`. Zero state a condition.**
+
+Every price this baseline produced was derived from what sellers *hoped* to get,
+on listings whose condition nobody stated. That single fact explains most of what
+went wrong:
+
+- **MP-000054 above** — asking-price distributions skew high, and the aggressive
+  strategy takes a high position within one. With no realised anchor there is
+  nothing to pull it back to what buyers actually pay.
+- `asking_only`, `asking_unknown_condition` and `condition_unknown_in_sample`
+  appear in the qualifier list of **every item in the baseline**.
+- `market_confidence` never exceeds 0.68, because the quality term is multiplied
+  down by unknown condition and asking-kind on every single comp.
+
+### Where the estimator did contribute: MP-000051
+
+The one item where the estimator shares blame. The retail anchor read
+`neutrogena.com` and recorded **$19.99** — the manufacturer's own price, for the
+*Gel Cream*, a different product from the Water Gel on the table. Street price at
+Walmart is $11.97. That inflated anchor blended in at weight 0.17 and pulled the
+central price up to within six cents of new retail.
+
+Two faults, one from each side: **research** took MSRP from a manufacturer's site
+as though it were market price, and of an adjacent product; **the estimator** had
+no rule that a second-hand item should sit meaningfully below new retail. A
+retail anchor is currently able to push a used price *up* to the new price, which
+is the one direction it should never go.
+
+## What this changes for V2
+
+1. **Sold prices, or say so loudly.** Zero of 91 comps were realised sales. Until
+   the system can see what things actually sold for, every price is an estimate
+   of other sellers' hopes. This is the single largest quality lever in the
+   baseline.
+2. **Comp selection matters more than the estimator.** MP-000053 is a 31:2
+   dilution of the right product by a cheaper line. V2 should weight or gate on
+   on-target share, and prefer refusing to price over pricing from 6% relevance.
+3. **A retail anchor must be a ceiling, never a lift.** MP-000051 shows an anchor
+   raising a used item to new-retail parity. Anchors should also prefer street
+   price over manufacturer MSRP.
+4. **Identity resolution is upstream of all of it.** MP-000049 cannot be priced
+   because its model was never resolved, and §3 shows that has never once
+   happened for any item. Fix that and the comp sets tighten by themselves.

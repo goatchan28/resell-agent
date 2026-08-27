@@ -1,6 +1,6 @@
 sku,owner_label,state,identification,condition,price,listing_text,questions_asked,questions_necessary,rescue,note,audit_low_cents,audit_high_cents,audit_sources,audit_verdict
-MP-000049,admin,listed,correct,correct,sensible,accurate,0,0,none,,,,,
-MP-000051,tester-b,listed,correct,correct,sensible,accurate,1,0,none,,,,,
-MP-000052,admin,abandoned,correct,correct,sensible,awkward,3,1,none,,,,,
-MP-000053,admin,abandoned,correct,correct,too_low,accurate,3,2,none,price judged too_low; triggers the independent pricing audit,,,,
-MP-000054,admin,abandoned,correct,correct,sensible,awkward,0,0,none,,,,,
+MP-000049,admin,listed,correct,correct,sensible,accurate,0,0,none,"model never resolved; 17070 dock spans 500-900 and e/i/j. If 600/700/800 as the agent guessed, used-with-dock is ~$30-90 and $114.49 is above",,,2,indeterminate
+MP-000051,tester-b,listed,correct,correct,sensible,accurate,1,0,none,Walmart sells it NEW at $11.97; agent priced the secondhand unit at $11.91,600,1000,2,above
+MP-000052,admin,abandoned,correct,correct,sensible,awkward,3,1,none,retail $180 (2023); used with scuffing+insole staining ~40-60% of retail. $120 is top of range,7000,13000,2,within_range
+MP-000053,admin,abandoned,correct,correct,too_low,accurate,3,2,none,used Explorer jackets $75-210; a size-41 Explorer Slim listed ~$208; current retail from $155.99,12000,21000,3,below
+MP-000054,admin,abandoned,correct,correct,sensible,awkward,0,0,none,MPB dealer body-only Excellent $329-354 WITH warranty; private sale + kit lens ~$250-320,25000,32000,2,above

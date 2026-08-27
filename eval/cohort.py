@@ -35,6 +35,16 @@ DB_PATH = ROOT / "data" / "resell.db"
 # before the window opened, so the first evaluation item is MP-000049.
 START_SEQ = 48
 
+# Items the operator has declared were not real attempts -- a mis-upload, a
+# duplicate, a test. Kept as an explicit list rather than a quiet deletion: the
+# report prints these with their reason, so a reader can see the cohort was
+# trimmed and by how much. This is for "that was not an attempt at selling
+# something", never for "that one went badly" -- outcome is not a criterion, and
+# MP-000052 failing to publish is exactly the sort of result the set is for.
+NOT_REAL_ATTEMPTS: dict[str, str] = {
+    "MP-000050": "operator declared it a mistake, not a real attempt",
+}
+
 # Five, not thirty. The run was cut back to a V1 baseline ahead of the lean V2
 # redesign: enough to characterise how V1 behaves end to end, and not so much
 # that it invests thirty items in an architecture about to be replaced.
@@ -128,6 +138,8 @@ def qualifying(conn, start_seq: int = START_SEQ, limit: int = COHORT_SIZE) -> li
     for row in rows:
         if row["photos"] < 1 or row["runs"] < 1:
             continue
+        if row["sku"] in NOT_REAL_ATTEMPTS:
+            continue
         out.append(Item(
             sku=row["sku"], seq=row["seq"], state=row["state"],
             owner_email=row["owner_email"] or "(none)",
@@ -157,7 +169,9 @@ def excluded(conn, start_seq: int = START_SEQ) -> list[tuple[str, str]]:
     ).fetchall()
     out = []
     for row in rows:
-        if row["photos"] < 1:
+        if row["sku"] in NOT_REAL_ATTEMPTS:
+            out.append((row["sku"], NOT_REAL_ATTEMPTS[row["sku"]]))
+        elif row["photos"] < 1:
             out.append((row["sku"], "no photographs attached"))
         elif row["runs"] < 1:
             out.append((row["sku"], "photographs attached but the agent never ran"))

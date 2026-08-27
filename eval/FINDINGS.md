@@ -22,6 +22,17 @@ not, the SKU and a rough note go in "Run notes" below and the run moves on.
 | cohort | first 30 qualifying items with seq > 48, **any owner** |
 | HEAD at end of run | _(after item #30)_ |
 
+## Excluded from the cohort
+
+Declared not-real-attempts. Listed here, and printed by `cohort.py`, so the set
+is auditable rather than quietly trimmed. This is for *"that was not an attempt
+at selling something"* only — never for an item that went badly. Outcome is not
+a selection criterion, which is why MP-000052 stays in despite failing.
+
+| sku | reason |
+|---|---|
+| MP-000050 | operator declared it a mistake, not a real attempt |
+
 ## Run notes
 
 Raw, from the phone. Only items that stopped, or needed something outside the

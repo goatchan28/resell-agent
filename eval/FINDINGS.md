@@ -20,7 +20,9 @@ not, the SKU and a rough note go in "Run notes" below and the run moves on.
 | model | `claude-sonnet-5` |
 | last pre-window item | `MP-000048` (seq 48) |
 | cohort | first 30 qualifying items with seq > 48, **any owner** |
-| HEAD at end of run | _(after item #30)_ |
+| evaluation window closed | 2026-08-27 |
+| HEAD at end of run | `db08ad280aff` |
+| cohort as run | MP-000049, 51, 52, 53, 54 (MP-000050 excluded) |
 
 ## Excluded from the cohort
 

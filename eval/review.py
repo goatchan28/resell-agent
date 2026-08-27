@@ -382,9 +382,14 @@ def verdict_row(item: Item, d: dict, flags: list[str]) -> dict:
 
 
 def index(items: list[Item], skipped, rows: list[dict], flagged: dict) -> str:
-    L = ["# 30-item evaluation — review", ""]
+    L = ["# V1 baseline evaluation — review", ""]
     L.append(f"Cohort: **{len(items)}/{COHORT_SIZE}** qualifying items after "
              f"sequence {START_SEQ}, any owner.")
+    listed = sum(1 for i in items if i.state == "listed")
+    L.append("")
+    L.append(f"**{listed}/{len(items)} reached `listed`.** Three did not publish, "
+             f"blocked by the unexplained eBay 500 ([F3](../FINDINGS.md)) rather "
+             f"than by anything the agent decided.")
     L.append("")
     by_owner: dict[str, int] = {}
     for i in items:

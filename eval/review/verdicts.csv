@@ -1,0 +1,6 @@
+sku,owner_label,state,identification,condition,price,listing_text,questions_asked,questions_necessary,rescue,note,audit_low_cents,audit_high_cents,audit_sources,audit_verdict
+MP-000049,admin,listed,correct,correct,sensible,accurate,0,0,none,,,,,
+MP-000051,tester-b,listed,correct,correct,sensible,accurate,1,0,none,,,,,
+MP-000052,admin,abandoned,correct,correct,sensible,awkward,3,1,none,,,,,
+MP-000053,admin,abandoned,correct,correct,too_low,accurate,3,2,none,price judged too_low; triggers the independent pricing audit,,,,
+MP-000054,admin,abandoned,correct,correct,sensible,awkward,0,0,none,,,,,

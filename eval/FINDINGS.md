@@ -50,6 +50,65 @@ Written at review time, from the report and the run notes.
 |---|---|---|---|---|---|
 | **F1** | **A — internal blocker** | MP-000052 | publish | Sneakers in an apparel category cannot be published: our condition table assumes an eBay condition ID means the same thing everywhere. Deterministic — four identical attempts. Abandoned in the app afterwards. **Not fixed; V1 is frozen.** See below. | `events` 2232/2239/2247/2254, all HTTP 500; offer `11484260010` `UNPUBLISHED` |
 
+| **F2** | **A — internal blocker** | MP-000053 | publish | Recurrence of F1 in **clothing** (category 3001). Not sneaker-specific: every category on eBay's apparel condition ladder fails. Three attempts, all HTTP 500. **Not fixed; V1 is frozen.** | `events` for MP-000053 15:41:11/18/29; offer `11484407010` |
+
+### F2 — the same defect, and it is not an edge case
+
+**MP-000053 — category 3001 (clothing), condition `NEW_OTHER`, $99.99.** Same
+`25002` / HTTP 500 at publish, three attempts, offer `11484407010` left
+`UNPUBLISHED`.
+
+Ruled out first, because the symptom invites both guesses:
+
+- **Not the token.** Zero 401/403 all day; the same user token returned `PUT 204`
+  and `POST 201` within seconds either side of each 500. An expired token gives
+  401, not 500.
+- **Not missing item specifics.** All seven required aspects for 3001 were
+  supplied (`Brand, Color, Department, Size, Size Type, Style, Type`).
+- **Not a disallowed condition ID.** 1500 *is* in 3001's allowed list.
+
+**The discriminator is the ladder, and it is exact across the whole baseline:**
+
+| category | ladder | outcome |
+|---|---|---|
+| 20614 | standard `1000,1500,2500,3000,7000` | published |
+| 177765 | standard `1000,1500` | published |
+| 15709 (shoes) | apparel `1000,1500,1750,2990,3000,3010` | **failed** |
+| 3001 (clothing) | apparel `1000,1500,1750,2990,3000,3010` | **failed** |
+
+Every apparel-ladder category fails; every standard-ladder category publishes.
+
+What is wrong is the **enum name**, not the id: in apparel categories 1500 means
+"New without tags", and the Inventory API wants that category's enum rather than
+the general ladder's `NEW_OTHER`. The prompt shows the same corruption as F1 —
+six grades offered by eBay, four shown to the agent, the last self-contradictory:
+
+```
+Category 3001 accepts exactly these grades:
+  NEW  (New with tags)
+  NEW_OTHER  (New without tags)
+  NEW_WITH_DEFECTS  (New with imperfections)
+  USED_EXCELLENT  (Pre-owned - Good)
+```
+
+**This refutes a comment sitting directly above the offending table:**
+
+> `# There is no NEW_WITH_TAGS enum; clothing's "New with tags" is 1000 -> NEW.`
+
+That line is the assumption's own justification, and it is wrong.
+
+**Two consequences.**
+
+1. **Frequency.** Not a sneaker edge case — all clothing and footwear, which for
+   a reselling app is a large share of everything people own. Keeping shoes in
+   normal rotation is what produced this; avoiding the category would have left
+   the defect looking rare.
+2. **The proposed patch was wrong.** Adding `2990` and `3010` would not have
+   saved MP-000053, which fails on `1500` — an id the table already has, mapped
+   to an enum this category does not accept. Confirms the V2 direction: the
+   category's own options must be the vocabulary, not something translated
+   through a global table.
+
 ### F1 — condition IDs are not global, and our table assumes they are
 
 **MP-000052 — Nike Air Jordan 1 High, category 15709 (Athletic Shoes).**

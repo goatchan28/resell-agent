@@ -9,8 +9,15 @@ category.
 
 ## 1. Condition: eBay's category options are the source of truth
 
-**From [F1](../eval/FINDINGS.md) — MP-000052, Nike Air Jordan 1, category 15709.**
-V1 could not publish it, deterministically, and V1 is frozen with it stuck.
+**From [F1 and F2](../eval/FINDINGS.md) — MP-000052 (shoes, 15709) and MP-000053
+(clothing, 3001).** V1 could not publish either, deterministically, and V1 is
+frozen with both stuck.
+
+**Scope: every category on eBay's apparel condition ladder.** The baseline
+correlates exactly — 20614 and 177765 use the standard ladder and published;
+15709 and 3001 use the apparel ladder (`1000,1500,1750,2990,3000,3010`) and both
+failed. That is all clothing and all footwear, which for a reselling app is a
+large share of everything people own. This is not an edge case to special-case.
 
 ### The assumption that failed
 
@@ -65,12 +72,18 @@ translate into a global one.**
   against the fetched options at proposal time turns a publish-time 500 into a
   legible refusal.
 
-### Deliberately not done in V1
+### Deliberately not done in V1 — and the patch would not have worked anyway
 
 Adding `2990 -> PRE_OWNED_EXCELLENT` and `3010 -> PRE_OWNED_FAIR` is two lines
 and would unstick MP-000052. It is not being applied, on purpose: it special-cases
 sneakers while leaving the global-semantics assumption exactly where it is, so
-the next category with its own ladder fails the same way. `DECISIONS.md` had
+the next category with its own ladder fails the same way.
+
+**MP-000053 then proved that concretely.** It fails on `1500` — an id the table
+already contains — because in clothing 1500 is "New without tags" and the enum
+the table pairs with it is the general ladder's. A patch that adds missing ids
+does not address a table whose *existing* entries mean different things in
+different categories. `DECISIONS.md` had
 already recorded that condition IDs are category-dependent, and clothing's reuse
 of 1000/1500 was in a comment above the very table that got this wrong — a note
 warning about the bug sat directly above the bug.

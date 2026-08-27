@@ -277,6 +277,84 @@ MP-000049, MP-000051), and `getPrivileges` returns only
 one field that would confirm or kill it. A correlate with a two-day lag is not a
 mechanism.
 
+#### Command-line diagnosis, 2026-08-27 — it is eBay's Sandbox, not us
+
+Run directly against the eBay client with Sandbox credentials, no application
+code changed, no LLM or pricing workflow involved. One variable at a time.
+
+| # | test | result |
+|---|---|---|
+| A | republish MP-000055's existing offer `11485522010` | 500 / 25002 |
+| A2 | same, via `bulk_publish_offer` for a per-offer error | 500 / 25002, no extra detail |
+| B | disposable `DIAG-001`: minimal payload, category 20614 (9 prior successes) | 500 / 25002 |
+| B2 | **full clone** of MP-000049's published listing — same category, condition, aspects, **images**, price, policies, location | **500 / 25002** |
+| C | price $1.00 | 500 / 25002 |
+| C2 | price $0.99 | 500 / 25002 |
+
+**A complete clone of a listing that published successfully now fails.** Nothing
+about the request matters.
+
+eBay's full structured error carries no `parameters` and no `longMessage`:
+
+```json
+{"errorId": 25002, "domain": "API_INVENTORY", "subdomain": "Selling",
+ "category": "Request",
+ "message": "A user error has occurred. System error. Unable to process your
+             request. Please try again later."}
+```
+
+##### The finding that resolves it
+
+`publishOffer` is **not** the only Sandbox endpoint failing. Probing ten Sell API
+endpoints with the same credentials:
+
+| status | endpoint |
+|---|---|
+| 200 | `account/privilege`, `account/program/get_opted_in_programs`, `account/payment_policy`, `account/sales_tax`, `inventory/location`, `inventory/inventory_item`, `fulfillment/order` |
+| **500 `errorId 20500` "System error."** | **`account/subscription`** |
+| **500 `errorId 20500` "System error."** | **`account/rate_table`** |
+| 403 | `analytics/seller_standards_profile` (not granted; expected) |
+
+Two unrelated **read-only** account endpoints, with nothing to do with our
+listings, return eBay's generic system-error code. That is a **partial Sandbox
+outage**, and `publishOffer`'s 25002 is the same class of failure wearing a
+different number.
+
+##### Ruled out, each by a direct test
+
+- **Token expiry** — fresh token, zero 401/403 ever, `resell smoke` passes.
+- **The payload** — a full clone of a published listing fails.
+- **Value-based selling limit** — $0.99 fails.
+- **Live quantity cap** — withdrawing `SPIKE-001` freed a slot; the next publish
+  still failed.
+- **Category or condition ladder ([F1](#f1))** — four categories fail, including
+  two with 8 and 9 prior successes.
+- **Orphaned state** — the account had just been cleaned.
+- **Business policies, merchant location, program enrolment** — all fetched live:
+  policies valid, location `ENABLED`, opted in to `SELLING_POLICY_MANAGEMENT`.
+- **Missing images** — the clone carried MP-000049's own image URLs.
+
+##### Still not provable from here
+
+A consumed **monthly listed allowance** cannot be read: `getPrivileges` returns
+`{"sellerRegistrationCompleted": false}` with no `sellingLimit` object. It stays
+a hypothesis, now a weaker one — it would not explain `account/subscription` and
+`account/rate_table` returning system errors on plain GETs.
+
+##### Conclusion
+
+**The publish failure is an eBay Sandbox platform fault.** It is class **E —
+external**, not an agent or application defect, and no code change would fix it.
+The three items it blocked are not agent failures.
+
+What would confirm it beyond doubt, and needs the operator: a **second Sandbox
+seller account**. If that account publishes, the problem is specific to this
+seller; if it fails too, it is Sandbox-wide. Cheaper first step: the Sandbox
+Seller Hub shows selling limits directly, which the API declines to.
+
+All diagnostic objects were removed — `DIAG-001`'s offer and inventory item both
+deleted (204), nothing published, nothing left behind.
+
 #### The decisive test
 
 Publish one item in a category-and-condition pair that succeeded *before* the

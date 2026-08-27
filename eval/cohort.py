@@ -4,8 +4,8 @@ Read-only. The production database is opened through a `file:...?mode=ro` URI so
 a bug here cannot advance an item, write an identification, or change a price.
 The baseline is frozen; the evaluation may not alter the schema it is evaluating.
 
-The cohort is **the first 30 qualifying items after the start point, whoever owns
-them.** An invited tester's item flows through the same orchestrator, the same
+The cohort is **the first 5 qualifying items after the start point, whoever owns
+them** -- a V1 baseline ahead of the V2 redesign. An invited tester's item flows through the same orchestrator, the same
 gateway and the same tables as the admin's -- MP-000047 has 3 runs, 24 model
 calls, 88 steps and a proposal, exactly the shape of any other item -- so there is
 no technical reason to exclude one, and excluding it would measure the operator
@@ -34,7 +34,11 @@ DB_PATH = ROOT / "data" / "resell.db"
 # at pre-flight, and recorded in FINDINGS.md. MP-000048 was created and abandoned
 # before the window opened, so the first evaluation item is MP-000049.
 START_SEQ = 48
-COHORT_SIZE = 30
+
+# Five, not thirty. The run was cut back to a V1 baseline ahead of the lean V2
+# redesign: enough to characterise how V1 behaves end to end, and not so much
+# that it invests thirty items in an architecture about to be replaced.
+COHORT_SIZE = 5
 
 
 def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:

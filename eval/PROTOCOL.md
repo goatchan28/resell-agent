@@ -1,4 +1,4 @@
-# 30-item functional evaluation — protocol
+# V1 baseline evaluation — protocol
 
 **Frozen baseline: `b28e4f4`.** No change to `src/`, the consumer UI, prompts,
 identification, research, pricing, model selection, schemas or workflow during
@@ -8,6 +8,12 @@ diff.
 The point is to evaluate **the normal user experience**. So the run *is* normal
 use. Nothing is added to the consumer flow, and there is no research protocol to
 operate between items.
+
+**Five items, not thirty.** Cut back once the lean V2 redesign was decided on:
+enough to characterise how V1 behaves end to end, and not thirty items' worth of
+investment in an architecture about to be replaced. Everything else about the
+protocol is unchanged — the point of a frozen baseline is that it still means
+something when the run is short.
 
 ## 1. Your workflow during the run
 
@@ -189,7 +195,7 @@ verdict as opinion rather than evidence, visibly.
 
 ## 8. The cohort — who and what counts
 
-**The first 30 qualifying items after the start point, whoever owns them.**
+**The first 5 qualifying items after the start point, whoever owns them.**
 
 Invited testers' items count, and they do nothing differently. A tester's item
 runs through the same orchestrator, the same gateway and the same tables:
@@ -224,11 +230,15 @@ that is not enough — an item whose photographs do not settle what it was —
 
 ### Selection advice
 
-Grab a varied set — some branded with model numbers, some without, some
-clothing, some generic, some you expect to go badly. **Do not pre-classify
-anything.** Traits and difficulty are assigned at review time, from the
-photographs and the record. Variety matters because thirty of the same kind of
-thing measures one kind of thing. Advice, not a checklist to satisfy mid-run.
+Grab whatever you would normally sell. **Do not pre-classify anything** — traits
+and difficulty are assigned at review time, from the photographs and the record.
+
+**Do not steer around known defects.** Shoes and apparel stay in normal rotation
+even though [F1](FINDINGS.md) shows V1 cannot publish them: an evaluation that
+avoids the category it just failed in measures the avoidance. If another item
+hits the same defect, that recurrence is recorded as its own finding — a second
+occurrence is evidence about how often this bites, which is worth more than a
+cleaner-looking result.
 
 ## 9. Pre-flight, once, before item #1
 

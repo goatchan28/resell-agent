@@ -812,6 +812,19 @@ def advance(
     return report
 
 
+def _usable_comps(conn, sku: str) -> int:
+    """Comparables this item can actually be priced from.
+
+    An excluded claim is a judgement that a listing is *not* evidence about this
+    item, so counting it as a comparable overstates the market by exactly the
+    listings the judge threw out.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM comp_claim WHERE sku = ? AND comparability != 'excluded'",
+        (sku,),
+    ).fetchone()[0]
+
+
 class StageRunner:
     """Calls the real stages. One method, dispatching on the step.
 
@@ -1206,7 +1219,6 @@ class StageRunner:
         of the lookups this item was allotted is the guard working.
         """
         from resell import views
-        from resell.reasoning.adapters.marketplace import SearchedMarketplaceAdapter
         from resell.reasoning.adapters.search import get_search_backend
         from resell.reasoning.budget import BudgetExceeded
         from resell.reasoning.comp_loop import run_comp_round
@@ -1218,11 +1230,6 @@ class StageRunner:
         if spent:
             return self._conclude_comp_research(conn, sku, why)
 
-        adapter = SearchedMarketplaceAdapter(
-            get_search_backend(),
-            identity_terms=views.identity_terms(conn, sku),
-            echo=lambda *a, **k: None,
-        )
         # The same budgets the predicate above consulted, grants included. Passing
         # them explicitly is what keeps "can this run" and "may this spend" the
         # same question.
@@ -1242,8 +1249,8 @@ class StageRunner:
             # say. Which listings are comparable is a matter of fact about the
             # objects, and the judge sees the whole record.
             outcome = run_comp_round(
-                conn, gateway, sku, research_adapter=adapter, propose_only=False,
-                stage_budget=stage_budget, lookup_budget=lookup_budget,
+                conn, gateway, sku, backend=get_search_backend(),
+                lookup_budget=lookup_budget,
             )
         except BudgetExceeded as exc:
             return f"stopped on this item's search budget: {exc}"
@@ -1285,13 +1292,24 @@ class StageRunner:
         # the budget technically has calls left. Otherwise "let it look again"
         # bought an attempt, the attempt found nothing, and the item went back to
         # a card offering another attempt -- which is the loop with extra steps.
+        #
+        # "Nothing to review" is not "nothing found". When the agent judges its
+        # own comparables -- which it has since `propose_only=False` -- it records
+        # claims and no candidate is ever left pending, so this branch is the
+        # normal ending for a successful round rather than the failure case it
+        # was written as. Reporting it as "found nothing usable" told every item
+        # since MP-000044 that its research had failed: MP-000053 said so with 33
+        # contributing comps on the record.
         if not proposed_now:
-            return self._conclude_comp_research(
-                conn, sku,
-                f"{searched} search(es) found nothing usable"
-                + (f": {(outcome.stop_reason or outcome.stopped)[:70]}"
-                   if outcome.stopped else ""),
-            )
+            usable = _usable_comps(conn, sku)
+            if usable:
+                why = f"{searched} search(es), {usable} usable comparable(s)"
+            else:
+                why = f"{searched} search(es) found nothing usable" + (
+                    f": {(outcome.stop_reason or outcome.stopped)[:70]}"
+                    if outcome.stopped else ""
+                )
+            return self._conclude_comp_research(conn, sku, why)
         if outcome.stopped:
             return (
                 f"{searched} search(es), {found} listing(s): "
@@ -1333,6 +1351,11 @@ class StageRunner:
             "SELECT COUNT(*) FROM research_lookup WHERE sku = ? AND scope = 'pricing'",
             (sku,),
         ).fetchone()[0]
+        # Judged and usable are different numbers, and only one of them can price
+        # an item. MP-000047 recorded ten claims of which one contributed -- nine
+        # were attachment heads and cupping sets -- and "finished with 10
+        # comparable(s)" described a market it did not have.
+        usable = _usable_comps(conn, sku)
 
         if not comp_research_concluded(conn, sku):
             log_event(conn, COMP_RESEARCH_CONCLUDED, {
@@ -1340,11 +1363,18 @@ class StageRunner:
                 "searches": searches,
                 "candidates": collected,
                 "claims": claimed,
-                "sufficient": claimed > 0,
+                "usable": usable,
+                # Whether there is anything to price from, which is what the word
+                # has to mean. A round that judged twelve listings and excluded
+                # all twelve found nothing, however many rows it wrote.
+                "sufficient": usable > 0,
             }, item_id=sku)
             conn.commit()
-        if claimed:
-            return f"comp research finished with {claimed} comparable(s): {why}"
+        if usable:
+            return (
+                f"comp research finished with {usable} usable comparable(s) "
+                f"of {claimed} judged: {why}"
+            )
         return (
             f"comp research finished with no usable comparables after {searches} "
             f"search(es): {why}"

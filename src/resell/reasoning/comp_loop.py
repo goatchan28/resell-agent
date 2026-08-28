@@ -1,116 +1,72 @@
-"""The comp research loop: plan, retrieve, extract, judge, record.
+"""Comp research: identity -> static queries -> search -> filter -> claim.
 
-Same shape as identity research and the same rule at its centre -- the model
-proposes, deterministic code decides what the proposal is permitted to become. What
-differs is what is at stake. Identity research that goes wrong attaches the wrong
-attributes to an object. Comp research that goes wrong produces a *number*, and a
-number carries an authority that prose does not.
+No model calls. The stage that used to plan searches, read pages and judge
+comparability with three LLM stages now does the same work with string rules,
+and the replay that justified the change is in `bench/`: across the V1 baseline,
+161 of 161 comps that reached a price came from the search index and none from
+the fetch-and-extract route that cost 30% of the pricing budget.
 
-So three things are computed here rather than accepted from the model:
+One round of four fixed queries. No planner, no research ladder, no adaptive
+rounds, no fallback to a model. If the queries are wrong the fix is the queries.
 
-  sold or asking   from the text the extractor quoted -- see `comp_reading`
-  condition band   from the seller's own wording, mapped, defaulting to unknown
-  the ladder       `record_comp_claim` refuses any rung above the item's identity
-                   ceiling, whatever the judge said
+**The invariant this module exists to protect.** *"Set a price yourself" is a
+statement about the market: we looked, and there is not enough to price from.* A
+search that failed is not that. A query that raises, or a round the budget never
+let search at all, leaves `incomplete_reason` set and `judging_complete` false,
+and the orchestrator raises rather than concluding. A round where every search
+succeeded and found nothing is still allowed to say so, because that is the case
+the sentence is for.
 
-**This module does not price anything.** It records observations and claims, and
-stops. `price recommend` reads them, `build_strategies` turns them into options and
-`price propose` commits to one. Nothing here computes a central estimate, suggests a
-figure, or so much as sorts the comps by price -- a research stage that emits a
-number is a pricing engine nobody reviewed.
+Classification is deterministic and happens in memory, so there is no judging
+stage that can run out of budget partway and leave a listing unjudged --
+`unjudged` is empty by construction rather than by luck.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-import sqlite3
-import uuid
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from resell import store_pricing as sp
 from resell import progress
 from resell.db import log_event
-from resell.pricing.comps import (
-    CompClaim,
-    CompObservation,
-    Comparability,
-    ConditionSource,
-    ModelVisibility,
-    RetrievalMethod,
-    ceiling_for_identity,
-)
-from resell.reasoning.adapters import AdapterError, ModelAdapter, get_adapter
-from resell.reasoning.adapters.research import ResearchError, ResearchQuery
-from resell.reasoning.budget import (
-    BudgetExceeded,
-    LookupBudget,
-    LookupRates,
-    LookupSpend,
-    StageBudget,
-    StageSpend,
-    check,
-    check_lookup_plan,
-    estimate_cost,
-)
-from resell.reasoning.comp_reading import (
-    band_for_declared_condition, basis_for, read_price_kind, retail_from_source,
-)
-from resell.reasoning.ledger import CallStatus, begin_call, finalize_call
-from resell.reasoning.stages import (
-    comp_judging_stage,
-    comp_planning_stage,
-    render_observations,
-)
-from resell.reasoning.tools import (
-    parse_comp_judge_tool_input,
-    parse_comp_plan_tool_input,
-)
+from resell.pricing.comps import Comparability, ceiling_for_identity
+from resell.reasoning.adapters.research import ResearchQuery
+from resell.reasoning.adapters.search import hits_as_asking_comps
+from resell.reasoning.comp_match import classify
+from resell.reasoning.comp_queries import identity_terms, queries_for
 
 
 class CompLoopError(RuntimeError):
-    pass
+    """The round could not run at all."""
 
 
 @dataclass
 class CompRoundOutcome:
-    plan: object | None = None
+    """What one round did, in the vocabulary the orchestrator and /ops read."""
+
     performed: list[str] = field(default_factory=list)
     deferred: list[str] = field(default_factory=list)
     deferral_reason: str = ""
     listings_found: int = 0
     comps_recorded: int = 0
-    # Of those, the ones their source's licence allows into a prompt -- which is
-    # the set the judge is actually shown, and so the only honest denominator for
-    # "how many came back without a verdict".
+    # Every comp is classified, so this equals `comps_recorded`. Kept because
+    # `CompRoundIncomplete` reports it as the denominator for "how many came back
+    # without a verdict", and that number should stay meaningful.
     promptable_recorded: int = 0
     claims_recorded: int = 0
-    candidates_offered: int = 0
     refused: list[str] = field(default_factory=list)
     ladder: dict[str, int] = field(default_factory=dict)
     kinds: dict[str, int] = field(default_factory=dict)
-    downgraded: list[str] = field(default_factory=list)
-    withheld_from_model: list[str] = field(default_factory=list)
     stopped: str | None = None
     stop_reason: str = ""
     notes: list[str] = field(default_factory=list)
-    # The extraction budget ran out partway. Not a failure: the round keeps what
-    # it retrieved, judges it, and stops searching for pages it cannot read.
-    stopped_early: bool = False
-    # Retail research, counted apart from everything above it.
-    retail_query: str = ""
-    retail_pages_read: int = 0
-    retail_recorded: int = 0
-    retail_skipped: str = ""
-    # Listings that went into judging and came back without a verdict, and why.
-    #
-    # An empty list is the only thing that makes "no usable comparables" a
-    # statement about the market. With anything in it the round did not finish,
-    # and what it found is a partial answer -- worth keeping, never worth
-    # reporting as though the market had been searched and come up short.
+    # Listings that went into judging and came back without a verdict. Always
+    # empty here -- classification cannot fail partway -- and kept because the
+    # orchestrator's incompleteness check reads it.
     unjudged: list[str] = field(default_factory=list)
     incomplete_reason: str = ""
+    retail_hits_dropped: int = 0
 
     @property
     def judging_complete(self) -> bool:
@@ -118,1290 +74,388 @@ class CompRoundOutcome:
 
 
 def _uid(prefix: str) -> str:
+    import uuid
+
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
-STAGE_SAYS: dict[str, str] = {
-    "comp_plan": "working out what to search for",
-    "comp_extract": "reading the listings on the page",
-    "comp_judge": "deciding which are comparable",
-}
+def _identity_resolution(conn, sku: str) -> str:
+    from resell.reasoning.research_loop import identity_resolution
+
+    return str(identity_resolution(conn, sku))
 
 
-# How many listings go into one judging call, and how much room its answer gets.
+MAX_COMPS_PER_SEARCH = 12
+
+# Bounds on the diagnostic event, so one noisy round cannot write a huge row.
+MAX_NOTES = 120
+NOTE_CHARS = 400
+
+
+# A comp is a resale listing. A retailer's shelf price is retail evidence, which
+# is a different kind of thing and is deliberately not built in this pass.
 #
-# Batching is the guarantee; the ceiling is only headroom inside a batch. A
-# judgement runs about 110 output tokens once it carries a comp id, a rung,
-# citations on both sides, a rationale and -- for an exclusion -- a reason. At
-# ten per call that is roughly 1,100 against 8,000, so a batch cannot outgrow
-# its budget however verbose one judgement turns out to be.
+# V1 never needed this rule because it had one by accident: it only took
+# search-index comps from hosts it was *not permitted to fetch*, which in
+# practice meant eBay, and 88% of every contributing comp in the record
+# (324 of 369) is `ebay.com`. Feeding all priced hits to the extractor removed
+# that accident, and the replay immediately priced a used moisturiser from
+# Walmart, Walgreens, Ulta, CVS and Costco -- fifteen of its sixteen comps were
+# shops selling it new.
 #
-# Raising the ceiling alone would not have fixed anything. It defers the number
-# at which truncation returns: 4,000 broke at 35 listings, 8,000 would break at
-# 70, and the failure would look exactly the same when it came.
-# --- one round, three units ---------------------------------------------------
-#
-# `StageBudget.max_calls` is a count of physical model calls, and it was written
-# when every stage made exactly one. Three stages fan out -- search by plan size,
-# extraction by how many pages a search engine returned, judging by how many
-# listings came back -- so the same number came to mean three different things.
-# MP-000039 lost thirty verdicts to it; MP-000041 spent its whole extraction
-# allowance on the first query's three manufacturer pages and never ran searches
-# three or four.
-#
-# So three quantities, each counted in its own unit:
-#
-#   rounds    how many times the agent may go round the loop. Counted by
-#             `comp_plan` calls, which is one per round by construction, and
-#             already what `comp_research_exhausted` gates on.
-#   breadth   how far a single round may fan out: searches (LookupBudget),
-#             documents per round (EXTRACT_PER_ROUND), listings per judging
-#             batch (JUDGE_BATCH).
-#   money     `max_cost_micros`, summing every physical call whatever stage it
-#             belongs to. The real ceiling, and the only one that should stop a
-#             round in flight.
-#
-# Breadth is what keeps any one round affordable; money is what keeps the item
-# affordable. Neither is the per-call cap, which now bounds rounds alone.
-
-# Documents one round may extract from. Eight rather than three: a single query
-# returning three pages must not be able to spend the whole item's allowance, and
-# a round that reads eight pages has been given a fair chance to find a market.
-EXTRACT_PER_ROUND = 8
-
-# --- retail research, the second evidence objective ---------------------------
-#
-# Pricing research has two objectives and they are counted separately:
-#
-#   marketplace research  ->  what strangers ask or get for used ones
-#   retail research       ->  what the thing costs new, from someone entitled
-#                             to sell it new
-#
-# Separate because they are different questions with different extractors,
-# different storage and different downstream evidence types -- and because
-# MP-000047 showed what sharing a budget costs. Eight extractions that round all
-# went to shop pages the comp extractor could not read, the marketplace searches
-# planned as 4 and 5 never ran, and the item was priced from one $45 ask while
-# $399.00 sat unread on a page the round had already fetched.
-#
-# Narrow on purpose. One targeted query, and only while the answer is unknown:
-# a shop price does not change between two rounds of one run, so once a
-# same-product current price is on the record the question is closed.
-RETAIL_EXTRACT_PER_ROUND = 2
-
-# What the retail-intent query looks for. Deliberately not a marketplace query:
-# "used", "for sale" and "second-hand" are what the other objective asks, and
-# adding them here returns resale listings again.
-# Wording that has to name the *thing*, not just who made it.
-#
-# "Achedaway price new official store" returns the brand's homepage, which sells
-# nothing -- it is navigation, and the products are a click away. Adding the
-# product noun ("massage gun") turns up
-# `achedaway.com/collections/achedaway-massage-gun`, which has the prices. The
-# noun usually only exists in the drafted title, so the title is used whenever
-# the model is unknown, with the condition wording stripped: "USED Excellent" in
-# a retail query asks for the wrong market entirely.
-_CONDITION_WORDS = (
-    "used", "new", "pre-owned", "preowned", "excellent", "very good", "good",
-    "fair", "refurbished", "open box", "for parts", "with tags", "nwt",
-)
+# So the rule is explicit now, and small. Adding a marketplace is a deliberate
+# act; a host nobody has vouched for contributes nothing.
+RESALE_MARKETPLACES = frozenset({
+    "ebay.com", "ebay.co.uk", "ebay.ca",
+    "mercari.com", "poshmark.com", "depop.com", "grailed.com", "vinted.com",
+    "offerup.com", "swappa.com", "reverb.com", "stockx.com", "goat.com",
+    "therealreal.com", "vestiairecollective.com",
+})
 
 
-def retail_query_for(brand: str | None, model: str | None, title: str | None) -> str:
-    """The one retail-intent search a round may spend.
-
-    Built from identity rather than proposed by the planner. The planner is
-    briefed to find a resale market and does that well; asking it to also carry
-    an unrelated objective is how the objective gets dropped on the items that
-    need it most.
-    """
-    if brand and model and model.strip():
-        subject = f"{brand} {model}".strip()
-    elif title and title.strip():
-        subject = _without_condition(title)
-    elif brand:
-        subject = brand.strip()
-    else:
-        return ""
-    return f"{subject} price official site".strip() if subject else ""
+def is_resale_marketplace(host: str) -> bool:
+    """Whether a price from this host is a resale comp at all."""
+    host = (host or "").casefold().removeprefix("www.")
+    return any(host == m or host.endswith(f".{m}") for m in RESALE_MARKETPLACES)
 
 
-def _without_condition(title: str) -> str:
-    """The product, with the grade taken off. `title` is written to sell a used
-    one and this query is asking a shop what a new one costs."""
-    head = title.split(" - ")[0].split(" | ")[0].split(",")[0]
-    words = [w for w in head.split()
-             if w.strip(",.").casefold() not in _CONDITION_WORDS]
-    return " ".join(words).strip()
+@dataclass
+class Timing:
+    """Wall-clock per phase. Recorded because the point of this path is speed."""
 
-JUDGE_BATCH = 10
-# Sized to the batch rather than to the old single-call world.
-#
-# The cost guard reserves a call's *whole* output ceiling as its worst case, so a
-# fixed 8,000 made each batch reserve about $0.12 of a $0.25 stage budget and a
-# four-batch round could not fit -- the same mistake as the call cap, one step
-# along: a number written when a round was one call, applied to each of four.
-#
-# Nine real batches of ten listings have peaked at 1,736 output tokens, so 300
-# per listing leaves roughly three-quarters again in hand while keeping the
-# reservation close to what a batch actually costs.
-JUDGE_OUTPUT_TOKENS_PER_LISTING = 300
-JUDGE_OUTPUT_FLOOR = 1500
+    search_s: float = 0.0
+    extract_s: float = 0.0
+    match_s: float = 0.0
+    price_s: float = 0.0
+
+    @property
+    def total_s(self) -> float:
+        return self.search_s + self.extract_s + self.match_s + self.price_s
 
 
-def judge_output_tokens(listings: int) -> int:
-    return max(JUDGE_OUTPUT_FLOOR, listings * JUDGE_OUTPUT_TOKENS_PER_LISTING)
+@dataclass
+class RoundV2:
+    queries: tuple[str, ...] = ()
+    hits: int = 0
+    observations: list = field(default_factory=list)
+    verdicts: dict = field(default_factory=dict)     # comp_id -> Verdict
+    notes: list[str] = field(default_factory=list)
+    timing: Timing = field(default_factory=Timing)
+    retail_hits_dropped: int = 0
+
+    @property
+    def contributing(self) -> list:
+        return [o for o in self.observations
+                if self.verdicts[o.comp_id].comparability is not Comparability.EXCLUDED]
+
+    @property
+    def ladder(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for v in self.verdicts.values():
+            out[str(v.comparability)] = out.get(str(v.comparability), 0) + 1
+        return out
 
 
-def _batches(items, size: int):
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
-
-
-def _round_spend(conn, sku, purpose: str):
-    """A fan-out stage's spend, counted in rounds rather than physical calls.
-
-    Rounds come from `comp_plan`, one per round by construction. Money is the
-    stage's real accumulated cost, so `max_cost_micros` still sees every batch
-    and every document.
-    """
-    from resell.reasoning.budget import StageSpend
-    from resell.reasoning.vision import spend_so_far
-
-    return StageSpend(
-        calls=spend_so_far(conn, sku, "comp_plan").calls,
-        cost_micros=spend_so_far(conn, sku, purpose).cost_micros,
-    )
-
-
-def _judging_spend(conn, sku, this_round_micros: int = 0):
-    """What judging has used, counted the way the budget means it.
-
-    `max_calls` on this stage means judging *rounds*, and it was written when a
-    round was one model call. Batching made a round several, so charging each
-    batch against the same cap made a round of four look like four rounds -- and
-    at a cap of three, MP-000039's fourth batch was refused, taking thirty
-    verdicts already paid for with it.
-
-    Rounds are counted by plans instead: exactly one `comp_plan` precedes each
-    round, and `comp_research_exhausted` already gates the stage on that same
-    number, so this is the existing bound rather than a new one.
-
-    Money is not relaxed. Every batch is ledgered as its own call and its cost is
-    summed here, so `max_cost_micros` still sees the true total -- including what
-    the current round has spent so far, which the ledger does not yet show for a
-    call that has not finished.
-    """
-    from resell.reasoning.budget import StageSpend
-    from resell.reasoning.vision import spend_so_far
-
-    return StageSpend(
-        calls=spend_so_far(conn, sku, "comp_plan").calls,
-        cost_micros=spend_so_far(conn, sku, "comp_judge").cost_micros
-        + this_round_micros,
-    )
-
-
-def _judge_in_batches(conn, sku, adapter, promptable, observations, ceiling, budget,
-                      outcome=None):
-    """Judge every retrieved listing, in chunks small enough to answer in full.
-
-    One listing is judged exactly once: the batches partition the list, and each
-    call is told only its own ids -- so a judgement naming a comp from another
-    batch is refused by the parser exactly as an invented one is.
-
-    Everything else is unchanged. Same schema, same citation requirements on
-    both sides, same ladder, same ceiling enforced at recording. Merging is
-    ordered by batch and then by the order the model answered in, so the same
-    listings in the same order produce the same claims.
-    """
-    from dataclasses import replace
-
-    from resell.reasoning.tools import CompJudgements
-
-    # The estimate that bounds worst-case cost has to match what the request
-    # actually asks for, or the budget check is measuring the wrong thing.
-    # Per batch, because the batches differ in size and the last one is usually
-    # short. Reserving the largest batch's ceiling for a batch of one is what
-    # made a round of four unaffordable.
-    def budget_for(size: int):
-        return replace(budget, max_output_tokens=judge_output_tokens(size))
-    valid_item_evidence = {row["id"] for row in observations}
-    identification = render_identification(conn, sku)
-    rendered_observations = render_observations(observations)
-
-    merged = CompJudgements()
+def plan_round(
+    *,
+    brand: str | None,
+    model: str | None,
+    title: str | None,
+    backend,
+    item_type: str | None = None,
+    identity_resolution: str = "unattempted",
+    item_evidence_ids: tuple[str, ...] = ("1",),
+    max_comps_per_search: int = MAX_COMPS_PER_SEARCH,
+    now: datetime | None = None,
+) -> RoundV2:
+    """Queries -> search -> observations -> verdicts. No database, no model."""
+    now = now or datetime.now(UTC)
+    ceiling = ceiling_for_identity(identity_resolution)
+    round_ = RoundV2(queries=queries_for(brand, model, title))
+    terms = identity_terms(brand, model, title)
     seen: set[str] = set()
-    batches = list(_batches(list(promptable), JUDGE_BATCH))
-    for number, batch in enumerate(batches, start=1):
-        if len(batches) > 1:
-            progress.report(
-                progress.Phase.JUDGING,
-                f"weighing listings {number} of {len(batches)}",
-            )
-        batch_budget = budget_for(len(batch))
-        request = comp_judging_stage(
-            identification=identification,
-            observations=rendered_observations,
-            comps=render_retrieved(batch),
-            identity_ceiling=str(ceiling),
-            max_output_tokens=batch_budget.max_output_tokens,
-        )
+
+    for query in round_.queries:  # noqa: B007 - `round_` is built up as we go
+        started = time.perf_counter()
         try:
-            result = _run_stage(
-                conn, sku, adapter, request, purpose="comp_judge",
-                budget=batch_budget, spent=_judging_spend(conn, sku),
-            )
-        except (BudgetExceeded, CompLoopError) as exc:
-            # Whatever the earlier batches decided is kept. Thirty verdicts that
-            # cost real money are not thrown away because the thirty-first could
-            # not be asked for -- and the listings that never got a verdict are
-            # named, so nothing downstream can mistake this for a finished round.
-            merged.malformed.append(f"batch {number} of {len(batches)}: {exc}")
-            if outcome is not None:
-                outcome.incomplete_reason = str(exc)
-            break
-        judged = parse_comp_judge_tool_input(
-            result.tool_input,
-            valid_item_evidence=valid_item_evidence,
-            valid_comp_ids={obs.comp_id for obs in batch},
+            hits = backend.find(ResearchQuery(query, "marketplace", "comp research"),
+                                limit=40)
+        except Exception as exc:  # noqa: BLE001 - one bad query must not lose the round
+            round_.timing.search_s += time.perf_counter() - started
+            round_.notes.append(f"search failed ({query}): {type(exc).__name__}: {exc}")
+            continue
+        round_.timing.search_s += time.perf_counter() - started
+        round_.hits += len(hits)
+
+        started = time.perf_counter()
+        # Resale listings only. Retailers are dropped here rather than judged
+        # later: a shop price is not a worse comp, it is not a comp.
+        resale = [h for h in hits if is_resale_marketplace(h.host)]
+        dropped = len(hits) - len(resale)
+        if dropped:
+            round_.retail_hits_dropped += dropped
+        observations, notes = hits_as_asking_comps(
+            resale, identity_terms=terms, now=now,
+            max_comps=max_comps_per_search, seen=seen,
         )
-        merged.malformed.extend(judged.malformed)
-        for judgement in judged.judgements:
-            if judgement.comp_id in seen:
-                merged.malformed.append(
-                    f"{judgement.comp_id} judged more than once; keeping the first"
-                )
-                continue
-            seen.add(judgement.comp_id)
-            merged.judgements = merged.judgements + (judgement,)
+        round_.timing.extract_s += time.perf_counter() - started
+        round_.observations.extend(observations)
+        round_.notes.extend(notes)
 
-    # Every listing that went in should have come back with a verdict. Saying so
-    # is the difference between "the judge considered it and said nothing" and
-    # "it never got there", which is the distinction this whole change is about.
-    unjudged = [obs.comp_id for obs in promptable if obs.comp_id not in seen]
-    if unjudged:
-        merged.malformed.append(
-            f"{len(unjudged)} listing(s) came back without a verdict"
+    started = time.perf_counter()
+    for obs in round_.observations:
+        round_.verdicts[obs.comp_id] = classify(
+            brand=brand, model=model, item_title=title, comp_title=obs.title,
+            item_evidence_ids=item_evidence_ids, ceiling=ceiling,
+            item_type=item_type,
         )
-        if outcome is not None:
-            outcome.unjudged = unjudged
-    return merged
-
-
-def _run_stage(conn, sku, adapter: ModelAdapter, request, *, purpose: str,
-               budget: StageBudget, spent: StageSpend):
-    """A ledgered, budgeted model call. Same as every other stage."""
-    rates = adapter.rates()
-    estimate = estimate_cost(adapter.estimate_input_tokens(request), budget, rates)
-    check(budget, spent, estimate)
-    said = STAGE_SAYS.get(purpose, purpose.replace("_", " "))
-
-    call_id = begin_call(
-        conn, sku, purpose=purpose, provider=adapter.provider, model=adapter.model,
-        estimated_cost_micros=estimate.worst_case_micros, rate_basis=str(rates.basis),
-        request_key=request.replay_key(),
-    )
-    try:
-        with progress.timed(progress.Phase.THINKING, said):
-            result = adapter.run(request)
-    except AdapterError as exc:
-        finalize_call(conn, call_id, status=CallStatus.PROVIDER_ERROR, error=str(exc)[:2000])
-        raise CompLoopError(str(exc)) from exc
-
-    # A response cut off at the ceiling is not a short answer, it is half an
-    # answer: the tool call's JSON stops mid-structure and parses to nothing.
-    # Downstream that was indistinguishable from a model that considered every
-    # listing and rejected all of them, so MP-000038's judging was truncated
-    # twice and the item slid to "decide a price without comparables" with
-    # seventeen perfectly good comps already on disk.
-    #
-    # Billed as `parse_failed`: the money was spent and the answer is unusable,
-    # which is exactly what that status is for.
-    truncated = result.stop_reason == "max_tokens"
-    finalize_call(
-        conn, call_id,
-        status=CallStatus.PARSE_FAILED if truncated else CallStatus.COMPLETED,
-        input_tokens=result.usage.input_tokens, output_tokens=result.usage.output_tokens,
-        cost_micros=rates.cost_micros(result.usage.input_tokens, result.usage.output_tokens),
-        latency_ms=result.latency_ms, response=result.raw_response,
-        raw_usage=result.usage.raw,
-        error=(f"{purpose}: the answer was cut off at "
-               f"{result.usage.output_tokens} output tokens" if truncated else None),
-    )
-    if truncated:
-        raise CompLoopError(
-            f"{said} was cut off at {result.usage.output_tokens} output tokens; "
-            f"the answer is incomplete and cannot be read as a result"
-        )
-    return result
-
-
-def _stage_spend(conn, sku, purpose) -> StageSpend:
-    from resell.reasoning.vision import spend_so_far
-
-    return spend_so_far(conn, sku, purpose)
-
-
-def render_identification(conn: sqlite3.Connection, sku: str) -> str:
-    """What the item is believed to be, as the planner and judge see it."""
-    from resell.gateway import current_identification
-
-    row = current_identification(conn, sku)
-    if row is None:
-        return "(nothing identified yet)"
-    lines = []
-    for field_name in ("brand", "model", "variant", "title", "category_id", "condition_id"):
-        if row[field_name]:
-            lines.append(f"{field_name}: {row[field_name]}")
-    if row["aspects"]:
-        for name, values in sorted(json.loads(row["aspects"]).items()):
-            lines.append(f"aspect {name}: {' + '.join(map(str, values))}")
-    mode = row["mode"] if "mode" in row.keys() else None
-    if mode:
-        lines.append(f"identification mode: {mode}")
-    return "\n".join(lines) or "(nothing identified yet)"
-
-
-def render_recorded_comps(conn: sqlite3.Connection, sku: str) -> str:
-    """Comps already on file, so the planner does not re-find what it has.
-
-    Prices are shown because the planner needs to see where the sample is thin,
-    not so it can form a view about the number. It has no tool with which to say
-    one.
-    """
-    scored = sp.load_scored_comps(conn, sku)
-    if not scored:
-        return ""
-    lines = []
-    for entry in scored:
-        obs = entry.observation
-        lines.append(
-            f"[{obs.comp_id}] {obs.price_kind.verb} {obs.price_cents / 100:.2f} "
-            f"({obs.condition_band}) {entry.claim.comparability} - {(obs.title or '')[:60]}"
-        )
-    return "\n".join(lines)
-
-
-def render_retrieved(comps: list[CompObservation]) -> str:
-    """Retrieved listings as the judge sees them. Field names are the citable ones."""
-    lines = []
-    for obs in comps:
-        shipping = (
-            f"{obs.shipping_cents / 100:.2f}" if obs.shipping_cents is not None
-            else "not stated"
-        )
-        lines.append(
-            f"[{obs.comp_id}]\n"
-            f"  title: {obs.title}\n"
-            f"  price: {obs.price_cents / 100:.2f} ({obs.price_kind})\n"
-            f"  shipping: {shipping}\n"
-            f"  condition_text: {obs.condition_declared_raw or 'not stated'} "
-            f"({obs.condition_band})\n"
-            f"  marketplace: {obs.marketplace}"
-        )
-    return "\n".join(lines)
-
-
-def _prior_lookups(conn, sku: str) -> list[str]:
-    return [
-        row["query"] for row in conn.execute(
-            "SELECT query FROM research_lookup WHERE sku = ? AND scope = 'pricing'",
-            (sku,),
-        )
-    ]
-
-
-# --- the round ---------------------------------------------------------------
+    round_.timing.match_s = time.perf_counter() - started
+    return round_
 
 
 def run_comp_round(
-    conn: sqlite3.Connection,
+    conn,
     gateway,
     sku: str,
     *,
-    model_adapter: ModelAdapter | None = None,
-    research_adapter=None,
-    provider: str | None = None,
-    stage_budget: StageBudget | None = None,
-    lookup_budget: LookupBudget | None = None,
-    lookup_rates: LookupRates | None = None,
-    dry_run: bool = False,
-    propose_only: bool = False,
-) -> CompRoundOutcome:
-    """One comp research round. Records comps and claims; recommends nothing.
+    backend,
+    lookup_budget=None,
+    lookup_rates=None,
+    max_comps_per_search: int = MAX_COMPS_PER_SEARCH,
+):
+    """One deterministic round, recorded. Returns V1's `CompRoundOutcome`.
 
-    `propose_only` writes comp *candidates* instead of claims: the judge's rung is
-    recorded as a proposal and an operator accepts or rejects it in one action.
-    That is what the UI runs, so the observation/claim split never surfaces as two
-    things to do. The CLI keeps the direct path, where the judgement stands on its
-    own.
+    Returning V1's outcome type rather than inventing a second one is the whole
+    integration: the orchestrator, `/ops` and `round_detail` already read it, and
+    a parallel shape would mean teaching three readers about a fourth vocabulary.
+    Fields V2 has no equivalent for -- the research ladder, retail counters,
+    deferral of a planner's proposals -- are simply left at their defaults.
+
+    **The invariant this function exists to protect.** "Set a price yourself" is a
+    statement about the market: we looked, and there is not enough to price from.
+    A search that *failed* is not that. V1 protects this with
+    `judging_complete`, and V2 sets the same flag from the same idea -- a query
+    that raised, or a round that was never allowed to search at all, leaves
+    `incomplete_reason` set, and the orchestrator raises rather than concluding.
+
+    One round of the fixed queries. No second round, no adaptive research.
     """
-    from resell.gateway import observations_in_scope
+    import json as _json
+    import sqlite3
+
+    from resell import store_pricing as sp
+    from resell.pricing.comps import CompClaim
+    from resell.reasoning.budget import (
+        LookupBudget, LookupRates, LookupSpend, check_lookup_plan,
+    )
 
     outcome = CompRoundOutcome()
-    observations = observations_in_scope(conn, sku)
-    if not observations:
-        raise CompLoopError(f"{sku} has no observations; run: resell item observe {sku}")
-    if research_adapter is None:
-        raise CompLoopError("no retrieval adapter supplied")
+    identification = conn.execute(
+        "SELECT brand, model, title, aspects FROM identification WHERE sku = ? "
+        "ORDER BY version DESC LIMIT 1", (sku,),
+    ).fetchone()
+    if identification is None:
+        outcome.stopped = "no_identification"
+        outcome.incomplete_reason = f"{sku} has no identification to search from"
+        return outcome
 
-    model_adapter = model_adapter or get_adapter(provider)
-    stage_budget = stage_budget or StageBudget.from_env("comp_research")
-    # A separate allowance from identity research, so a hard-to-identify item
-    # cannot spend the comp budget before pricing has started.
-    lookup_budget = lookup_budget or LookupBudget.from_env("pricing")
-    lookup_rates = lookup_rates or LookupRates.from_env(research_adapter.provider)
-
+    aspects = _json.loads(identification["aspects"] or "{}") or {}
+    types = aspects.get("Type") or aspects.get("Product Type") or []
+    item_type = types[0] if types else None
     resolution = _identity_resolution(conn, sku)
     ceiling = ceiling_for_identity(resolution)
+    evidence = tuple(
+        str(r["id"]) for r in conn.execute(
+            "SELECT id FROM evidence WHERE sku = ? AND subject = 'this_item' "
+            "ORDER BY id LIMIT 3", (sku,))
+    )
+    if not evidence:
+        # `validate_claim` refuses a claim citing nothing, so a round with no
+        # observations to cite would record comps it could never claim.
+        outcome.stopped = "no_observations"
+        outcome.incomplete_reason = (
+            f"{sku} has no observations to cite; run: resell item observe {sku}"
+        )
+        return outcome
 
+    queries = queries_for(identification["brand"], identification["model"],
+                          identification["title"])
+    if not queries:
+        outcome.stopped = "no_identity"
+        outcome.stop_reason = "the item has no brand, model or title to search for"
+        return outcome
+
+    lookup_budget = lookup_budget or LookupBudget.from_env("pricing")
+    lookup_rates = lookup_rates or LookupRates.from_env(
+        getattr(backend, "provider", "search"))
     performed_count = conn.execute(
         "SELECT COUNT(*) FROM research_lookup WHERE sku = ? AND scope = 'pricing'",
         (sku,),
     ).fetchone()[0]
-    if performed_count >= lookup_budget.max_lookups:
-        outcome.stopped = "exhausted"
-        outcome.stop_reason = (
-            f"{performed_count} pricing lookup(s) already performed, which is the "
-            f"budget for this item"
-        )
-        return outcome
-
-    # --- plan -----------------------------------------------------------------
-    request = comp_planning_stage(
-        identification=render_identification(conn, sku),
-        observations=render_observations(observations),
-        identity_resolution=resolution,
-        existing_comps=render_recorded_comps(conn, sku),
-        prior_lookups="\n".join(_prior_lookups(conn, sku)),
-        max_output_tokens=stage_budget.max_output_tokens,
+    allocation = check_lookup_plan(
+        lookup_budget, LookupSpend(lookups=performed_count, cost_micros=0),
+        len(queries), lookup_rates,
     )
-    result = _run_stage(
-        conn, sku, model_adapter, request, purpose="comp_plan",
-        budget=stage_budget, spent=_stage_spend(conn, sku, "comp_plan"),
-    )
-    plan = parse_comp_plan_tool_input(
-        result.tool_input,
-        valid_evidence_ids={row["id"] for row in observations},
-        already_searched=set(_prior_lookups(conn, sku)),
-    )
-    outcome.plan = plan
-    outcome.notes.extend(f"plan: {note}" for note in plan.malformed)
-
-    if not plan.usable:
-        outcome.stopped = "plan_unusable"
-        outcome.stop_reason = (
-            "the planner's arguments could not be read. Nothing was recorded and no "
-            "lookup was spent; re-run to try again."
-        )
-        return outcome
-    if plan.sufficient or not plan.lookups:
-        outcome.stopped = "sufficient"
-        outcome.stop_reason = plan.rationale or "the planner proposed no searches"
-        return outcome
-
-    spent = LookupSpend(lookups=performed_count, cost_micros=0)
-    allocation = check_lookup_plan(lookup_budget, spent, len(plan.lookups), lookup_rates)
     outcome.deferral_reason = allocation.reason
-    outcome.deferred = [plan.lookups[i].query for i in allocation.deferred]
-    if allocation.trimmed and not dry_run:
-        log_event(
-            conn, "comp_research.lookups_deferred",
-            {"reason": allocation.reason, "deferred": outcome.deferred}, item_id=sku,
+    outcome.deferred = [queries[i] for i in allocation.deferred]
+    if allocation.allowed <= 0:
+        # Nothing was searched, so nothing was learned. Reported as incomplete
+        # rather than as an empty market -- this is exactly the shape that made
+        # MP-000039 ask its owner to name a price.
+        outcome.stopped = "exhausted"
+        outcome.stop_reason = allocation.reason
+        outcome.incomplete_reason = (
+            f"no pricing lookup was permitted for {sku}: {allocation.reason}"
         )
-
-    if dry_run:
-        outcome.performed = [l.query for l in plan.lookups[: allocation.allowed]]
         return outcome
 
-    # --- retrieve and extract --------------------------------------------------
-    recorded: list[CompObservation] = []
-    planned_total = len(plan.lookups[: allocation.allowed])
-    # Counted across the round rather than per query, so one search returning ten
-    # pages cannot consume what the other three were going to need.
-    extracted_this_round = 0
-    for index, planned in enumerate(plan.lookups[: allocation.allowed], start=1):
-        progress.report(
-            progress.Phase.SEARCHING,
-            f"search {index}/{planned_total}: {planned.query[:60]}",
+    terms = identity_terms(identification["brand"], identification["model"],
+                           identification["title"])
+    now = datetime.now(UTC)
+    seen: set[str] = set()
+    observations: list = []
+    failures: list[str] = []
+
+    for index, query in enumerate(queries[: allocation.allowed], start=1):
+        progress.report(progress.Phase.SEARCHING,
+                        f"search {index}/{allocation.allowed}: {query[:60]}")
+        try:
+            hits = backend.find(ResearchQuery(query, "marketplace", "comp research"),
+                                limit=40)
+        except Exception as exc:  # noqa: BLE001 - recorded, never swallowed
+            failures.append(f"{query}: {type(exc).__name__}: {exc}")
+            outcome.notes.append(f"lookup failed ({query}): {type(exc).__name__}: {exc}")
+            continue
+
+        resale = [h for h in hits if is_resale_marketplace(h.host)]
+        found, notes = hits_as_asking_comps(
+            resale, identity_terms=terms, now=now,
+            max_comps=max_comps_per_search, seen=seen,
+        )
+        observations.extend(found)
+        outcome.notes.extend(notes)
+        if len(hits) - len(resale):
+            outcome.notes.append(
+                f"{len(hits) - len(resale)} priced result(s) from {query!r} were not "
+                f"resale marketplaces and are not comps"
+            )
+        gateway.record_lookup(
+            sku, provider=getattr(backend, "provider", "search"), query=query,
+            motivation="comp research", evidence_ids=[int(e) for e in evidence],
+            result_count=len(hits), scope="pricing",
+            cost_micros=backend.cost_micros_per_search(),
+        )
+        outcome.performed.append(query)
+
+    # A query that raised is a technical failure, and a technical failure must
+    # never read as an empty market. Even a partially successful round is
+    # reported incomplete: what it found is a partial answer, worth keeping and
+    # never worth presenting as though the market had been searched.
+    if failures:
+        outcome.incomplete_reason = (
+            f"{len(failures)} of {allocation.allowed} search(es) failed: "
+            + "; ".join(f[:120] for f in failures[:3])
+        )
+
+    outcome.listings_found = len(observations)
+    stored = []
+    for obs in observations:
+        try:
+            sp.record_comp_observation(conn, obs)
+        except sqlite3.IntegrityError:
+            outcome.notes.append(f"already recorded: {obs.comp_id}")
+        stored.append(obs)
+        outcome.kinds[str(obs.price_kind)] = outcome.kinds.get(str(obs.price_kind), 0) + 1
+    outcome.comps_recorded = len(stored)
+    # Everything retrieved is classified, deterministically and in memory. There
+    # is no judging stage to run out of budget partway, so `unjudged` stays empty
+    # by construction rather than by luck.
+    outcome.promptable_recorded = len(stored)
+
+    for obs in stored:
+        verdict = classify(
+            brand=identification["brand"], model=identification["model"],
+            item_title=identification["title"], comp_title=obs.title,
+            item_evidence_ids=evidence, ceiling=ceiling, item_type=item_type,
         )
         try:
-            documents = research_adapter.search(
-                ResearchQuery(planned.query, "marketplace", planned.motivation)
-            )
-        except ResearchError as exc:
-            outcome.notes.append(f"lookup failed ({planned.query}): {exc}")
-            _drain_adapter_notes(research_adapter, outcome)
+            sp.record_comp_claim(conn, CompClaim(
+                claim_id=_uid("claim"), sku=sku, comp_id=obs.comp_id,
+                comparability=verdict.comparability,
+                item_citations=evidence, comp_citations=verdict.comp_citations,
+                rationale=verdict.rationale, excluded_reason=verdict.excluded_reason,
+            ), identity_resolution=resolution)
+        except ValueError as exc:
+            # The ladder ceiling, refused where it is enforced.
+            outcome.refused.append(f"{obs.comp_id}: {exc}")
             continue
-        except Exception as exc:  # noqa: BLE001 - one bad page must not lose the round
-            # Everything already retrieved is still worth recording. Losing a
-            # round's work to the last query in it is the failure this prevents.
-            outcome.notes.append(
-                f"lookup failed ({planned.query}): {type(exc).__name__}: {exc}"
-            )
-            _drain_adapter_notes(research_adapter, outcome)
+        except sqlite3.IntegrityError:
+            # This listing was already judged for this item, by an earlier round
+            # or by the V1 pipeline. The verdict on record stands: re-judging it
+            # would be the same deterministic answer, and replacing it would
+            # discard a claim the item may already have been priced from.
+            #
+            # Not a refusal and not a failure -- the comp is judged, which is the
+            # only thing the round needs to be true before it may conclude.
+            outcome.notes.append(f"already judged: {obs.comp_id}")
+            outcome.claims_recorded += 1
+            key = str(verdict.comparability)
+            outcome.ladder[key] = outcome.ladder.get(key, 0) + 1
             continue
+        outcome.claims_recorded += 1
+        key = str(verdict.comparability)
+        outcome.ladder[key] = outcome.ladder.get(key, 0) + 1
 
-        for position, document in enumerate(documents, start=1):
-            progress.report(
-                progress.Phase.READING,
-                f"reading listing {position}/{len(documents)} from "
-                f"{document.marketplace}",
-            )
-            if extracted_this_round >= EXTRACT_PER_ROUND:
-                outcome.notes.append(
-                    f"stopped extracting after {EXTRACT_PER_ROUND} page(s) this round"
-                )
-                outcome.stopped_early = True
-                break
-            try:
-                extracted_this_round += 1
-                found = _comps_from_document(
-                    conn, sku, document, planned, model_adapter, stage_budget, outcome
-                )
-            except BudgetExceeded as exc:
-                # The extraction budget is gone. Everything already retrieved is
-                # still evidence, and it was already paid for -- this used to
-                # propagate out of the round and discard all of it, which is how
-                # three rounds of real Canon listings became zero comps. The stage
-                # ends here and the round finishes with what it has.
-                outcome.notes.append(f"extraction stopped: {exc}")
-                outcome.stopped_early = True
-                break
-            recorded.extend(found)
-
-        # Observations the adapter read straight from the search index, for hosts
-        # we are not permitted to fetch. No page was loaded and no extraction call
-        # was made, so they cost nothing here and arrive already shaped -- asking,
-        # condition unstated. Adapters without this method simply have none.
-        direct = getattr(research_adapter, "take_direct_comps", None)
-        from_index = list(direct()) if direct else []
-        if from_index:
-            recorded.extend(from_index)
-            outcome.notes.append(
-                f"{len(from_index)} asking price(s) taken from the search index for "
-                f"{planned.query!r}: condition unstated, never sold prices"
-            )
-
-        # Pages the adapter could not read -- timed out, refused, empty -- with the
-        # URL. Without this they were appended to the adapter's own `notes` and
-        # never looked at again, so a host that reliably stalls was invisible.
-        _drain_adapter_notes(research_adapter, outcome)
-
-        gateway.record_lookup(
-            sku, provider=research_adapter.provider, query=planned.query,
-            motivation=planned.motivation, evidence_ids=list(planned.evidence_ids),
-            result_count=len(documents) + len(from_index), scope="pricing",
-            cost_micros=research_adapter.cost_micros_per_lookup(),
-        )
-        outcome.performed.append(planned.query)
-        if outcome.stopped_early:
-            # No further query can extract anything, so searching again would
-            # spend lookups to produce pages nothing can read.
-            outcome.notes.append(
-                "stopped searching: the extraction budget for this item is spent"
-            )
-            break
-
-    # --- retail research, once, and only while the answer is unknown ---------
-    _retail_round(conn, gateway, sku, research_adapter, model_adapter,
-                  stage_budget, outcome)
-
-    outcome.listings_found = len(recorded)
-    if not recorded:
+    if not stored and not outcome.incomplete_reason:
         outcome.stopped = "searched_not_found"
         outcome.stop_reason = (
             f"{len(outcome.performed)} search(es) returned no usable listing"
         )
-        return outcome
-
-    stored = []
-    for obs in recorded:
-        try:
-            sp.record_comp_observation(conn, obs)
-        except sqlite3.IntegrityError:
-            # Same marketplace, same listing id, same instant: this *is* the row
-            # already there, not a second sighting. The table is right to refuse
-            # the insert -- but the comp is still a comp for this item, so it
-            # stays in the round.
-            #
-            # Dropping it was worse than the crash it replaced. A listing found in
-            # an earlier round could never be claimed in a later one: MP-000022
-            # re-found the two real Bowflex pairs at $250 and $499.99, skipped
-            # both as duplicates, judged only the parts listings that happened to
-            # be new, and priced a pair of dumbbells at $50.
-            outcome.notes.append(f"already recorded: {obs.comp_id}")
-            stored.append(obs)
-            outcome.kinds[str(obs.price_kind)] = (
-                outcome.kinds.get(str(obs.price_kind), 0) + 1
-            )
-            continue
-        stored.append(obs)
-        outcome.kinds[str(obs.price_kind)] = (
-            outcome.kinds.get(str(obs.price_kind), 0) + 1
-        )
-    recorded = stored
-    outcome.comps_recorded = len(recorded)
-
-    # --- judge -----------------------------------------------------------------
-    #
-    # Only comps their source's licence permits into a prompt. A source recorded
-    # as `derived_only` may still price the item -- `estimate.py` is arithmetic and
-    # never sees a prompt -- but its rows must not appear in a model's context, and
-    # the judge is the one stage in this loop that would put them there.
-    #
-    # Withheld comps are not silently dropped: they are reported, and they are
-    # judged by whoever can legitimately look at them, which is the operator via
-    # `price claim` or the deterministic matcher an official adapter supplies.
-    promptable = [
-        obs for obs in recorded
-        if obs.model_visibility is ModelVisibility.FULL
-    ]
-    outcome.promptable_recorded = len(promptable)
-    outcome.withheld_from_model = [
-        obs.comp_id for obs in recorded if obs.model_visibility is not ModelVisibility.FULL
-    ]
-    if outcome.withheld_from_model:
-        outcome.notes.append(
-            f"{len(outcome.withheld_from_model)} comp(s) withheld from the judging "
-            f"prompt by their source's licence; offered for your judgement instead"
-        )
-    withheld = [
-        obs for obs in recorded if obs.model_visibility is not ModelVisibility.FULL
-    ]
-    if not promptable:
-        offered = _offer_withheld(conn, sku, withheld, ceiling, outcome, propose_only)
-        outcome.stopped = "nothing_promptable"
-        outcome.stop_reason = (
-            f"{len(recorded)} comp(s) recorded, none of which their licence allows "
-            f"into a model prompt. "
-            + (f"{offered} offered for your judgement."
-               if offered else
-               "They are stored and priceable; comparability is yours to record "
-               "with `price claim`.")
-        )
-        return outcome
-
-    progress.report(
-        progress.Phase.JUDGING,
-        f"weighing {len(promptable)} listing(s) against this item",
-    )
-    judged = _judge_in_batches(
-        conn, sku, model_adapter, promptable, observations, ceiling, stage_budget,
-        outcome=outcome,
-    )
-    outcome.notes.extend(f"judge: {note}" for note in judged.malformed)
-
-    for judgement in judged.judgements:
-        if propose_only:
-            # Excluded judgements are still decided by the agent: ruling out a
-            # bundle or a parts unit is not a question worth putting to a person.
-            if judgement.comparability == "excluded":
-                pass
-            else:
-                sp.record_comp_candidate(
-                    conn, sku=sku, comp_id=judgement.comp_id,
-                    proposed_comparability=judgement.comparability,
-                    item_citations=tuple(str(i) for i in judgement.item_evidence_ids),
-                    comp_citations=judgement.comp_fields,
-                    rationale=judgement.rationale,
-                )
-                outcome.candidates_offered += 1
-                outcome.ladder[judgement.comparability] = (
-                    outcome.ladder.get(judgement.comparability, 0) + 1
-                )
-                continue
-
-        claim = CompClaim(
-            claim_id=_uid("claim"),
-            sku=sku,
-            comp_id=judgement.comp_id,
-            comparability=Comparability(judgement.comparability),
-            # Evidence ids as strings: `comp_claim` stores citation labels rather
-            # than a foreign key, and an integer id renders as one either way.
-            item_citations=tuple(str(i) for i in judgement.item_evidence_ids),
-            comp_citations=judgement.comp_fields,
-            rationale=judgement.rationale,
-            excluded_reason=judgement.excluded_reason,
-        )
-        try:
-            sp.record_comp_claim(conn, claim, identity_resolution=resolution)
-        except ValueError as exc:
-            # The ladder ceiling, refused where it is enforced. Recorded rather
-            # than retried at a lower rung: silently demoting a claim would make
-            # the judgement look considered when it was salvaged.
-            outcome.refused.append(f"{judgement.comp_id}: {exc}")
-            continue
-        outcome.claims_recorded += 1
-        outcome.ladder[judgement.comparability] = (
-            outcome.ladder.get(judgement.comparability, 0) + 1
-        )
-
-    _offer_withheld(conn, sku, withheld, ceiling, outcome, propose_only)
 
     log_event(
         conn, "comp_research.round_complete",
         {"lookups": outcome.performed, "comps": outcome.comps_recorded,
-         "claims": outcome.claims_recorded,
-         "candidates": outcome.candidates_offered, "ladder": outcome.ladder,
-         "kinds": outcome.kinds, "refused": len(outcome.refused)},
+         "claims": outcome.claims_recorded, "candidates": 0,
+         "ladder": outcome.ladder, "kinds": outcome.kinds,
+         "refused": len(outcome.refused)},
         item_id=sku,
     )
     _record_round_detail(conn, sku, outcome)
     return outcome
 
 
-def _record_round_detail(conn, sku: str, outcome: "CompRoundOutcome") -> None:
+def _record_round_detail(conn, sku: str, outcome) -> None:
     """Everything the round noticed, kept where it can be read afterwards.
 
     `outcome.notes` was the whole diagnostic trail and it went to a browser flash
-    or a terminal and then nowhere -- "read as a shop, no product price found",
-    "not admitted: no schema.org Product with an offer", "a quotation is not in
-    the page; dropped", "stopped extracting after 8 page(s)". Reconstructing
-    MP-000047 meant re-running its searches and re-fetching its pages, because
-    nothing recorded that a page carrying the answer had been seen and skipped.
+    or a terminal and then nowhere. Reconstructing MP-000047 meant re-running its
+    searches, because nothing recorded that a page carrying the answer had been
+    seen and skipped.
 
     Summary counts already live in `round_complete`. This is the reasons.
 
-    Purely additive: it is written after every decision the round made, reads
-    only the outcome, and nothing downstream consults it.
+    Bounded, and stated rather than accidental: a round that noticed three
+    hundred things must not put three hundred things in one row.
     """
     log_event(
         conn, "comp_research.round_detail",
         {
             "run_id": progress.current_run_id(),
-            "notes": [n[:400] for n in outcome.notes][:120],
+            "notes": [n[:NOTE_CHARS] for n in outcome.notes][:MAX_NOTES],
+            "performed": outcome.performed,
+            "deferred": outcome.deferred[:MAX_NOTES],
+            "deferral_reason": outcome.deferral_reason[:NOTE_CHARS],
             "stopped": outcome.stopped,
-            "stop_reason": outcome.stop_reason[:400],
-            "stopped_early": outcome.stopped_early,
+            "stop_reason": outcome.stop_reason[:NOTE_CHARS],
             "promptable_recorded": outcome.promptable_recorded,
-            "withheld_from_model": outcome.withheld_from_model[:40],
-            "downgraded": outcome.downgraded[:40],
             "unjudged": list(outcome.unjudged)[:40],
-            "incomplete_reason": outcome.incomplete_reason[:400],
-            # Retail research had no event of its own at all, so after a run you
-            # could not tell which items even attempted it, let alone why it
-            # found nothing.
-            "retail": {
-                "query": outcome.retail_query,
-                "pages_read": outcome.retail_pages_read,
-                "recorded": outcome.retail_recorded,
-                "skipped": outcome.retail_skipped,
-            },
+            "incomplete_reason": outcome.incomplete_reason[:NOTE_CHARS],
+            "listings_found": outcome.listings_found,
+            "comps_recorded": outcome.comps_recorded,
+            "claims_recorded": outcome.claims_recorded,
+            "refused": outcome.refused[:40],
+            "ladder": outcome.ladder,
+            "retail_hits_dropped": outcome.retail_hits_dropped,
         },
         item_id=sku,
     )
-
-
-def _offer_withheld(conn, sku, withheld, ceiling, outcome, propose_only: bool) -> int:
-    """Put licence-withheld comps in front of the operator instead of nowhere.
-
-    `derived_only` means the rows must not enter a model prompt. It was never
-    meant to mean invisible -- the note beside the judge says as much: such comps
-    "are judged by whoever can legitimately look at them, which is the operator".
-    Nothing ever showed them, so they were recorded, priced at nothing and lost.
-
-    MP-000013 is the case. Its one genuinely comparable listing -- a $399.99 pair
-    of the right dumbbells -- came from an unregistered shop, was withheld, and
-    never became a candidate. What did reach the judge was eBay's replacement
-    weight plates, which the judge correctly excluded. The item then had no comps
-    at all, from a round that had found the right one.
-
-    The agent proposes no comparability here because it has not been allowed to
-    look. It offers the listing at the identity ceiling and says why it is
-    unassessed, and the operator -- who may read that page perfectly legitimately
-    -- decides. The licence rule is untouched: these rows still never go in a
-    prompt.
-    """
-    if not (withheld and propose_only):
-        return 0
-    offered = 0
-    for obs in withheld:
-        sp.record_comp_candidate(
-            conn, sku=sku, comp_id=obs.comp_id,
-            proposed_comparability=str(ceiling),
-            comp_citations=("title", "price"),
-            rationale=(
-                f"not assessed by the agent: {obs.marketplace} is not a registered "
-                f"source, so its listings may not enter a model prompt. Offered at "
-                f"the identity ceiling for you to judge."
-            ),
-        )
-        offered += 1
-    outcome.candidates_offered += offered
-    outcome.notes.append(
-        f"{offered} comp(s) offered for your judgement instead of the agent's, "
-        f"because their source's licence keeps them out of a prompt"
-    )
-    return offered
-
-
-def _identity_resolution(conn: sqlite3.Connection, sku: str) -> str:
-    """The stored resolution, which caps the ladder. Never inferred here."""
-    from resell.reasoning.research_loop import identity_resolution
-
-    return str(identity_resolution(conn, sku))
-
-
-def _comps_from_document(
-    conn, sku, document, planned, model_adapter, stage_budget, outcome
-) -> list[CompObservation]:
-    """Extract listings from one page and turn them into comp observations.
-
-    The extraction is a model call; everything it produces then passes through
-    `comp_reading`, which decides what a price *is*. A `sold` reading the quoted
-    text does not support becomes `asking` and the downgrade is reported -- that is
-    the single most consequential correction this loop makes.
-    """
-    from resell.reasoning.stages import comp_extraction_stage, page_body_for_extraction
-    from resell.reasoning.tools import parse_comp_extract_tool_input
-
-    page_text = getattr(document, "page_text", "") or ""
-    if not page_text.strip():
-        outcome.notes.append(f"{document.url}: no readable text")
-        return []
-
-    request = comp_extraction_stage(
-        page_text=page_text, url=document.url, query=planned.query,
-        seeking=planned.seeking, max_output_tokens=stage_budget.max_output_tokens,
-    )
-    # Rounds, not calls -- see the note above `EXTRACT_PER_ROUND`. Breadth within
-    # the round is bounded by the caller, which counts documents; money is bounded
-    # here as it always was, against the stage's real accumulated cost.
-    result = _run_stage(
-        conn, sku, model_adapter, request, purpose="comp_extract",
-        budget=stage_budget, spent=_round_spend(conn, sku, "comp_extract"),
-    )
-    extracted = parse_comp_extract_tool_input(
-        result.tool_input, page_text=page_body_for_extraction(page_text)
-    )
-    outcome.notes.extend(f"extract: {note}" for note in extracted.malformed)
-
-    ceiling = ceiling_for_identity(_identity_resolution(conn, sku))
-    exact = ceiling is Comparability.SAME_PRODUCT
-    now = datetime.now(UTC)
-
-    comps: list[CompObservation] = []
-    for listing in extracted.listings:
-        kind, why = read_price_kind(
-            listing.price_state, listing.excerpt, bool(listing.sale_date)
-        )
-        if listing.price_state == "sold" and str(kind) != "realized":
-            outcome.downgraded.append(f"{listing.title[:50]}: {why}")
-        # A price on the brand's own site is what the thing costs new. Left as an
-        # asking comp it competes with second-hand listings in the same sample.
-        kind, retail_kind, retail_why = retail_from_source(
-            kind, document.marketplace, _brand_of(conn, sku), document.authority,
-        )
-        if retail_kind is not None:
-            outcome.notes.append(f"retail context: {retail_why}")
-
-        band, band_why = band_for_declared_condition(listing.condition_text)
-        if listing.condition_text and str(band) == "unknown":
-            outcome.notes.append(f"condition: {band_why}")
-
-        comps.append(CompObservation(
-            comp_id=_uid("comp"),
-            marketplace=document.marketplace,
-            external_id=listing.external_id or _fingerprint(document.url, listing),
-            price_kind=kind,
-            basis=basis_for(kind, exact),
-            retail_kind=retail_kind,
-            price_cents=listing.price_cents,
-            observed_at=now,
-            condition_band=band,
-            condition_declared_raw=listing.condition_text or None,
-            condition_source=ConditionSource.SELLER_DECLARED,
-            shipping_cents=listing.shipping_cents,
-            url=listing.url or document.url,
-            title=listing.title,
-            source_authority=str(document.authority),
-            retrieval_method=RetrievalMethod.AUTOMATED_FETCH,
-            adapter=document.adapter,
-            query_text=planned.query,
-            raw_payload_hash=hashlib.sha256(listing.excerpt.encode()).hexdigest()[:32],
-            source_excerpt=listing.excerpt,
-            # From the source's recorded policy, not from the caller. An
-            # unregistered source resolves to derived_only, which is the
-            # conservative direction and costs only the model's view of the rows.
-            model_visibility=sp.visibility_for_source(conn, document.marketplace),
-        ))
-    return comps
-
-
-def _fingerprint(url: str, listing) -> str:
-    """A stable id for a listing the page never gave one.
-
-    `comp_observation` is unique on (marketplace, external_id, observed_at), so a
-    missing id would otherwise collide across listings on the same page. Derived
-    from the URL, title and price, which is what distinguishes them.
-    """
-    seed = f"{url}|{listing.title}|{listing.price_cents}"
-    return "anon-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
-
-
-def _brand_of(conn, sku: str) -> str | None:
-    """The item's brand, from the column or the aspect that holds it.
-
-    Both are consulted because they disagree: the column is filled by the mapping
-    stage's carry-forward and the aspect by the mapper itself, and an item mapped
-    before that carry-forward existed has one and not the other.
-    """
-    row = conn.execute(
-        "SELECT brand, aspects FROM identification "
-        "WHERE sku = ? AND superseded_at IS NULL", (sku,),
-    ).fetchone()
-    if row is None:
-        return None
-    if row["brand"]:
-        return str(row["brand"])
-    try:
-        values = (json.loads(row["aspects"] or "{}") or {}).get("Brand") or []
-    except (TypeError, ValueError):
-        return None
-    return str(values[0]) if values else None
-
-
-def _drain_adapter_notes(adapter, outcome) -> None:
-    """Move the adapter's per-URL notes onto the round's outcome, once each.
-
-    Drained rather than copied so a note is reported against the query that
-    produced it, and so the same unreadable page is not listed again on every
-    subsequent lookup.
-    """
-    notes = getattr(adapter, "notes", None)
-    if not notes:
-        return
-    outcome.notes.extend(f"page: {note}" for note in notes)
-    notes.clear()
-
-
-# --- retail research ---------------------------------------------------------
-
-
-def _retail_from_document(conn, sku, document, query, model_adapter, stage_budget,
-                          outcome, brand) -> int:
-    """Read one shop page and record what it charges. Returns rows written.
-
-    Every entry is checked twice before it is stored: the excerpt must be in the
-    page, and the price must be in the excerpt. The first is the same rule the
-    comp extractor lives by; the second matters more here, because a shop page is
-    dense with numbers that are not the product's price -- delivery thresholds,
-    finance offers, review counts -- and the whole value of a retail reference is
-    that it is the price of a specific thing.
-    """
-    from resell.reasoning.retail_reading import is_retail_source, trust_for
-    from resell.reasoning.stages import (
-        page_body_for_extraction, retail_extraction_stage,
-    )
-
-    url = getattr(document, "url", "") or ""
-    allowed, why = is_retail_source(url, brand)
-    if not allowed:
-        outcome.notes.append(f"{url}: not read as a shop -- {why}")
-        return 0
-
-    page_text = getattr(document, "page_text", "") or ""
-    if not page_text.strip():
-        outcome.notes.append(f"{url}: no readable text")
-        return 0
-
-    # A shop we know by name is read by the model; a shop we do not must prove
-    # itself from the page's own machine-readable claim about what it sells and
-    # for how much. `recoveryforathletes.com` is the case: a real retailer with a
-    # `schema.org/Product` offer for the exact item, previously worth nothing
-    # because of who it is rather than what it says.
-    trust = trust_for(url, brand)
-    if trust < 1.0:
-        return _retail_from_structured_data(conn, sku, document, query, outcome,
-                                            brand, trust)
-
-    body = page_body_for_extraction(page_text)
-    haystack = _squashed(body)
-    request = retail_extraction_stage(
-        page_text=page_text, url=url, query=query,
-        max_output_tokens=min(2000, stage_budget.max_output_tokens),
-    )
-    result = _run_stage(
-        conn, sku, model_adapter, request, purpose="retail_extract",
-        budget=stage_budget, spent=_round_spend(conn, sku, "retail_extract"),
-    )
-    products = (result.tool_input or {}).get("products") or []
-    outcome.retail_pages_read += 1
-
-    from urllib.parse import urlsplit
-
-    from resell import store_pricing as sp
-    from resell.reasoning.authority import authority_for_url
-
-    authority, _ = authority_for_url(url)
-    host = urlsplit(url).netloc.casefold()
-    written = 0
-    for entry in products:
-        price = entry.get("price_cents")
-        excerpt = (entry.get("excerpt") or "").strip()
-        title = (entry.get("product_title") or "").strip()
-        if not isinstance(price, int) or price <= 0 or not excerpt:
-            continue
-        # Whitespace-normalised, exactly as the comp extractor checks its own
-        # quotations: HTML-to-text collapses line breaks unpredictably, and a
-        # quotation that differs only in spacing is still the page's own words.
-        # Compared raw, every product on a shop's grid page failed -- the model
-        # joins a title and the price beneath it with a space, the page has a
-        # newline, and eleven real prices were dropped as fabrications.
-        if _squashed(excerpt) not in haystack:
-            outcome.notes.append(
-                f"{url}: a quotation for {title[:40]!r} is not in the page; dropped"
-            )
-            continue
-        # The price has to be in the words quoted for it, or the quotation is
-        # not evidence of that price.
-        if not _price_in_excerpt(price, excerpt):
-            outcome.notes.append(
-                f"{url}: {title[:40]!r} quotes text that does not contain its price; dropped"
-            )
-            continue
-        sp.record_retail_observation(
-            conn, sku=sku, url=url, host=host, product_title=title or None,
-            price_cents=price, currency=(entry.get("currency") or "USD"),
-            in_stock=entry.get("in_stock"),
-            source_authority=str(authority),
-            # Everything that reaches here today is a maker's own site or a
-            # registered retailer, so the source is believed outright. The column
-            # exists so an unknown shop can later be admitted below 1.0 on the
-            # strength of page-level attribution.
-            source_trust=1.0,
-            query_text=query, source_excerpt=excerpt[:2000],
-        )
-        written += 1
-    outcome.retail_recorded += written
-    if not written:
-        outcome.notes.append(f"{url}: read as a shop, no product price found")
-    return written
-
-
-def _retail_from_structured_data(conn, sku, document, query, outcome, brand,
-                                 trust) -> int:
-    """An unknown shop's price, taken only if the page proves it is a shop's.
-
-    No model call: the page's own `schema.org/Product` offer is the extraction,
-    and a site that publishes one has asserted the price in machine-readable
-    form. That is stronger attribution than a model reading prose, which is what
-    justifies admitting a host nobody vouched for -- at reduced trust, because
-    nobody vouched for it.
-
-    Every test in `validate_product_page` must pass. A coupon aggregator, a
-    review blog, a collection page and a page for a different brand each fail a
-    different one, and the reason is recorded so a round can say which.
-    """
-    from resell import store_pricing as sp
-    from resell.reasoning.retail_reading import validate_product_page
-
-    url = getattr(document, "url", "") or ""
-    html = getattr(document, "raw_html", None) or getattr(document, "page_text", "") or ""
-    product, why = validate_product_page(url, html, brand)
-    outcome.retail_pages_read += 1
-    if product is None:
-        outcome.notes.append(f"{url}: not admitted -- {why}")
-        return 0
-
-    from urllib.parse import urlsplit
-
-    sp.record_retail_observation(
-        conn, sku=sku, url=url, host=urlsplit(url).netloc.casefold(),
-        product_title=product.title, price_cents=product.price_cents,
-        currency=product.currency, in_stock=product.in_stock,
-        source_authority="page_validated", source_trust=trust,
-        query_text=query, source_excerpt=product.excerpt[:2000],
-    )
-    outcome.retail_recorded += 1
-    outcome.notes.append(
-        f"{url}: admitted at trust {trust:.2f} -- {why}"
-    )
-    return 1
-
-
-def _squashed(text: str) -> str:
-    """One space between words, case folded. The comparison both quotation checks
-    in this file use."""
-    return " ".join((text or "").split()).casefold()
-
-
-def _price_in_excerpt(price_cents: int, excerpt: str) -> bool:
-    """Whether the quoted words actually contain the price they are quoted for."""
-    import re
-
-    whole, cents = divmod(price_cents, 100)
-    candidates = {f"{whole}.{cents:02d}", f"{whole:,}.{cents:02d}"}
-    if cents == 0:
-        candidates |= {str(whole), f"{whole:,}"}
-    digits = re.sub(r"[^\d.,]", "", excerpt)
-    return any(c in excerpt or c in digits for c in candidates)
-
-
-def _retail_round(conn, gateway, sku, research_adapter, model_adapter,
-                  stage_budget, outcome) -> None:
-    """One targeted retail-intent search, and the pages it turns up.
-
-    Runs after the marketplace searches and out of their budget, so a shop page
-    can no longer consume an extraction the resale market needed -- which is
-    exactly what MP-000047 spent all eight of its extractions on.
-
-    Skipped entirely once the item has a same-product current shop price. That
-    fact does not change between two rounds of one run, and asking again spends a
-    lookup to learn something already on the record.
-    """
-    from resell import store_pricing as sp
-    from resell.gateway import current_identification
-    from resell.reasoning.adapters.research import ResearchQuery
-
-    if sp.has_trustworthy_retail(conn, sku):
-        outcome.retail_skipped = "a same-product shop price is already on the record"
-        return
-
-    identification = current_identification(conn, sku)
-    brand = identification["brand"] if identification else None
-    query = retail_query_for(
-        brand,
-        identification["model"] if identification else None,
-        identification["title"] if identification else None,
-    )
-    if not query:
-        outcome.retail_skipped = "nothing identified well enough to search a shop for"
-        return
-
-    # Straight to the search backend, not through the marketplace adapter's
-    # `search`. That method answers a different objective and selects for it: it
-    # keeps the first three fetchable hits, so on MP-000047 it spent all three on
-    # resale pages and the two `achedaway.com/collections/...` pages that carry
-    # the prices -- hits four and five -- were never fetched. Retail research
-    # chooses its own pages, which is the point of it being a separate objective.
-    backend = getattr(research_adapter, "backend", None)
-    retrieve = getattr(research_adapter, "_retrieve", None)
-    if backend is None or retrieve is None:
-        outcome.retail_skipped = "this adapter cannot search shops"
-        return
-
-    outcome.retail_query = query
-    progress.report(progress.Phase.SEARCHING, f"what it costs new: {query[:52]}")
-    try:
-        hits = backend.find(ResearchQuery(query, "retail", "what it costs new"))
-    except Exception as exc:  # noqa: BLE001 - retail is additive; never fail the round
-        outcome.notes.append(f"retail search failed: {type(exc).__name__}: {exc}")
-        return
-
-    from resell.reasoning.retail_reading import is_retail_source, shop_page_first
-
-    shops = [h for h in hits if is_retail_source(getattr(h, "url", ""), brand)[0]]
-    if not shops:
-        outcome.retail_skipped = "the search found no shop we recognise"
-        gateway.record_lookup(
-            sku, provider=research_adapter.provider, query=query,
-            motivation="what it costs new", evidence_ids=[],
-            result_count=len(hits), scope="pricing",
-            cost_micros=research_adapter.cost_micros_per_lookup(),
-        )
-        return
-
-    documents = []
-    for hit in shop_page_first(shops)[:RETAIL_EXTRACT_PER_ROUND]:
-        document = retrieve(getattr(hit, "url", ""))
-        if document is not None:
-            documents.append(document)
-
-    gateway.record_lookup(
-        sku, provider=research_adapter.provider, query=query,
-        motivation="what it costs new", evidence_ids=[],
-        result_count=len(documents), scope="pricing",
-        cost_micros=research_adapter.cost_micros_per_lookup(),
-    )
-
-    from resell.reasoning.retail_reading import shop_page_first
-
-    read = 0
-    for document in documents:
-        progress.report(
-            progress.Phase.READING,
-            f"reading {getattr(document, 'marketplace', 'a shop')}",
-        )
-        try:
-            _retail_from_document(conn, sku, document, query, model_adapter,
-                                  stage_budget, outcome, brand)
-        except (BudgetExceeded, CompLoopError) as exc:
-            outcome.notes.append(f"retail reading stopped: {exc}")
-            break
-        read += 1
-    if not outcome.retail_recorded and not outcome.retail_skipped:
-        outcome.retail_skipped = "no shop page yielded a price"
-        return
-    _judge_retail(conn, sku, model_adapter, stage_budget, outcome)
-
-
-def _judge_retail(conn, sku, model_adapter, stage_budget, outcome) -> None:
-    """Decide which of the recorded shop prices are this product's.
-
-    Until this runs the observations are prices somebody charges for something;
-    afterwards they are prices for a named relationship to the item, and only
-    `same_product` or `same_family_variant` may anchor. `load_retail_references`
-    omits anything unjudged, so an unfinished judging step leaves the evidence
-    inert rather than admitting it unchecked.
-    """
-    from resell import store_pricing as sp
-    from resell.gateway import observations_in_scope
-    from resell.reasoning.stages import retail_judging_stage
-    from resell.reasoning.tools import parse_comp_judge_tool_input
-
-    pending = sp.unjudged_retail(conn, sku)
-    if not pending:
-        return
-
-    observations = observations_in_scope(conn, sku)
-    ceiling = ceiling_for_identity(_identity_resolution(conn, sku))
-    lines = "\n".join(
-        f"- {row['retail_id']}: {row['product_title'] or '(untitled)'} "
-        f"at {row['price_cents'] / 100:.2f} {row['currency']} on {row['host']}"
-        for row in pending
-    )
-    request = retail_judging_stage(
-        identification=render_identification(conn, sku),
-        observations=render_observations(observations),
-        prices=lines, identity_ceiling=str(ceiling),
-        max_output_tokens=max(1000, len(pending) * 220),
-    )
-    try:
-        result = _run_stage(
-            conn, sku, model_adapter, request, purpose="retail_judge",
-            budget=stage_budget, spent=_round_spend(conn, sku, "retail_judge"),
-        )
-    except (BudgetExceeded, CompLoopError) as exc:
-        outcome.notes.append(f"shop prices left unjudged: {exc}")
-        return
-
-    judged = parse_comp_judge_tool_input(
-        result.tool_input,
-        valid_item_evidence={row["id"] for row in observations},
-        valid_comp_ids={row["retail_id"] for row in pending},
-    )
-    for note in judged.malformed:
-        outcome.notes.append(f"retail judgement discarded: {note}")
-
-    kept = 0
-    for judgement in judged.judgements:
-        try:
-            sp.record_retail_claim(
-                conn, sku=sku, retail_id=judgement.comp_id,
-                match=str(judgement.comparability),
-                item_citations=tuple(str(i) for i in judgement.item_evidence_ids),
-                retail_citations=tuple(judgement.comp_fields),
-                rationale=judgement.rationale or "",
-                excluded_reason=judgement.excluded_reason,
-            )
-            kept += 1
-        except (ValueError, sqlite3.IntegrityError) as exc:
-            outcome.notes.append(f"retail judgement refused: {exc}")
-    missing = len(pending) - kept
-    if missing > 0:
-        outcome.notes.append(
-            f"{missing} shop price(s) came back without a verdict and stay inert"
-        )

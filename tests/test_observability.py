@@ -111,40 +111,23 @@ def test_the_round_records_why_not_only_how_many(tmp_path):
         "stopped extracting after 8 page(s) this round",
         "a quotation for 'Widget' is not in the page; dropped",
     ]
-    outcome.stopped_early = True
     outcome.stop_reason = "the extraction budget for this item is spent"
     outcome.promptable_recorded = 26
     outcome.unjudged = ["comp_a", "comp_b"]
     outcome.incomplete_reason = "call limit reached"
+    outcome.retail_hits_dropped = 74
     _record_round_detail(conn, sku, outcome)
 
     payload = detail_event(conn, sku)
     assert len(payload["notes"]) == 3
     assert any("no schema.org Product" in n for n in payload["notes"])
-    assert payload["stopped_early"] is True
     assert payload["promptable_recorded"] == 26
     assert payload["unjudged"] == ["comp_a", "comp_b"]
     assert payload["incomplete_reason"] == "call limit reached"
+    assert payload["retail_hits_dropped"] == 74, (
+        "how many priced results were shops rather than resale listings"
+    )
 
-
-def test_retail_research_finally_leaves_a_record(tmp_path):
-    """It had no event of its own at all, so after a run you could not tell which
-    items even attempted it, let alone why it found nothing."""
-    from resell.reasoning.comp_loop import CompRoundOutcome, _record_round_detail
-
-    conn, _, sku = item(tmp_path)
-    outcome = CompRoundOutcome()
-    outcome.retail_query = "Achedaway Percussion Massage Gun price official site"
-    outcome.retail_pages_read = 2
-    outcome.retail_recorded = 0
-    outcome.retail_skipped = "no shop page yielded a price"
-    _record_round_detail(conn, sku, outcome)
-
-    retail = detail_event(conn, sku)["retail"]
-    assert retail["query"].startswith("Achedaway")
-    assert retail["pages_read"] == 2
-    assert retail["recorded"] == 0
-    assert "no shop page yielded a price" in retail["skipped"]
 
 
 def test_the_detail_event_is_bounded(tmp_path):

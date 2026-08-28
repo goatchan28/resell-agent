@@ -965,6 +965,60 @@ def _band_for_condition_enum(condition_enum: str | None):
     return ConditionBand.UNKNOWN
 
 
+def _recorded_pricing(conn: sqlite3.Connection, sku: str):
+    """The band and options as they were approved, or None if none were.
+
+    Returns the same six values the live computation produces, so the caller
+    cannot tell them apart -- which is the point: a settled price is a fact about
+    what happened, not a question to be re-answered.
+    """
+    from resell import store_pricing as sp
+
+    row = conn.execute(
+        "SELECT p.* FROM price_approval a JOIN price_proposal p "
+        "ON p.proposal_id = a.proposal_id "
+        "WHERE p.sku = ? AND a.voided_at IS NULL "
+        "ORDER BY a.approved_at DESC LIMIT 1",
+        (sku,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    import json as _json
+
+    from resell.pricing.strategy import SellerObjective
+
+    try:
+        strategies = _json.loads(row["strategy_prices_json"] or "{}") or {}
+    except (TypeError, ValueError):
+        strategies = {}
+    try:
+        qualifiers = tuple(_json.loads(row["qualifiers_json"] or "[]") or ())
+    except (TypeError, ValueError):
+        qualifiers = ()
+
+    approved = row["price_cents"]
+    options = tuple(
+        PriceOption(
+            objective=objective, price_cents=cents,
+            net_proceeds_cents=row["net_proceeds_cents"] if cents == approved else None,
+            tradeoff="", is_default=(cents == approved),
+        )
+        for objective, cents in strategies.items()
+    ) or (
+        PriceOption(objective=row["objective"] or "balanced", price_cents=approved,
+                    net_proceeds_cents=row["net_proceeds_cents"], tradeoff="",
+                    is_default=True),
+    )
+    return (
+        row["rationale"] or "",
+        options,
+        row["band_low_cents"], row["band_high_cents"],
+        row["uncertainty_note"] or "",
+        qualifiers,
+    )
+
+
 def pricing_view(
     conn: sqlite3.Connection,
     sku: str,
@@ -1280,7 +1334,19 @@ def workflow_view(
     # operator-supplied retail, which has no comp row behind it -- unreachable
     # from this path today, and a silent no-price if it ever becomes reachable.
     pricing_request = default_pricing_request(conn, sku, marketplace=marketplace)
-    if sp.load_scored_comps(conn, sku) or pricing_request.retail_cents:
+    # An item that already has an approved price shows the price it was approved
+    # at, from the record, and is never repriced by looking at it.
+    #
+    # `pricing_view` recomputes from the comps every time it is called, which is
+    # right while a price is still being chosen and wrong once one has been. The
+    # strategy semantics changed when the deterministic pipeline replaced the
+    # model-driven one, and without this an item approved and listed last week
+    # would quietly display a different band today -- a price nobody chose,
+    # attached to a listing that is already live at the price they did choose.
+    recorded = _recorded_pricing(conn, sku)
+    if recorded is not None:
+        price_summary, options, low, high, note, qualifiers = recorded
+    elif sp.load_scored_comps(conn, sku) or pricing_request.retail_cents:
         pricing = pricing_view(
             conn, sku, pricing_request, marketplace=marketplace,
         )

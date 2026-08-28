@@ -122,15 +122,10 @@
       <div class="decision">
         <p class="limitation">No search backend is configured, so the agent cannot
           find listings on its own. Set RESELL_SEARCH_BACKEND=brave and
-          BRAVE_API_KEY in .env, or paste links below.</p>
-        <p class="why">Search a marketplace and paste the results pages, one link
-          per line. Each is fetched and read for you. eBay cannot be fetched —
-          their agreement forbids it.</p>
-        <form method="post" action="{{ url_for('find_comps', sku=card.sku) }}">
-          <textarea name="urls" rows="3" required
-                    placeholder="https://poshmark.com/search?q=…&#10;https://www.mercari.com/search/?keyword=…"></textarea>
-          <button type="submit" class="primary">read these listings</button>
-        </form>
+          BRAVE_API_KEY in .env.</p>
+        <p class="why">Comp research searches an index using queries built from
+          the item's own identity. There is no page to supply: the round reads
+          structured results, not fetched pages.</p>
       </div>
 
     {# --- comp research is over and found nothing usable -------------------- #}
@@ -230,16 +225,6 @@
             data-long>
         <button type="submit" class="primary" data-busy="working…">carry on</button>
       </form>
-        {% if card.step == 'comp_research' %}
-          <details class="fix">
-            <summary>search from a page I already found</summary>
-            <form method="post" action="{{ url_for('find_comps', sku=card.sku) }}">
-              <textarea name="urls" rows="2"
-                        placeholder="https://poshmark.com/search?q=…"></textarea>
-              <button type="submit">read these instead</button>
-            </form>
-          </details>
-        {% endif %}
     {% endif %}
     {# --- stop work on this one, without losing it ------------------------ #}
     {# Not while the agent works either. Setting aside is a state transition, and

@@ -511,8 +511,8 @@ def cmd_research(args, conn: sqlite3.Connection) -> int:
     from resell.domain import FeeModel
     from resell.gateway import Gateway
     from resell.reasoning.adapters import get_adapter
-    from resell.reasoning.adapters.marketplace import get_marketplace_adapter
     from resell.reasoning.budget import BudgetExceeded, LookupBudget, StageBudget
+    from resell.reasoning.adapters.search import get_search_backend
     from resell.reasoning.comp_loop import CompLoopError, run_comp_round
 
     config = load_config(require_credentials=False)
@@ -529,17 +529,15 @@ def cmd_research(args, conn: sqlite3.Connection) -> int:
 
     print(f"\n{args.sku}: comp research{'  [DRY RUN]' if args.dry_run else ''}")
     print(f"  budget: {performed}/{lookup_budget.max_lookups} pricing lookups")
-    print("  retrieval is operator-directed: you supply the results page, it is "
-          "fetched and read.\n  eBay is not fetched; use `price comp-add` to record "
-          "an eBay listing by hand.")
+    print("  retrieval is a search index: four fixed queries built from the "
+          "item's identity.\n  eBay is not fetched; its asking prices come from the "
+          "index. Use `price comp-add` to record a listing by hand.")
 
     try:
         outcome = run_comp_round(
             conn, gateway, args.sku,
-            model_adapter=get_adapter(args.provider),
-            research_adapter=get_marketplace_adapter(args.research_provider),
-            stage_budget=stage_budget, lookup_budget=lookup_budget,
-            dry_run=args.dry_run,
+            backend=get_search_backend(args.research_provider),
+            lookup_budget=lookup_budget,
         )
     except BudgetExceeded as exc:
         print(f"\nREFUSED before calling the model: {exc}", file=sys.stderr)

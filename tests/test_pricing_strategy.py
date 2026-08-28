@@ -195,28 +195,17 @@ def test_thin_samples_collapse_quartiles_to_the_extremes():
     assert ss.get(SellerObjective.MAX_PROCEEDS).price_cents == 6000
 
 
-def test_cited_premium_brand_reaches_for_the_top_of_the_sample():
-    """V1 behaviour, unchanged. The guardrails are off unless a caller asks."""
-    rec = recommend(inp(comps=(comp(4000), comp(4400), comp(5000), comp(9000))))
-    plain = build_strategies(rec, schedule=VERIFIED)
-    premium = build_strategies(rec, schedule=VERIFIED, brand=BrandSignal(
-        strength=BrandStrength.PREMIUM, citations=("ev_retail_398",),
-        rationale="$398 swing tag",
-    ))
-    assert premium.get(SellerObjective.MAX_PROCEEDS).price_cents == 9000
-    assert plain.get(SellerObjective.MAX_PROCEEDS).price_cents < 9000
-
 
 def test_the_guardrail_caps_a_premium_brand_too():
-    """Under guardrails the same sample stops at 140% of Balanced.
+    """A premium brand stops at 140% of Balanced like everything else.
 
     4000/4400/5000/9000 is a median of 4700 and a top of 9000, 1.9x the centre.
     Aggressive is a seller intent rather than a statistic, and "hold out for
     more" does not mean "ask the most anyone has ever asked".
     """
     rec = recommend(inp(comps=(comp(4000), comp(4400), comp(5000), comp(9000))))
-    plain = build_strategies(rec, schedule=VERIFIED, guardrails=True)
-    premium = build_strategies(rec, schedule=VERIFIED, guardrails=True, brand=BrandSignal(
+    plain = build_strategies(rec, schedule=VERIFIED)
+    premium = build_strategies(rec, schedule=VERIFIED, brand=BrandSignal(
         strength=BrandStrength.PREMIUM, citations=("ev_retail_398",),
         rationale="$398 swing tag",
     ))
@@ -336,7 +325,7 @@ def test_a_broken_unit_does_not_become_the_fast_price():
     "sell quickly" prices a working camera at the price of a broken one.
     """
     rec = recommend(inp(comps=(comp(5899), comp(38000), comp(40000), comp(45000))))
-    ss = build_strategies(rec, schedule=VERIFIED, guardrails=True)
+    ss = build_strategies(rec, schedule=VERIFIED)
     balanced = ss.get(SellerObjective.BALANCED).price_cents
     fast = ss.get(SellerObjective.FAST_SALE).price_cents
 
@@ -349,7 +338,7 @@ def test_one_comp_gets_spacing_rather_than_three_identical_prices():
     are spacing rather than evidence -- so they are modest, not the full
     guardrail width. $100 gives $80/$100/$120."""
     rec = recommend(inp(comps=(comp(10000),)))
-    ss = build_strategies(rec, schedule=VERIFIED, guardrails=True)
+    ss = build_strategies(rec, schedule=VERIFIED)
 
     assert ss.get(SellerObjective.FAST_SALE).price_cents == 8000
     assert ss.get(SellerObjective.BALANCED).price_cents == 10000
@@ -360,7 +349,7 @@ def test_a_healthy_sample_keeps_its_own_positions():
     """The guardrails are bounds, not a replacement. Where the observed
     min/median/p75 already sit inside them, they are what the seller sees."""
     rec = recommend(inp(comps=(comp(9000), comp(9500), comp(10000), comp(11000))))
-    ss = build_strategies(rec, schedule=VERIFIED, guardrails=True)
+    ss = build_strategies(rec, schedule=VERIFIED)
     balanced = ss.get(SellerObjective.BALANCED).price_cents
 
     assert ss.get(SellerObjective.FAST_SALE).price_cents == 9000
@@ -368,14 +357,3 @@ def test_a_healthy_sample_keeps_its_own_positions():
     assert ss.get(SellerObjective.MAX_PROCEEDS).price_cents < round(balanced * STRATEGY_CAP)
 
 
-def test_the_live_path_is_not_guardrailed_by_default():
-    """The gate itself. V1 is in production and must keep producing the prices it
-    produced yesterday until the two paths are switched deliberately."""
-    rec = recommend(inp(comps=(comp(5899), comp(38000), comp(40000), comp(45000))))
-    v1 = build_strategies(rec, schedule=VERIFIED)
-    v2 = build_strategies(rec, schedule=VERIFIED, guardrails=True)
-
-    assert v1.get(SellerObjective.FAST_SALE).price_cents == 5899, "the broken one"
-    assert v2.get(SellerObjective.FAST_SALE).price_cents > 5899
-    assert (v1.get(SellerObjective.BALANCED).price_cents
-            == v2.get(SellerObjective.BALANCED).price_cents), "Balanced never moves"

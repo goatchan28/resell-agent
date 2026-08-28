@@ -236,7 +236,6 @@ def build_strategies(
     costs: CostLines | None = None,
     minimum_net_proceeds_cents: int = 500,
     default_objective: SellerObjective = SellerObjective.BALANCED,
-    guardrails: bool = False,
 ) -> StrategySet | None:
     """Three prices from the best evidence there is.
 
@@ -267,7 +266,7 @@ def build_strategies(
         minimum_net_proceeds_cents, schedule=sched, costs=c
     )
 
-    positions = _positions(rec, d, strength, guardrails) if not anchor_only else None
+    positions = _positions(rec, d, strength) if not anchor_only else None
 
     prices: dict[SellerObjective, StrategyPrice] = {}
     for objective in SellerObjective:
@@ -385,10 +384,6 @@ def _guardrailed(fast: int, balanced: int, aggressive: int) -> tuple[int, int, i
     Balanced is never touched: it is the market's central estimate and the only
     one of the three that is purely a measurement.
 
-    Off by default. This is the V2 pricing behaviour and the live V1 path must
-    keep producing the prices it produced yesterday until the two are switched
-    deliberately -- so callers opt in with `guardrails=True` rather than
-    inheriting a change they did not ask for.
     """
     if balanced <= 0:
         return fast, balanced, aggressive
@@ -401,8 +396,7 @@ def _guardrailed(fast: int, balanced: int, aggressive: int) -> tuple[int, int, i
     return fast, balanced, aggressive
 
 
-def _positions(rec: PriceRecommendation, d: Distribution, strength: BrandStrength,
-               guardrails: bool = False):
+def _positions(rec: PriceRecommendation, d: Distribution, strength: BrandStrength):
     """The three prices, from the marketplace sample and the retail anchor.
 
     Three deliberate asymmetries, because these are seller intents and not
@@ -438,8 +432,7 @@ def _positions(rec: PriceRecommendation, d: Distribution, strength: BrandStrengt
     band = rec.retail_anchor
     share = anchor_share(rec.market_confidence, anchor_trust(band))
     if band is None or share <= 0:
-        if guardrails:
-            m_lo, m_mid, m_hi = _guardrailed(m_lo, m_mid, m_hi)
+        m_lo, m_mid, m_hi = _guardrailed(m_lo, m_mid, m_hi)
         return {SellerObjective.FAST_SALE: m_lo,
                 SellerObjective.BALANCED: m_mid,
                 SellerObjective.MAX_PROCEEDS: m_hi}
@@ -460,8 +453,7 @@ def _positions(rec: PriceRecommendation, d: Distribution, strength: BrandStrengt
     # After the blend, not before: the guardrails are about the distance between
     # the three prices a seller is shown, and the blended centre is the one they
     # are shown.
-    if guardrails:
-        low, centre, high = _guardrailed(low, centre, high)
+    low, centre, high = _guardrailed(low, centre, high)
     return {SellerObjective.FAST_SALE: low,
             SellerObjective.BALANCED: centre,
             SellerObjective.MAX_PROCEEDS: high}

@@ -575,22 +575,6 @@ def test_the_orchestrator_owns_no_interactive_adapter():
     assert "OperatorUrlMarketplaceAdapter" not in source
 
 
-def test_pasting_links_is_how_comps_arrive(tmp_path):
-    app, conn, gateway, sku = seeded(tmp_path, identified=True)
-    gateway.begin_pricing(sku)
-    body = app.test_client().get(f"/ops/items/{sku}").data.decode()
-    assert "paste a few marketplace links" in body
-    assert 'name="urls"' in body
-
-
-def test_pasting_nothing_is_refused(tmp_path):
-    app, conn, gateway, sku = seeded(tmp_path, identified=True)
-    gateway.begin_pricing(sku)
-    response = app.test_client().post(
-        f"/items/{sku}/comps", data={"urls": "  \n \n"}, follow_redirects=True
-    )
-    assert b"paste at least one link" in response.data
-
 
 def test_an_ebay_link_pasted_here_is_still_refused():
     """The licence blocklist applies to anything pasted, and is checked before any
@@ -644,41 +628,6 @@ def test_an_unknown_backend_name_is_unavailable_not_a_crash(monkeypatch):
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "nonesuch")
     assert not views.search_is_available()
 
-
-def test_the_card_does_not_ask_for_links_on_an_agent_owned_step():
-    """The paste box was rendered on `comp_research` unconditionally. Once the
-    agent owns that step it is a request for work the operator no longer has to
-    do, and doing it anyway routes around the orchestrator."""
-    import jinja2
-
-    env = jinja2.Environment(
-        loader=jinja2.FileSystemLoader("src/resell/webui/templates")
-    )
-    env.filters.update(money=lambda v: v, shorten=lambda v, n=80: v)
-    env.globals["url_for"] = lambda *a, **k: "#"
-
-    class Card(dict):
-        __getattr__ = dict.get
-
-    def render(waiting):
-        return env.get_template("_card.html").render(
-            card=Card(sku="MP-1", step="comp_research", waiting_on_operator=waiting,
-                      can_search=not waiting, title="x", photo_positions=(),
-                      questions=(), candidates=(), summary="s", detail="d",
-                      state="pricing", is_done=False, has_price=False,
-                      ai_cost_micros=0),
-            forms={},
-        )
-
-    agent_owned = render(waiting=False)
-    assert "carry on" in agent_owned
-    assert "read these listings" not in agent_owned
-    # ...but an operator who has already found a page can still say so
-    assert "read these instead" in agent_owned
-
-    operator_owned = render(waiting=True)
-    assert "read these listings" in operator_owned
-    assert "No search backend is configured" in operator_owned
 
 
 def test_the_blocked_step_offers_a_way_out_rather_than_carry_on():
@@ -1130,3 +1079,28 @@ def test_the_picker_and_the_box_are_one_answer():
     source = _Path("src/resell/webui/app.py").read_text()
     assert 'request.form.get("choice")' in source
     assert "question_id, answer, operator=True" in source
+
+
+def test_the_card_never_asks_for_links():
+    """Comp research builds its own queries from the item's identity and reads a
+    search index. There is no page for an operator to supply, and no extraction
+    stage a supplied page could feed -- so asking for one would be asking for
+    work that cannot be used."""
+    import jinja2
+
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader("src/resell/webui/templates")
+    )
+    env.filters.update(money=lambda v: v, shorten=lambda v, n=80: v)
+    env.globals["url_for"] = lambda *a, **k: "#"
+
+    class Card(dict):
+        __getattr__ = dict.get
+
+    for waiting in (True, False):
+        html = env.get_template("_card.html").render(
+            card=Card(sku="MP-000001", step="comp_research", waiting=waiting,
+                      summary="", detail="", questions=(), candidates=()),
+        )
+        assert 'name="urls"' not in html
+        assert "paste" not in html.lower()

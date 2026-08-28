@@ -48,29 +48,6 @@ from resell.images import inspect
 
 _NEEDS_DERIVATIVE = {"heic", "heif", "tiff"}
 
-
-def _comp_adapter(sku: str, urls: list[str]):
-    """Search for comps if we can; read what was pasted if we cannot.
-
-    Supplied URLs win when present: an operator who went and found a page has
-    made a judgement the search backend has not, and overriding it would be
-    perverse. With no URLs and a backend configured, discovery is the agent's.
-    """
-    from resell.reasoning.adapters.marketplace import (
-        SearchedMarketplaceAdapter, SuppliedUrlsMarketplaceAdapter,
-    )
-    from resell.reasoning.adapters.search import NoSearchBackend, get_search_backend
-
-    if urls:
-        return SuppliedUrlsMarketplaceAdapter(urls, echo=lambda *a: None)
-    backend = get_search_backend()
-    if isinstance(backend, NoSearchBackend):
-        return None
-    return SearchedMarketplaceAdapter(
-        backend, identity_terms=views.identity_terms(g.conn, sku), echo=lambda *a: None,
-    )
-
-
 # What a single request may carry. Photos are shrunk to about 2048px in the
 # browser before they are sent, so a normal ten-photo upload is a few megabytes;
 # this is the ceiling for the case where that did not happen -- an older browser
@@ -79,6 +56,7 @@ def _comp_adapter(sku: str, urls: list[str]):
 # so this stays comfortably under it and fails on our side with a sentence rather
 # than on theirs with a 413 page.
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+
 
 
 def _secret_key() -> str:
@@ -643,19 +621,14 @@ def _register_routes(app: Flask) -> None:
         from resell.reasoning.budget import BudgetExceeded
         from resell.reasoning.comp_loop import CompLoopError, run_comp_round
 
-        urls = [
-            line.strip()
-            for line in (request.form.get("urls") or "").splitlines()
-            if line.strip()
-        ]
-        adapter = _comp_adapter(sku, urls)
-        if adapter is None:
-            flash("paste at least one link, or configure a search backend", "error")
-            return redirect(url_for("item", sku=sku))
+        # Comp research searches an index from the item's own identity. There is
+        # no page for an operator to paste any more: the round has no extraction
+        # stage for a supplied URL to feed.
+        from resell.reasoning.adapters.search import get_search_backend
+
+        backend = get_search_backend()
         try:
-            outcome = run_comp_round(
-                g.conn, g.gateway, sku, research_adapter=adapter, propose_only=True,
-            )
+            outcome = run_comp_round(g.conn, g.gateway, sku, backend=backend)
         except BudgetExceeded as exc:
             # An ordinary stop, not a fault. The guard did its job; saying so as a
             # 500 traceback told the operator the tool was broken when it was
@@ -1180,6 +1153,7 @@ def _propose_operator_price(sku: str, price_cents: int, rationale: str) -> str:
         category_id=request_values.category_id,
     )
     costs = CostLines(seller_paid_shipping_cents=request_values.shipping_cost_cents)
+    strategies = build_strategies(rec, schedule=schedule, costs=costs)
     proceeds = net_from_gross(price_cents, schedule=schedule, costs=costs)
 
     proposal = PriceProposal(

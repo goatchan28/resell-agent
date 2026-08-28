@@ -52,3 +52,7 @@ bench/results/
 eval/review/*.md
 eval/dataset/
 eval/baseline_snapshot/
+
+# V2 pricing replay output. Regenerable, and it embeds marketplace listing
+# titles and URLs -- the same content that keeps bench/results/ out.
+v2bench/results/

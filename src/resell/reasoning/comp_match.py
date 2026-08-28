@@ -52,7 +52,36 @@ _NOT_THE_PRODUCT = (
 # Phrases that mean the listing is a *bundle of many*, which prices a different
 # thing. Deliberately short: the V1 bundle rule took three attempts to get right
 # and the lesson was that ambiguity belongs at the rung, not the exclusion.
-_LOTS = ("lot of", "bundle of", "wholesale lot", "job lot", "pallet", "x10", "x20")
+_LOTS = ("bundle of", "wholesale lot", "job lot", "pallet", "x10", "x20")
+
+# "LOT (2)", "LOT of 2", "LOT 2". The plain-phrase version missed the first two,
+# and a two-Roomba lot priced a single Roomba at $38.
+_LOT_COUNT = re.compile(r"\blot\b\s*(?:of\s*)?\(?\s*(\d+)")
+
+# Nouns for the things a product comes *with*. A listing selling one of these on
+# its own is not a comp for the product; three Achedaway attachment heads at
+# $15.89-$17.89 were setting a massage gun's Fast price.
+_ACCESSORY_NOUNS = frozenset({
+    "attachment", "attachments", "head", "heads", "base", "dock", "docks",
+    "case", "cases", "manual", "manuals", "charger", "chargers", "cable",
+    "cables", "strap", "straps", "cover", "covers", "lid", "lids", "filter",
+    "filters", "brush", "brushes", "remote", "stand", "battery", "batteries",
+    "adapter", "adapters", "tip", "tips", "mount", "grip",
+})
+
+# Words that say the accessory is *included with* the product rather than being
+# it. Without these the rule ate the product it was meant to protect: "Massage
+# Gun Kit Extra Attachments Case Charger" is a massage gun, and so is a camera
+# listed as "Lens + Battery Grip + Charger".
+_INCLUSION = ("with", "w/", "includes", "including", "incl", "plus", "kit",
+              "extra", "extras", "bundle", "+", "combo", "set of accessories")
+
+# "No Docks" is a statement about what is missing, not about what is for sale.
+_ABSENCE = ("no", "not", "without", "missing", "sans")
+
+# Marketplace suffixes that would otherwise sit in the head-noun position and
+# hide the accessory noun behind them.
+_TITLE_TAIL = re.compile(r"\s*[|\-–]\s*(ebay|amazon|mercari|poshmark|etsy)\s*$", re.I)
 
 # Multi-packs, generically. The replay found a used moisturiser priced partly
 # from "Pack of 2" and "2-pack" listings, which are twice the product at roughly
@@ -109,6 +138,40 @@ def model_tokens(text: str) -> set[str]:
     return found
 
 
+def _tokens(text: str) -> list[str]:
+    """Words, with punctuation split so `Base/Dock` is two tokens rather than one."""
+    return [t for t in re.split(r"[^a-z0-9+/]+", (text or "").casefold()) if t]
+
+
+def sold_as_accessory(title: str) -> str | None:
+    """The accessory noun this listing is selling, if that is what it is selling.
+
+    Three conditions, all required, because each one on its own over-fires:
+
+      - an accessory noun sits in the **head-noun position** -- the last two
+        meaningful words. "Dumbbell Base/Dock" ends in the accessory; "Autoempty
+        Dock Lidar Self-Emptying" is a vacuum that has one.
+      - no word anywhere says the accessory is *included with* something.
+      - the noun is not negated. "No Docks" is a vacuum without its dock.
+    """
+    cleaned = _TITLE_TAIL.sub("", title or "")
+    words = _tokens(cleaned)
+    if not words:
+        return None
+    if any(m in words or m in cleaned.casefold() for m in _INCLUSION):
+        return None
+    for position, word in enumerate(words):
+        if position < len(words) - 2:
+            continue
+        for part in word.split("/"):
+            if part not in _ACCESSORY_NOUNS:
+                continue
+            if position and words[position - 1] in _ABSENCE:
+                continue
+            return part
+    return None
+
+
 def _has_any(text: str, needles) -> str | None:
     folded = f" {(text or '').casefold()} "
     for needle in needles:
@@ -141,6 +204,12 @@ def classify(
             Comparability.EXCLUDED, "", ("title",),
             excluded_reason=f"an accessory or part, not the product: title says {hit!r}",
         )
+    noun = sold_as_accessory(title)
+    if noun:
+        return Verdict(
+            Comparability.EXCLUDED, "", ("title",),
+            excluded_reason=f"the listing is selling a {noun}, not the product",
+        )
 
     # 2. Is the sale unit many of them?
     hit = _has_any(title, _LOTS)
@@ -148,6 +217,12 @@ def classify(
         return Verdict(
             Comparability.EXCLUDED, "", ("title",),
             excluded_reason=f"a multi-unit lot, not one item: title says {hit!r}",
+        )
+    lot = _LOT_COUNT.search(title.casefold())
+    if lot and int(lot.group(1)) > 1:
+        return Verdict(
+            Comparability.EXCLUDED, "", ("title",),
+            excluded_reason=f"a lot of {lot.group(1)}, not one item",
         )
     count = multipack_of(title)
     if count:

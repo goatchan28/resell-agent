@@ -53,7 +53,7 @@ Written at review time, from the report and the run notes.
 | **F1** | **latent defect — real; not established as the cause of the publish failure** | MP-000052 | condition | Our condition table assumes an eBay condition ID means the same thing in every category. eBay offers six grades for 15709; the agent is shown four. Verifiable independently of any publish attempt. Cause of the 500s: **see F3**. | `events` 2232/2239/2247/2254; the recorded `condition` prompt |
 
 | **F2** | **unclassified — cause not established** | MP-000053 | publish | Three HTTP 500s. Originally attributed to the apparel condition ladder; **that attribution is withdrawn** — see F3. | `events` 15:41:11/18/29; offer `11484407010` |
-| **F3** | **reconciliation** | MP-000052, MP-000053 | publish | The apparel-ladder explanation is refuted by the history. The real boundary is **temporal, at `publishOffer`**. Cause still unknown; a decisive test is proposed. | 18 successes → 7 failures; see below |
+| **F3** | **E — external** | MP-000052, MP-000053, MP-000054, MP-000055 | publish | **eBay Sandbox platform fault.** Confirmed on four independent surfaces, including eBay's own seller UI failing to load items. Not an agent or application defect. | 18 successes → all failures; `25002` + `20500` + UI error |
 
 | **F4** | **B — correctness** | MP-000052, MP-000053, MP-000054 | set aside | Setting an item aside is local-only. eBay keeps the inventory item **and a priced, publishable offer**, which nothing in the codebase ever removes. Separate from F3. | offers `11484260010`, `11484407010`, `11484418010`, all `UNPUBLISHED` |
 
@@ -341,16 +341,43 @@ A consumed **monthly listed allowance** cannot be read: `getPrivileges` returns
 a hypothesis, now a weaker one — it would not explain `account/subscription` and
 `account/rate_table` returning system errors on plain GETs.
 
+##### Confirmed from outside Resell entirely
+
+The operator opened the **eBay Sandbox website** directly — not our code, not our
+credentials in our client, not the API — and **My eBay → Selling fails to load**:
+
+> *"There was a problem loading your items. Please try again later."*
+
+eBay's own seller UI cannot list this seller's items. That is the same fault,
+observed on a surface Resell has no involvement in whatsoever.
+
 ##### Conclusion
 
-**The publish failure is an eBay Sandbox platform fault.** It is class **E —
-external**, not an agent or application defect, and no code change would fix it.
-The three items it blocked are not agent failures.
+**The publish failure is an eBay Sandbox platform fault.** Four independent
+surfaces now exhibit it:
 
-What would confirm it beyond doubt, and needs the operator: a **second Sandbox
-seller account**. If that account publishes, the problem is specific to this
-seller; if it fails too, it is Sandbox-wide. Cheaper first step: the Sandbox
-Seller Hub shows selling limits directly, which the API declines to.
+| surface | symptom |
+|---|---|
+| `publishOffer` | HTTP 500, `errorId 25002`, "System error" |
+| `account/subscription` (read-only GET) | HTTP 500, `errorId 20500`, "System error." |
+| `account/rate_table` (read-only GET) | HTTP 500, `errorId 20500`, "System error." |
+| **eBay's own Sandbox seller UI** | **"There was a problem loading your items."** |
+
+Three of the four have nothing to do with publishing, and the fourth is not our
+software. No hypothesis about our payload, our account configuration or our code
+survives that.
+
+Class **E — external**. Not an agent or application defect; no code change would
+fix it. **The three items it blocked are not agent failures**, and the V1
+baseline conclusions stand unchanged.
+
+The second-seller-account test is no longer needed to establish this. It is
+recorded as unresolved rather than closed only because the *duration* is
+eBay's to determine: there is nothing to fix on our side and nothing to do but
+retry when the Sandbox recovers.
+
+**No further publish diagnostics.** The question is answered; repeating it would
+only add attempts to the record.
 
 All diagnostic objects were removed — `DIAG-001`'s offer and inventory item both
 deleted (204), nothing published, nothing left behind.

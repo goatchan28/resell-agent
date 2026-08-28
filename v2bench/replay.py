@@ -87,7 +87,8 @@ def price_from(observations, verdicts, case) -> tuple[dict, float]:
             identity_resolution=case.identity_resolution,
             comps=scored,
         ))
-        built = build_strategies(rec)
+        # V2 prices with the guardrails; the live V1 path does not.
+        built = build_strategies(rec, guardrails=True)
         prices = ({str(k): v.price_cents for k, v in built.prices.items()}
                   if built else {})
     except Exception as exc:  # noqa: BLE001

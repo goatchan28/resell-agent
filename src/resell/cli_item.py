@@ -154,11 +154,21 @@ def merged_identification(conn, sku: str, **overrides) -> tuple[dict, list[str]]
     identification with aspects and no category, title or condition.
 
     One implementation, so that cannot happen again.
+
+    It happened again anyway, one column at a time. `category_path` was the first
+    -- written at v1 by `suggest_category` and absent from every version after,
+    invisible until pricing chose a retention rate without it. `mode`,
+    `mode_rationale` and `identity_resolution` were the next three: `declare_mode`
+    wrote them onto the current version and the next stage superseded that row
+    eleven seconds later, so ten items reached a real `searched_not_found` and
+    none of them still had it. Anything the identification is supposed to
+    remember belongs in this list.
     """
     fields = {
         "brand": None, "model": None, "variant": None, "title": None,
         "description": None, "condition_id": None, "category_id": None,
         "category_path": None, "aspects": None, "confidence": None, "reasoning": None,
+        "mode": None, "mode_rationale": None, "identity_resolution": None,
     }
     fields.update({key: value for key, value in overrides.items() if key in fields})
 
@@ -171,6 +181,14 @@ def merged_identification(conn, sku: str, **overrides) -> tuple[dict, list[str]]
             if fields[field] is None and previous[field]:
                 fields[field] = previous[field]
                 carried.append(field)
+        # Carried, but not announced. `carried` is printed to an operator to say
+        # which *beliefs* survived, and these three are bookkeeping about how the
+        # identification was reached rather than what it claims. Both of them are
+        # NOT NULL with a default, so they would appear on every single write and
+        # train a reader to skip the line that matters.
+        for field in ("mode", "mode_rationale", "identity_resolution"):
+            if fields[field] is None and previous[field]:
+                fields[field] = previous[field]
         if previous["aspects"]:
             # Merge per aspect, not per field. Carrying the dict forward only when
             # no aspects were supplied meant `--aspect "Material=Wool"` replaced all

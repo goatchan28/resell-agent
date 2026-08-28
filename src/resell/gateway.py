@@ -882,6 +882,9 @@ class Gateway:
         aspects: dict | None = None,
         confidence: float | None = None,
         reasoning: str | None = None,
+        mode: str | None = None,
+        mode_rationale: str | None = None,
+        identity_resolution: str | None = None,
     ) -> Accepted:
         """Supersede the previous belief rather than editing it.
 
@@ -904,13 +907,21 @@ class Gateway:
             self.conn.execute(
                 "INSERT INTO identification (sku, version, brand, model, variant, title, "
                 "description, condition_id, category_id, category_path, aspect_schema, "
-                "aspects, confidence, reasoning, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "aspects, confidence, reasoning, mode, mode_rationale, "
+                "identity_resolution, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sku, version, brand, model, variant, title, description, condition_id,
                     category_id, category_path,
                     json.dumps(aspect_schema) if aspect_schema else None,
-                    json.dumps(aspects) if aspects else None, confidence, reasoning, now_iso(),
+                    json.dumps(aspects) if aspects else None, confidence, reasoning,
+                    # Both columns are NOT NULL with a default, and passing None
+                    # would insert NULL rather than fall back to it. The defaults
+                    # are spelled out here so a caller that says nothing gets the
+                    # same value the schema would have given it.
+                    mode or "unresolved", mode_rationale,
+                    identity_resolution or "unattempted",
+                    now_iso(),
                 ),
             )
         self._void_approvals(sku, "identification revised")

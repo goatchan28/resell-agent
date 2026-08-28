@@ -22,7 +22,9 @@ from resell.pricing.estimate import (
     recommend,
 )
 from resell.pricing.proceeds import CostLines, FeeBasis, FeeSchedule
-from resell.pricing.strategy import (
+from resell.pricing.strategy import (  # noqa: F401
+    STRATEGY_CAP,
+    STRATEGY_FLOOR,
     BrandSignal,
     BrandStrength,
     SellerObjective,
@@ -193,15 +195,29 @@ def test_thin_samples_collapse_quartiles_to_the_extremes():
     assert ss.get(SellerObjective.MAX_PROCEEDS).price_cents == 6000
 
 
-def test_cited_premium_brand_reaches_for_the_top_of_the_sample():
+def test_cited_premium_brand_reaches_higher_but_not_past_the_guardrail():
+    """Premium takes `max` where unknown takes `p75`, so it reaches further up
+    the sample -- but not past 140% of Balanced.
+
+    The sample here is 4000/4400/5000/9000: a median of 4700 and a top of 9000,
+    which is 1.9x the centre. Before the guardrail, a cited premium brand priced
+    at that 9000. Aggressive is a seller intent rather than a statistic, and
+    "hold out for more" does not mean "ask the most anyone has ever asked".
+    """
     rec = recommend(inp(comps=(comp(4000), comp(4400), comp(5000), comp(9000))))
     plain = build_strategies(rec, schedule=VERIFIED)
     premium = build_strategies(rec, schedule=VERIFIED, brand=BrandSignal(
         strength=BrandStrength.PREMIUM, citations=("ev_retail_398",),
         rationale="$398 swing tag",
     ))
-    assert premium.get(SellerObjective.MAX_PROCEEDS).price_cents == 9000
-    assert plain.get(SellerObjective.MAX_PROCEEDS).price_cents < 9000
+    balanced = premium.get(SellerObjective.BALANCED).price_cents
+    top = premium.get(SellerObjective.MAX_PROCEEDS).price_cents
+
+    assert top == round(balanced * STRATEGY_CAP), "capped, not the sample maximum"
+    assert top < 9000
+    assert top > plain.get(SellerObjective.MAX_PROCEEDS).price_cents, (
+        "premium still reaches higher than unknown"
+    )
 
 
 def test_uncited_brand_strength_is_treated_as_unknown_and_says_so():
@@ -300,3 +316,43 @@ def test_no_stale_note_when_the_asks_are_fresh():
     ), window_days=90))
     ss = build_strategies(rec, schedule=VERIFIED)
     assert not any("already declined" in n for n in ss.notes)
+
+
+def test_a_broken_unit_does_not_become_the_fast_price():
+    """The reason the floor exists.
+
+    MP-000054's sample minimum was $58.99 for a camera body sold "AS IS
+    Parts/Repair NO Power", against a median of $400. Recommending that as
+    "sell quickly" prices a working camera at the price of a broken one.
+    """
+    rec = recommend(inp(comps=(comp(5899), comp(38000), comp(40000), comp(45000))))
+    ss = build_strategies(rec, schedule=VERIFIED)
+    balanced = ss.get(SellerObjective.BALANCED).price_cents
+    fast = ss.get(SellerObjective.FAST_SALE).price_cents
+
+    assert fast == round(balanced * STRATEGY_FLOOR)
+    assert fast > 5899, "the broken one no longer sets the price"
+
+
+def test_one_comp_gets_spacing_rather_than_three_identical_prices():
+    """A single observation supports one number, and the two endpoints around it
+    are spacing rather than evidence -- so they are modest, not the full
+    guardrail width. $100 gives $80/$100/$120."""
+    rec = recommend(inp(comps=(comp(10000),)))
+    ss = build_strategies(rec, schedule=VERIFIED)
+
+    assert ss.get(SellerObjective.FAST_SALE).price_cents == 8000
+    assert ss.get(SellerObjective.BALANCED).price_cents == 10000
+    assert ss.get(SellerObjective.MAX_PROCEEDS).price_cents == 12000
+
+
+def test_a_healthy_sample_keeps_its_own_positions():
+    """The guardrails are bounds, not a replacement. Where the observed
+    min/median/p75 already sit inside them, they are what the seller sees."""
+    rec = recommend(inp(comps=(comp(9000), comp(9500), comp(10000), comp(11000))))
+    ss = build_strategies(rec, schedule=VERIFIED)
+    balanced = ss.get(SellerObjective.BALANCED).price_cents
+
+    assert ss.get(SellerObjective.FAST_SALE).price_cents == 9000
+    assert ss.get(SellerObjective.FAST_SALE).price_cents > round(balanced * STRATEGY_FLOOR)
+    assert ss.get(SellerObjective.MAX_PROCEEDS).price_cents < round(balanced * STRATEGY_CAP)

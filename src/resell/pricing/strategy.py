@@ -355,15 +355,55 @@ def _from_anchor(
     )
 
 
+# Fast and Aggressive are seller intents, not statistics of a sample. The sample
+# says where the market is; these say how hard the seller wants to push against
+# it, and a position taken from the sample is only useful while it is a sensible
+# push.
+#
+# The floor exists because the minimum of a marketplace sample is very often a
+# broken one. MP-000054's was $58.99 for a parts-only camera body with no power,
+# MP-000049's $14.99 for a unit whose title was "READ!". Recommending those as
+# "sell quickly" prices a working item at the price of a broken one.
+#
+# This deliberately overrides the older rule that Fast never rises above the
+# market floor. That rule protected against recommending above every visible
+# competitor; the corpus says the greater risk is anchoring to a damaged listing.
+STRATEGY_FLOOR = 0.70          # Fast may not fall below 70% of Balanced
+STRATEGY_CAP = 1.40            # Aggressive may not rise above 140% of Balanced
+
+# When an endpoint collapses onto Balanced the sample has no opinion about it, so
+# these are spacing rather than evidence -- and spacing should be modest. A
+# single $100 observation gives $80/$100/$120, not the full guardrail width.
+COLLAPSED_LOW = 0.80
+COLLAPSED_HIGH = 1.20
+
+
+def _guardrailed(fast: int, balanced: int, aggressive: int) -> tuple[int, int, int]:
+    """Keep the two endpoints a sensible distance from the centre.
+
+    Balanced is never touched: it is the market's central estimate and the only
+    one of the three that is purely a measurement.
+    """
+    if balanced <= 0:
+        return fast, balanced, aggressive
+    fast = max(fast, round(balanced * STRATEGY_FLOOR))
+    if fast >= balanced:
+        fast = round(balanced * COLLAPSED_LOW)
+    aggressive = min(aggressive, round(balanced * STRATEGY_CAP))
+    if aggressive <= balanced:
+        aggressive = round(balanced * COLLAPSED_HIGH)
+    return fast, balanced, aggressive
+
+
 def _positions(rec: PriceRecommendation, d: Distribution, strength: BrandStrength):
     """The three prices, from the marketplace sample and the retail anchor.
 
     Three deliberate asymmetries, because these are seller intents and not
     statistics of one sample:
 
-    **Fast never rises above the market floor.** A "sell quickly" price above
-    every visible competitor does not sell quickly. Retail can lower it -- when
-    there is no market at all it is all there is -- and cannot lift it.
+    **Fast never rises above the market floor** -- except where `_guardrailed`
+    says otherwise, because a marketplace minimum is very often a broken unit.
+    Retail can lower it and cannot lift it.
 
     **Balanced is capped by the market's ceiling**, whenever the sample is big
     enough to have one. Balanced means the price most likely to actually sell;
@@ -391,6 +431,7 @@ def _positions(rec: PriceRecommendation, d: Distribution, strength: BrandStrengt
     band = rec.retail_anchor
     share = anchor_share(rec.market_confidence, anchor_trust(band))
     if band is None or share <= 0:
+        m_lo, m_mid, m_hi = _guardrailed(m_lo, m_mid, m_hi)
         return {SellerObjective.FAST_SALE: m_lo,
                 SellerObjective.BALANCED: m_mid,
                 SellerObjective.MAX_PROCEEDS: m_hi}
@@ -408,6 +449,10 @@ def _positions(rec: PriceRecommendation, d: Distribution, strength: BrandStrengt
     if d.n >= ENOUGH_TO_BOUND and m_hi > m_lo:
         centre = min(max(centre, m_lo), m_hi)
     centre = min(max(centre, low), high)
+    # After the blend, not before: the guardrails are about the distance between
+    # the three prices a seller is shown, and the blended centre is the one they
+    # are shown.
+    low, centre, high = _guardrailed(low, centre, high)
     return {SellerObjective.FAST_SALE: low,
             SellerObjective.BALANCED: centre,
             SellerObjective.MAX_PROCEEDS: high}

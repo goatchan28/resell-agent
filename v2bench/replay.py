@@ -105,7 +105,8 @@ def offline() -> list[dict]:
         verdicts = {
             o.comp_id: classify(brand=case.brand, model=case.model,
                                 item_title=case.title, comp_title=o.title,
-                                item_evidence_ids=("1",), ceiling=ceiling)
+                                item_evidence_ids=("1",), ceiling=ceiling,
+                                item_type=case.item_type)
             for o in case.stored_observations
         }
         timing.match_s = time.perf_counter() - started
@@ -141,7 +142,7 @@ def live() -> list[dict]:
     rows = []
     for case in corpus.load():
         round_ = plan_round(brand=case.brand, model=case.model, title=case.title,
-                            backend=backend,
+                            backend=backend, item_type=case.item_type,
                             identity_resolution=case.identity_resolution)
         prices, round_.timing.price_s = price_from(
             round_.observations, round_.verdicts, case)

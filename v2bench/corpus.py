@@ -40,6 +40,7 @@ class Case:
     model: str | None
     title: str | None
     identity_resolution: str
+    item_type: str | None
     condition_band: str | None
     v1_price_cents: int | None
     v1_strategies: dict = field(default_factory=dict)
@@ -78,7 +79,7 @@ def load(skus=CORPUS) -> list[Case]:
     cases: list[Case] = []
     for sku in skus:
         idn = conn.execute(
-            "SELECT brand, model, title, identity_resolution, condition_id "
+            "SELECT brand, model, title, identity_resolution, condition_id, aspects "
             "FROM identification WHERE sku=? ORDER BY version DESC LIMIT 1", (sku,)
         ).fetchone()
         if idn is None:
@@ -123,6 +124,8 @@ def load(skus=CORPUS) -> list[Case]:
         cases.append(Case(
             sku=sku, brand=idn["brand"], model=idn["model"], title=idn["title"],
             identity_resolution=idn["identity_resolution"] or "unattempted",
+            item_type=(lambda a: (a.get("Type") or a.get("Product Type") or [None])[0])(
+                json.loads(idn["aspects"] or "{}") or {}),
             condition_band=idn["condition_id"],
             v1_price_cents=prop["price_cents"] if prop else None,
             v1_strategies=json.loads((prop["strategy_prices_json"] or "{}")) if prop else {},

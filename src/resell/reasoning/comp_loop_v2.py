@@ -101,6 +101,7 @@ def plan_round(
     model: str | None,
     title: str | None,
     backend,
+    item_type: str | None = None,
     identity_resolution: str = "unattempted",
     item_evidence_ids: tuple[str, ...] = ("1",),
     max_comps_per_search: int = MAX_COMPS_PER_SEARCH,
@@ -148,6 +149,7 @@ def plan_round(
         round_.verdicts[obs.comp_id] = classify(
             brand=brand, model=model, item_title=title, comp_title=obs.title,
             item_evidence_ids=item_evidence_ids, ceiling=ceiling,
+            item_type=item_type,
         )
     round_.timing.match_s = time.perf_counter() - started
     return round_
@@ -160,6 +162,7 @@ def run_comp_round_v2(conn, gateway, sku: str, *, backend, **kwargs) -> RoundV2:
     the part that writes. Nothing calls it yet -- the replay measures `plan_round`
     and this exists so wiring it later is not a rewrite.
     """
+    import json
     import sqlite3
 
     from resell import store_pricing as sp
@@ -167,9 +170,12 @@ def run_comp_round_v2(conn, gateway, sku: str, *, backend, **kwargs) -> RoundV2:
     from resell.reasoning.comp_loop import _identity_resolution, _uid
 
     identification = conn.execute(
-        "SELECT brand, model, title FROM identification WHERE sku = ? "
+        "SELECT brand, model, title, aspects FROM identification WHERE sku = ? "
         "ORDER BY version DESC LIMIT 1", (sku,),
     ).fetchone()
+    aspects = json.loads(identification["aspects"] or "{}") or {}
+    types = aspects.get("Type") or aspects.get("Product Type") or []
+    item_type = types[0] if types else None
     resolution = _identity_resolution(conn, sku)
     evidence = tuple(
         str(r["id"]) for r in conn.execute(
@@ -178,7 +184,7 @@ def run_comp_round_v2(conn, gateway, sku: str, *, backend, **kwargs) -> RoundV2:
 
     round_ = plan_round(
         brand=identification["brand"], model=identification["model"],
-        title=identification["title"], backend=backend,
+        title=identification["title"], backend=backend, item_type=item_type,
         identity_resolution=resolution, item_evidence_ids=evidence, **kwargs,
     )
 

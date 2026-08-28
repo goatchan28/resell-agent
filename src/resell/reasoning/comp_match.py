@@ -131,6 +131,39 @@ class Verdict:
     exact_model: bool = False       # recorded for analysis; the ladder cannot say it
 
 
+def required_type_tokens(item_type: str | None, item_title: str | None) -> frozenset[str]:
+    """The `Type` tokens a comp title must carry -- or nothing, which is usual.
+
+    `Type` is the most reliably present aspect in the record: 46 identifications
+    out of 46 have one. It is also usually a *category label* rather than the
+    product's noun -- "Athletic" for a sneaker, "Robotic" for a vacuum, "Digital
+    SLR" where every listing says DSLR. Requiring those would have kept 1 comp of
+    24 on the Jordans and 3 of 20 on the Roomba.
+
+    So the item vouches for its own Type: the rule applies only when the complete
+    normalised Type already appears in the item's own title, which is where a
+    value like "Massage Gun" is a real product noun and "Athletic" is not. When it
+    does not appear, this returns nothing and Type has no filtering effect at all.
+
+    A single-word Type is never enough, even when it does appear. "Robotic" is in
+    the Roomba's own title -- as an adjective -- and passing on that technicality
+    dropped seventeen legitimate Roombas over *robot* versus *robotic*. Two words
+    is what separates a product noun phrase from a category label.
+
+    No synonyms, no category mapping, no expansion. If the words are not there,
+    the rule is not available.
+    """
+    if not item_type or not item_title:
+        return frozenset()
+    normalized = " ".join(str(item_type).casefold().split())
+    if not normalized:
+        return frozenset()
+    if normalized not in " ".join(str(item_title).casefold().split()):
+        return frozenset()
+    tokens = frozenset(t for t in re.split(r"[^a-z0-9]+", normalized) if t)
+    return tokens if len(tokens) >= 2 else frozenset()
+
+
 def model_tokens(text: str) -> set[str]:
     """Model-number-ish tokens in a string, lowercased."""
     found = set()
@@ -192,6 +225,7 @@ def classify(
     comp_title: str | None,
     item_evidence_ids: tuple[str, ...],
     ceiling: Comparability = Comparability.SAME_FAMILY_VARIANT,
+    item_type: str | None = None,
 ) -> Verdict:
     """What this listing is, relative to the item. Never raises."""
     title = (comp_title or "").strip()
@@ -253,6 +287,21 @@ def classify(
                 f"the item is {sorted(item_models)[:3]}"
             ),
         )
+
+    # 3b. A different kind of object. Only asked when the item's own title
+    #     confirms its Type is a product noun -- see `required_type_tokens`.
+    needed = required_type_tokens(item_type, item_title)
+    if needed:
+        present = {t for t in re.split(r"[^a-z0-9]+", folded) if t}
+        if not needed <= present:
+            missing = sorted(needed - present)
+            return Verdict(
+                Comparability.EXCLUDED, "", ("title",),
+                excluded_reason=(
+                    f"a different kind of object: the listing does not say "
+                    f"{', '.join(missing)!r} and the item is a {item_type!r}"
+                ),
+            )
 
     if shared and brand_ok:
         return Verdict(

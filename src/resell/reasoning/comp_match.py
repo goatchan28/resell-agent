@@ -88,9 +88,13 @@ _TITLE_TAIL = re.compile(r"\s*[|\-–]\s*(ebay|amazon|mercari|poshmark|etsy)\s*$
 # twice the price -- the single most direct way to inflate a sample. Covers
 # "2-pack", "2 pack" and "pack of 2"; a quantity of one is not a multi-pack and
 # is left alone.
+# "set" is deliberately absent. A pack of two is two products; a *set* of two is
+# very often one product's normal configuration -- a pair of dumbbells, a pair of
+# shoes -- and excluding it threw away the single best comp MP-000022 had, a
+# $389 pair listed against an item that is itself a pair.
 _MULTIPACK = re.compile(
     r"\b(?:(?P<n>\d+)\s*-?\s*(?:pack|packs|count|ct)\b"
-    r"|(?:pack|packs|set)\s+of\s+(?P<m>\d+)\b)"
+    r"|(?:pack|packs)\s+of\s+(?P<m>\d+)\b)"
 )
 
 

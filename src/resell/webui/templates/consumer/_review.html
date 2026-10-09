@@ -15,7 +15,7 @@
     <div class="c-carousel" role="group" aria-label="Listing photos">
       {% for position in task.photo_positions %}
         <figure class="c-slide">
-          <img src="{{ url_for('photo', sku=task.sku, position=position) }}"
+          <img src="{{ url_for('photo', sku=task.sku, position=position, size='view') }}"
                alt="" loading="{{ 'eager' if loop.first else 'lazy' }}">
         </figure>
       {% endfor %}

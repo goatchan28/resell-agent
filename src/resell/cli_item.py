@@ -569,11 +569,9 @@ def cmd_item_observe(args: argparse.Namespace) -> int:
               f"surfaces {list(finding.surfaces_examined) or 'none named'}")
         if finding.note:
             print(f"    {finding.note[:100]}")
-        db.kv_set(conn, f"identity_search:{args.sku}", json.dumps({
-            "surfaces_examined": list(finding.surfaces_examined),
-            "photos_reviewed": finding.photos_reviewed,
-            "note": finding.note,
-        }))
+        # Stored by `observe_and_record`, which both entry points share. This is
+        # where the write used to live, and living here meant the orchestrator did
+        # not do it.
 
     # A model can satisfy the observation contract perfectly while leaving every
     # product code inside a text_read claim, where it is never check-digit verified
@@ -809,186 +807,44 @@ def cmd_item_declare_mode(args: argparse.Namespace) -> int:
 
 
 def cmd_item_research(args: argparse.Namespace) -> int:
-    """Run one identification research round: plan, retrieve, judge, select.
+    """Work out what the item is. Deterministic; at most one search.
 
-    Planning happens before anything is fetched, and `--dry-run` stops there. What a
-    lookup returns is recorded as candidate-product evidence; whether any of it may
-    describe this item is decided afterwards by the donation gate, not here.
+    No planner, no page reader, no matcher. The tier is read off what `observe`
+    recorded, and Tier 2 asks a search backend the one question an identifier
+    cannot answer about itself -- which product it denotes -- then decides from the
+    results by string comparison and source authority.
     """
     config, conn, gateway = _open(require_credentials=True)
-    from resell.ebay.client import EbayApiError, EbayClient
-    from resell.ebay.publisher import Publisher
-    from resell.reasoning.adapters.research import get_research_adapter
-    from resell.reasoning.budget import (
-        BudgetExceeded, LookupBudget, LookupRates, StageBudget,
-    )
-    from resell.reasoning.research_loop import ResearchLoopError, rejudge, run_round
-    from resell.reasoning.vision import spend_so_far
+    from resell.reasoning.identity import run_identity_round, tier_for
 
-    identification = current_identification(conn, args.sku)
-    unresolved = ""
-    category_id = args.category or (identification["category_id"] if identification else None)
-    if category_id:
-        with EbayClient(config, conn) as client:
-            try:
-                specs = Publisher(gateway, client, conn).aspect_schema(
-                    config.marketplace_id, category_id
-                )
-                have = json.loads(identification["aspects"]) if (
-                    identification and identification["aspects"]
-                ) else {}
-                missing = [s.name for s in specs if s.required and not have.get(s.name)]
-                unresolved = ", ".join(missing)
-            except EbayApiError as exc:
-                print(f"  (could not read the aspect form: HTTP {exc.status_code})")
-
-    stage_budget = StageBudget.from_env("research")
-    lookup_budget = LookupBudget.from_env("identity")
-    # `fetch` runs a ledgered extraction call per page, so it needs the connection,
-    # the SKU and a model adapter of its own. The extraction provider is separate
-    # from the reasoning provider on purpose: it is the narrowest, highest-volume
-    # stage and the first candidate for a cheaper or local model, and choosing it
-    # independently is what makes that a flag rather than a rewrite.
-    extra: dict = {}
-    if args.research_provider == "fetch":
-        from resell.reasoning.adapters import get_adapter
-
-        extra = {
-            "conn": conn,
-            "sku": args.sku,
-            "model_adapter": get_adapter(
-                args.extraction_provider or args.provider
-            ),
-        }
-    adapter = get_research_adapter(args.research_provider, **extra)
-    rates = LookupRates.from_env(adapter.provider)
-    performed = conn.execute(
-        "SELECT COUNT(*) FROM research_lookup WHERE sku = ? AND scope = 'identity'",
-        (args.sku,),
-    ).fetchone()[0]
-
-    print(f"\n{args.sku}: identification research"
-          f"{'  [DRY RUN]' if args.dry_run else ''}")
-    print(f"  mode: {identification['mode'] if identification else 'unresolved'}   "
-          f"effort: {conn.execute('SELECT identification_effort FROM item WHERE sku = ?', (args.sku,)).fetchone()[0]}")
-    if unresolved:
-        print(f"  unresolved required aspects: {unresolved}")
-    plan_spend = spend_so_far(conn, args.sku, "research_plan")
-    print(f"  budgets: {plan_spend.calls}/{stage_budget.max_calls} planning calls, "
-          f"{performed}/{lookup_budget.max_lookups} lookups via {adapter.provider}")
-    if adapter.provider == "manual":
-        print("  retrieval is operator-mediated: anything you paste is recorded as your "
-              "account of a page,\n  not as something the system fetched or verified.")
-
-    try:
-        if args.rejudge:
-            outcome = rejudge(
-                conn, gateway, args.sku, provider=args.provider,
-                stage_budget=stage_budget,
-            )
-        else:
-            outcome = run_round(
-            conn, gateway, args.sku, unresolved=unresolved,
-            provider=args.provider, research_adapter=adapter,
-            stage_budget=stage_budget, lookup_budget=lookup_budget,
-            lookup_rates=rates, dry_run=args.dry_run,
-            )
-    except BudgetExceeded as exc:
-        print(f"\nREFUSED before calling the model: {exc}", file=sys.stderr)
-        return 1
-    except ResearchLoopError as exc:
-        print(f"\nresearch failed: {exc}", file=sys.stderr)
-        return 1
-
-    if outcome.stopped and not outcome.plan:
-        print(f"\n  STOPPED [{outcome.stopped}] {outcome.stop_reason}")
-        _print_mode(outcome)
-        return 0
-
-    # An unusable plan is a failed call, not a decision about the item, and it
-    # exits non-zero so a scripted run does not read it as a completed round.
-    if outcome.stopped == "plan_unusable":
-        print(f"\n  FAILED [{outcome.stopped}] {outcome.stop_reason}", file=sys.stderr)
-        for note in outcome.notes:
-            print(f"    {note[:150]}", file=sys.stderr)
-        return 1
-
-    plan = outcome.plan
-    if plan:
-        print(f"\n  plan: proposed mode {plan.proposed_mode}, "
-              f"{len(plan.lookups)} lookup(s)")
-        for line in _wrap(plan.rationale, 92):
-            print(f"    {line}")
-        for lookup in plan.lookups:
-            print(f"    [{lookup.source_kind}] {lookup.query}")
-            print(f"        cites {list(lookup.evidence_ids)} — {lookup.motivation[:72]}")
-
-    for note in outcome.notes:
-        print(f"  NOTE {note[:110]}")
-
-    if outcome.deferred:
-        print(f"\n  DEFERRED {len(outcome.deferred)} lookup(s): {outcome.deferral_reason[:70]}")
-        for query in outcome.deferred:
-            print(f"    {query}")
-        print("    (recorded in the event log; re-plannable when budget allows)")
-
-    if outcome.stopped:
-        print(f"\n  STOPPED [{outcome.stopped}] {outcome.stop_reason[:150]}")
-        _print_mode(outcome)
-        return 0
+    tier = tier_for(conn, args.sku)
+    print(f"  tier {tier.tier}: {tier.why}")
+    if tier.identifiers:
+        for identifier in tier.identifiers:
+            print(f"    {identifier.scheme:<14} {identifier.normalized}")
 
     if args.dry_run:
-        print(f"\n  WOULD perform {len(outcome.performed)} lookup(s). Nothing was "
-              f"fetched and nothing was recorded.")
+        if tier.searches:
+            from resell.reasoning.identity import best_identifier, query_for
+
+            print(f"\n  would search: {query_for(tier.brand, best_identifier(tier.identifiers))!r}")
+        else:
+            print("\n  would not search; nothing external to look for")
         return 0
 
-    print(f"\n  performed {len(outcome.performed)} lookup(s), "
-          f"{outcome.candidates_found} candidate document(s)")
+    outcome = run_identity_round(conn, gateway, args.sku)
+    conn.commit()
 
-    # Show what was captured before showing what was made of it, so a retrieval
-    # problem is not mistaken for a judging problem.
-    for row in conn.execute(
-        "SELECT candidate_ref, source_url, source_authority, retrieval_method, "
-        "COUNT(*) n, SUM(fact_domain = 'identity') identity_facts "
-        "FROM evidence WHERE sku = ? AND subject = 'candidate_product' "
-        "GROUP BY candidate_ref", (args.sku,),
-    ):
-        via = " · operator-transcribed" if row["retrieval_method"] == "operator_transcribed" else ""
-        print(f"    {row['candidate_ref']}  [{row['source_authority']}{via}]  "
-              f"{row['identity_facts']} identity + {row['n'] - row['identity_facts']} retail")
-        print(f"      {row['source_url'][:88]}")
-
-    selection = outcome.selection
-    if selection is None:
-        return 0
-    print(f"\n  judged {selection.considered} candidate(s), {selection.ruled_out} ruled out")
-    for line in _wrap(selection.reason, 92):
-        print(f"    {line}")
-
-    for row in conn.execute(
-        "SELECT candidate_ref, is_match, strength, source_authority, donation_scope, "
-        "rationale FROM product_match WHERE sku = ? ORDER BY id DESC LIMIT 10",
-        (args.sku,),
-    ):
-        verdict = "MATCH  " if row["is_match"] else "no     "
-        print(f"    {verdict} {row['candidate_ref']:<16} {row['strength']:<22} "
-              f"{row['source_authority']:<14} donates: {row['donation_scope']}")
-        for line in _wrap(row["rationale"], 88):
-            print(f"             {line}")
-
-    citable = gateway.conn and __import__(
-        "resell.gateway", fromlist=["citable_candidate_evidence"]
-    ).citable_candidate_evidence(conn, args.sku)
-    if citable:
-        print(f"\n  {len(citable)} external fact(s) are now citable by an aspect. "
-              f"Re-run map-aspects to use them:")
-        print(f"    resell item map-aspects {args.sku}")
-    else:
-        print("\n  No external fact is citable by an aspect. Identification is "
-              "unchanged by this round.")
-        if outcome.candidates_found and outcome.selection and not outcome.selection.selected:
-            print("  The retrieved documents are kept. To judge them again without "
-                  f"spending a lookup:\n    resell item research {args.sku} --rejudge")
+    if outcome.query:
+        print(f"\n  searched {outcome.query!r} -> {outcome.hits} result(s)")
+    confirmation = outcome.confirmation
+    if confirmation is not None:
+        for match in confirmation.matches:
+            print(f"    {match['candidate_ref']:<24} {match['authority']:<14} "
+                  f"{match['title'][:60]}")
+        print(f"\n  {confirmation.reason}")
+    elif outcome.stop_reason:
+        print(f"\n  {outcome.stop_reason}")
     _print_mode(outcome)
     return 0
 
@@ -2115,22 +1971,11 @@ def register(subparsers) -> None:
     declare.set_defaults(func=cmd_item_declare_mode)
 
     research = sub.add_parser(
-        "research", help="one identification research round: plan, retrieve, judge"
+        "research", help="work out what the item is; at most one search"
     )
     research.add_argument("sku")
-    research.add_argument("--category", help="defaults to the identification's category")
-    research.add_argument("--provider", default=None, help="model provider")
-    research.add_argument("--research-provider", default=None,
-                          help="retrieval provider: manual (you type the facts) or "
-                               "fetch (you give a URL, the page is read for you)")
-    research.add_argument("--extraction-provider", default=None,
-                          help="model for reading fetched pages; defaults to "
-                               "--provider. Separate so the cheapest stage can move "
-                               "to a cheaper model on its own")
     research.add_argument("--dry-run", action="store_true",
-                          help="plan only; fetch nothing")
-    research.add_argument("--rejudge", action="store_true",
-                          help="re-judge candidates already retrieved; no new lookups")
+                          help="report the tier and the query; search nothing")
     research.set_defaults(func=cmd_item_research)
 
     mapping = sub.add_parser(

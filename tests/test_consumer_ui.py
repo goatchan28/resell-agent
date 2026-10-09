@@ -859,14 +859,21 @@ def test_the_clock_does_not_use_the_last_steps_elapsed(tmp_path):
     progress = (CONSUMER / "_progress.html").read_text()
     assert "elapsed_ms" not in progress
 
+    from resell import db
     from tests.test_webui import seeded
 
     app, conn, _, sku = seeded(tmp_path)
-    client = app.test_client()
-    response = client.post(f"/items/{sku}/run", follow_redirects=False)
-    run_id = re.search(r"run=(run_\w+)", response.headers["Location"]).group(1)
-    payload = client.get(f"/runs/{run_id}",
-                         headers={"Accept": "application/json"}).get_json()
+    # A run with no steps recorded against it, written directly rather than raced
+    # against a live worker. The claim is about what the endpoint reports when
+    # there is nothing to report, and starting a real run to observe that made the
+    # assertion a coin toss on how far the background thread had got.
+    conn.execute(
+        "INSERT INTO agent_run (run_id, sku, status, started_at) VALUES (?,?,?,?)",
+        ("run_stepless", sku, "running", db.now_iso()),
+    )
+    conn.commit()
+    payload = app.test_client().get(
+        "/runs/run_stepless", headers={"Accept": "application/json"}).get_json()
     assert payload["elapsed_ms"] == 0, "nothing recorded yet, and it shows"
 
 
@@ -1784,3 +1791,71 @@ def test_the_front_door_asks_for_the_tag():
     assert "Include a photo of the tag or label if there is one." in hero
     # one sentence, not a checklist
     assert hero.count('<p class="c-hero-note"') == 1
+
+
+# --- an interrupted upload does not become an error page ----------------------
+#
+# A phone moving from Wi-Fi to cellular changes IP and every open connection dies
+# with it. As a plain form post that means the browser navigates to its own error
+# page and takes the FileList with it, so the seller re-picks every photograph
+# and uploads the same bytes again. Reproducible, not our error, and not our page.
+
+
+def test_the_picker_has_somewhere_to_report_a_failed_upload():
+    picker = (CONSUMER / "_photo_picker.html").read_text()
+    assert "data-upload-problem" in picker
+    assert "aria-live" in picker, "a screen reader should hear it without focus moving"
+    assert "hidden" in picker, "silent until something goes wrong"
+
+
+def test_the_upload_is_sent_without_leaving_the_page():
+    base = (CONSUMER / "base.html").read_text()
+    assert "form.c-picker" in base
+    assert "new FormData(form)" in base
+    assert "xhr.open(\"POST\", form.getAttribute(\"action\")" in base, (
+        "the same server route, unchanged"
+    )
+
+
+def test_a_network_failure_offers_retry_rather_than_navigating():
+    base = (CONSUMER / "base.html").read_text()
+    error_block = base[base.index('xhr.addEventListener("error"'):]
+    assert "window.location" not in error_block.split("})")[0], (
+        "an interrupted upload must not navigate anywhere"
+    )
+    assert "Retry" in base
+    assert "your photos are still here" in base
+
+
+def test_the_upload_reports_real_progress():
+    """These take tens of seconds on a phone; the button used to say "Uploading…"
+    whether it was moving or stalled."""
+    base = (CONSUMER / "base.html").read_text()
+    assert "xhr.upload.addEventListener(\"progress\"" in base
+    assert "lengthComputable" in base
+
+
+def test_a_browser_without_xhr_keeps_the_plain_form():
+    """Progressive enhancement: no JS, no regression."""
+    base = (CONSUMER / "base.html").read_text()
+    assert "if (!window.XMLHttpRequest || !window.FormData) { return; }" in base
+    picker = (CONSUMER / "_photo_picker.html").read_text()
+    assert 'method="post"' in picker and 'action="{{ action }}"' in picker
+    assert 'enctype="multipart/form-data"' in picker
+
+
+def test_a_double_tap_cannot_start_two_uploads():
+    base = (CONSUMER / "base.html").read_text()
+    assert 'form.dataset.uploading === "1"' in base
+
+
+def test_too_large_is_told_apart_from_interrupted():
+    """413 is a decision about the request; a dead connection is not."""
+    base = (CONSUMER / "base.html").read_text()
+    assert "xhr.status === 413" in base
+    assert "too large" in base
+
+
+def test_the_failure_message_is_styled():
+    css = CSS.read_text()
+    assert ".c-upload-problem" in css

@@ -25,7 +25,7 @@
     <section class="c-item">
       <div class="c-shot">
         {% if task.photo_positions %}
-          <img src="{{ url_for('photo', sku=task.sku, position=task.photo_positions[0]) }}"
+          <img src="{{ url_for('photo', sku=task.sku, position=task.photo_positions[0], size='view') }}"
                alt="{{ task.name }}">
         {% else %}
           <div class="c-shot-empty" aria-hidden="true"></div>

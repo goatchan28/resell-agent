@@ -759,3 +759,12 @@ body:has(.c-more[open]) .c-item { display: none; }
 @media (prefers-reduced-motion: reduce) {
   .c-big-button:active { transform: none; }
 }
+
+/* An interrupted upload says so here rather than on the browser's error page.
+   Quiet, not alarming: nothing was lost and the photographs are still picked. */
+.c-upload-problem {
+  margin: 12px 0 0;
+  color: var(--warn, #8a5a00);
+  font-size: .92rem;
+  line-height: 1.4;
+}

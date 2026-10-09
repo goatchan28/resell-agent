@@ -43,6 +43,12 @@ an observation. Style codes, product codes, article numbers, factory codes and \
 barcode digits are all identifiers. An observation saying "the tag reads style code \
 ABC-123" records that you saw it; the identifiers entry is what gets verified and \
 carried into the listing. Do both. If the scheme is unclear, use `other`.
+- A brand name legible on the object is a maker's mark, and the same rule applies: \
+it must ALSO appear in `identifiers`, with scheme `makers_mark`. Transcribe the \
+brand and nothing else -- not the product line printed beside it, not the country \
+of origin, not a standards or certification mark. If a logo is recognisable but \
+its text is not legible, that is an `inference` observation and never an \
+identifier: a brand you recognised is not a brand you read.
 - Emit the tool arguments as real JSON structures: `observations` and `identifiers` \
 are arrays of objects, and `identity_search` is an object. Do not serialise them \
 into strings.
@@ -265,23 +271,48 @@ def mapping_stage(
 def render_aspect_form(specs, max_values: int = 60) -> str:
     """The form as the model sees it.
 
-    Allowed values are capped: some aspects carry hundreds, and the token cost is
-    real. The cap is stated so a missing value is visibly a truncation rather than
-    an absence.
+    Values are capped: some aspects carry hundreds, and the token cost is real.
+    The cap is stated so a missing value is visibly a truncation rather than an
+    absence.
+
+    **A free-text aspect's values are suggestions, and the form has to say so.**
+    eBay marks each aspect `SELECTION_ONLY` or `FREE_TEXT`, and only the first is
+    a closed set -- but both used to be printed under the word `allowed:`, which
+    reads as a closed set either way.
+
+    MP-000063 and MP-000065 are two crocheted yarn hacky sacks. eBay's `Material`
+    for their category is free text with five suggestions --
+    `Carbon Fiber | Foam | Metal | Plastic | Wood` -- and a ball of yarn is none of
+    them. Told those were the allowed values, the mapper picked `Wood` three times
+    across the two items; MP-000065 is listed with it. When the same call
+    understood it could write what it saw, it wrote `Wool` -- a value not on
+    eBay's list at all, accepted without complaint, because the field really is
+    free text.
+
+    So the rendering distinguishes them, and for the free-text case it says what
+    to do when nothing fits. A form that offers five wrong answers and calls them
+    the allowed ones is asking for the least wrong of them.
     """
     lines = []
     for spec in specs:
         flag = "REQUIRED" if spec.required else "optional"
         lines.append(f"- {spec.name} [{flag}, {spec.mode.lower()}, {spec.cardinality.lower()}]")
-        if spec.allowed_values:
-            shown = list(spec.allowed_values[:max_values])
-            suffix = (
-                f" ... and {len(spec.allowed_values) - len(shown)} more not shown"
-                if len(spec.allowed_values) > len(shown) else ""
-            )
-            lines.append(f"    allowed: {' | '.join(shown)}{suffix}")
+        if not spec.allowed_values:
+            lines.append("    free text -- write the observed value")
+            continue
+        shown = list(spec.allowed_values[:max_values])
+        suffix = (
+            f" ... and {len(spec.allowed_values) - len(shown)} more not shown"
+            if len(spec.allowed_values) > len(shown) else ""
+        )
+        if getattr(spec, "selection_only", False):
+            lines.append(f"    allowed (choose one of these or leave it unset): "
+                         f"{' | '.join(shown)}{suffix}")
         else:
-            lines.append("    free text")
+            lines.append(f"    common values (free text -- suggestions, not a "
+                         f"closed list): {' | '.join(shown)}{suffix}")
+            lines.append("      if none of these is truthful for this item, write "
+                         "the observed value instead; never pick the nearest one.")
     return "\n".join(lines)
 
 
@@ -301,128 +332,6 @@ def render_observations(rows) -> str:
         suffix = f"  ({'; '.join(detail)})" if detail else ""
         lines.append(f"[{row['id']}] {row['basis'] or row['kind']}: {claim}{suffix}")
     return "\n".join(lines)
-
-
-PLAN_SYSTEM_PROMPT = """You are deciding whether external research would improve the \
-identification of a second-hand item, and if so, exactly what to look up. You are \
-planning, not searching. Nothing is fetched until this plan is agreed.
-
-Rules:
-
-- Every lookup must cite the observations that motivate it. "Search the \
-manufacturer's site for style code SUJT EXP 2BSV SLIM, because observation 41 \
-transcribed it from the swing tag" is a plan. "Search for Brooks Brothers jackets" \
-is browsing.
-- Order lookups by value. The list may be trimmed to fit a budget, so what you put \
-first is what will run.
-- Prefer the manufacturer's own source. The same code on a reseller page is worth \
-much less, because they may have transcribed it from a photograph or be describing a \
-different variant.
-- Say when searching is not warranted. If the evidence already supports the best \
-identification available, set `sufficient` to true, propose the mode, and return no \
-lookups. An item with no discoverable brand and a thorough examination behind it is \
-a `described_object`, and that is a successful outcome, not a failure to identify. \
-Spending lookups to confirm an absence is waste.
-- A known brand with no discoverable model is `branded_generic`. If the brand is \
-already established from a label, searching for a model number that the item does \
-not carry will not find one.
-- Do not propose a search you have already been told was performed.
-- Remember what a lookup can and cannot do. It can confirm which of two transcribed \
-codes is the product number; it cannot tell you the size of the garment in front of \
-the operator.
-
-Call the plan_research tool exactly once."""
-
-
-def planning_stage(
-    observations: str,
-    identifiers: str,
-    unresolved: str,
-    prior_lookups: str,
-    current_mode: str,
-    effort: str,
-    max_output_tokens: int = 2000,
-) -> StageRequest:
-    """Build the research planning request. No images: this reasons over the record."""
-    from resell.reasoning.tools import PLAN_TOOL_NAME, PLAN_TOOL_SCHEMA
-
-    instruction = (
-        f"Current identification mode: {current_mode}\n"
-        f"Identification effort allowed: {effort}\n\n"
-        f"Recorded observations:\n\n{observations}\n\n"
-        f"Identifiers read from the item:\n\n{identifiers or '(none)'}\n\n"
-        f"Aspects still unresolved:\n\n{unresolved or '(none)'}\n\n"
-        f"Lookups already performed for this item:\n\n{prior_lookups or '(none)'}\n\n"
-        "Decide whether external research would improve this identification, and "
-        "what specifically to look up."
-    )
-    return StageRequest(
-        system_prompt=PLAN_SYSTEM_PROMPT,
-        images=(),
-        instruction=instruction,
-        tool=ToolSpec(
-            name=PLAN_TOOL_NAME,
-            description=PLAN_TOOL_SCHEMA["description"],
-            json_schema=PLAN_TOOL_SCHEMA["input_schema"],
-        ),
-        max_tokens=max_output_tokens,
-    )
-
-
-MATCH_SYSTEM_PROMPT = """You are judging whether retrieved candidate products are the \
-second-hand item described by a set of observations. You are not looking at the item \
-or at the pages; you are comparing two records.
-
-Rules:
-
-- Concluding that nothing matches is a correct answer. A research loop that always \
-selects a product will always find one, and what it finds will increasingly be \
-whatever it was hoping for. If none of these candidates is the item, say so.
-- Record the non-matches too, with what ruled them out. "Candidate is a three-button \
-jacket; observation 29 shows a two-button front" is worth keeping: it stops the same \
-candidate being reconsidered, and a specific conflict is more informative than \
-silence.
-- Every claim cites both sides. Which observation of the physical object corresponds \
-to which fact about the candidate. A claim citing only the candidate is a description \
-of a web page.
-- Choose the strength honestly. `identifier_verified` needs an identifier that passes \
-its own check digit. `identifier_asserted` is a code that matches but cannot be \
-checked -- garment style codes, model numbers. `attribute_convergence` is several \
-independent attributes agreeing with no identifier. `similarity` is resemblance, and \
-donates nothing.
-- Resemblance is not identity. A page showing a very similar navy two-button jacket \
-from the same brand is `similarity` unless something ties it specifically to this \
-object. Mass-produced goods have many near-twins, and the differences that matter -- \
-year, variant, colourway -- are often invisible in a photograph.
-- Do not infer that a candidate matches because it would be convenient. The item is \
-allowed to be unidentifiable.
-
-Call the judge_candidates tool exactly once."""
-
-
-def matching_stage(
-    observations: str, candidates: str, max_output_tokens: int = 3000
-) -> StageRequest:
-    """Build the candidate matching request."""
-    from resell.reasoning.tools import MATCH_TOOL_NAME, MATCH_TOOL_SCHEMA
-
-    instruction = (
-        f"Observations of the physical item:\n\n{observations}\n\n"
-        f"Retrieved candidate products:\n\n{candidates}\n\n"
-        "Judge each candidate. Recording that none of them is this item is a valid "
-        "and useful conclusion."
-    )
-    return StageRequest(
-        system_prompt=MATCH_SYSTEM_PROMPT,
-        images=(),
-        instruction=instruction,
-        tool=ToolSpec(
-            name=MATCH_TOOL_NAME,
-            description=MATCH_TOOL_SCHEMA["description"],
-            json_schema=MATCH_TOOL_SCHEMA["input_schema"],
-        ),
-        max_tokens=max_output_tokens,
-    )
 
 
 def render_donated_facts(conn, citable: dict[int, str]) -> str:
@@ -577,14 +486,34 @@ def drafting_stage(
     aspects: str,
     condition: str,
     max_output_tokens: int = 2000,
+    refused_terms: tuple[str, ...] = (),
 ) -> StageRequest:
-    """Build the listing drafting request. No images: it writes from the record."""
+    """Build the listing drafting request. No images: it writes from the record.
+
+    `refused_terms` are words an earlier attempt at *this item* used and the
+    reviewer refused, carried here so a retry is a different question rather than
+    the same one asked again. They arrive as words because that is how the
+    reviewer holds them -- keys of `CONDITIONAL_TERMS` and `PROHIBITED_TERMS` --
+    and never as the sentence that complained about them.
+    """
     from resell.reasoning.tools import DRAFT_TOOL_NAME, DRAFT_TOOL_SCHEMA
 
+    already_refused = ""
+    if refused_terms:
+        already_refused = (
+            "An earlier attempt at this listing used these words and the review "
+            "refused it for each of them: "
+            + ", ".join(repr(t) for t in refused_terms)
+            + ". The record has not changed since, so they cannot be supported "
+            "now either. Do not use them, and do not reach for a synonym that "
+            "makes the same claim -- describe what was actually observed "
+            "instead.\n\n"
+        )
     instruction = (
         f"Resolved aspects:\n\n{aspects or '(none)'}\n\n"
         f"Item condition: {condition or '(not set)'}\n\n"
         f"Recorded observations:\n\n{observations}\n\n"
+        f"{already_refused}"
         "Write the listing."
     )
     return StageRequest(
@@ -755,97 +684,7 @@ def repair_stage(
     )
 
 
-EXTRACT_SYSTEM_PROMPT = """You are reading one web page and listing what it says about \
-the product it describes. You are not identifying anything and not judging anything: \
-another stage decides whether this product is the item on the table, and it needs a \
-clean record of what this page claims.
-
-Rules:
-
-- Every fact quotes the page. Put the page's own words in `excerpt`, verbatim. A \
-paraphrase cannot be checked, and a quotation that is not in the page is discarded \
-along with its fact.
-- Facts about the product only. Site navigation, cookie notices, delivery policy, \
-related products and customer reviews are not facts about this product. A page that \
-describes no product yields an empty list, which is a correct answer.
-- Separate identity from retail. Identity is what the thing is: model number, \
-colourway, materials, dimensions, generation, what is in the box. Retail is what \
-someone charges for it: price, discount, shipping cost, stock. Prices are always \
-retail even when the page presents them as a specification.
-- One claim per fact. "Navy, wool blend, made in Egypt" is three facts with three \
-excerpts, not one.
-- Do not resolve contradictions and do not fill gaps. If the page gives two model \
-numbers, list both and quote both. If it never states the material, say nothing about \
-material; inventing a plausible value is the failure this stage exists to avoid.
-- Do not describe the object the operator is holding. You have not seen it. \
-Everything here is a claim about a product on a page.
-
-Call the extract_candidate_facts tool exactly once."""
-
-
 MAX_PAGE_CHARS = 24_000
-
-
-def page_body_for_extraction(page_text: str, max_page_chars: int = MAX_PAGE_CHARS) -> str:
-    """The page text the extractor will actually be shown.
-
-    Exported so the caller can validate excerpts against exactly this string. The
-    alternative -- checking a quotation against the whole assembled prompt -- would
-    accept text lifted from the URL, the query or the motivation, and those are our
-    words rather than the page's. The excerpt check is the only thing standing
-    behind an automated extraction, so it must compare against the page and nothing
-    else.
-    """
-    return page_text[:max_page_chars]
-
-
-def extraction_stage(
-    page_text: str,
-    url: str,
-    query: str,
-    motivation: str,
-    max_output_tokens: int = 2000,
-    max_page_chars: int = MAX_PAGE_CHARS,
-) -> StageRequest:
-    """Build the fact-extraction request for one fetched page.
-
-    The narrowest stage in the system, and the one intended to move to a local model
-    first: no images, a small tool, and a job that is closer to parsing than to
-    reasoning. It goes through the same `ModelAdapter` protocol as every other
-    stage, so that move is a provider argument rather than a new interface.
-
-    The page is truncated, and the truncation is stated in the prompt. A silent cut
-    would make a fact absent from a long page indistinguishable from a fact the page
-    never carried -- and the parser rejects excerpts it cannot find, so a quotation
-    from beyond the cut has to fail visibly rather than look fabricated.
-    """
-    from resell.reasoning.tools import EXTRACT_TOOL_NAME, EXTRACT_TOOL_SCHEMA
-
-    body = page_body_for_extraction(page_text, max_page_chars)
-    truncated = len(page_text) > max_page_chars
-    instruction = (
-        f"Page URL: {url}\n"
-        f"Retrieved for the query: {query}\n"
-        f"Which was intended to settle: {motivation}\n\n"
-        f"Page text{' (truncated)' if truncated else ''}:\n\n{body}\n\n"
-    )
-    if truncated:
-        instruction += (
-            f"The text above is the first {max_page_chars} characters of "
-            f"{len(page_text)}. Quote only from what you were given.\n\n"
-        )
-    instruction += "List what this page states about the product it describes."
-    return StageRequest(
-        system_prompt=EXTRACT_SYSTEM_PROMPT,
-        images=(),
-        instruction=instruction,
-        tool=ToolSpec(
-            name=EXTRACT_TOOL_NAME,
-            description=EXTRACT_TOOL_SCHEMA["description"],
-            json_schema=EXTRACT_TOOL_SCHEMA["input_schema"],
-        ),
-        max_tokens=max_output_tokens,
-    )
 
 
 # --- comp research -----------------------------------------------------------

@@ -19,7 +19,13 @@ from pathlib import Path
 from resell.db import now_iso
 from resell.derivatives import for_model
 from resell.reasoning.adapters import AdapterError, ModelAdapter, get_adapter
-from resell.reasoning.ledger import BILLABLE_STATUSES, CallStatus, begin_call, finalize_call
+from resell.reasoning.ledger import (
+    BILLABLE_STATUSES,
+    CallStatus,
+    begin_call,
+    completion_status,
+    finalize_call,
+)
 from resell.reasoning.budget import (
     CostEstimate,
     ModelRates,
@@ -214,9 +220,10 @@ def observe_and_record(
     cost = rates.cost_micros(result.usage.input_tokens, result.usage.output_tokens)
     try:
         proposal = parse_observe_tool_input(result.tool_input)
-        status = CallStatus.PARSE_FAILED if (
-            not proposal.observations and not proposal.identifiers and proposal.malformed
-        ) else CallStatus.COMPLETED
+        status = completion_status(
+            bool(proposal.observations or proposal.identifiers)
+            or not proposal.malformed
+        )
         error = "; ".join(proposal.malformed)[:2000] if proposal.malformed else None
     except Exception as exc:  # noqa: BLE001 -- parsing must never lose a paid call
         finalize_call(
@@ -235,9 +242,40 @@ def observe_and_record(
         latency_ms=result.latency_ms, response=result.raw_response,
         raw_usage=result.usage.raw, error=error,
     )
+    record_negative_finding(conn, sku, proposal)
     return VisionResult(
         proposal=proposal, request=request, result=result, estimate=estimate, rates=rates
     ), call_id
+
+
+def record_negative_finding(conn: sqlite3.Connection, sku: str, proposal) -> bool:
+    """Persist how hard the observation stage looked for an identity.
+
+    Here rather than in a caller, because it was in a caller and only one of them
+    had it. `cli_item` stored the finding; the orchestrator -- the path every
+    phone-processed item takes -- parsed it, validated it and dropped it. The cost
+    was invisible and total: `branded_generic` and `described_object` both *require*
+    a cited negative finding, so for every item created through the web UI the two
+    commonest honest outcomes were unreachable, and each one fell back to
+    `unresolved`.
+
+    The finding is a real one. MP-000056's names four surfaces across three photos
+    and explains what the embossed text on the staple channel was. Nothing was
+    missing except the write.
+    """
+    import json as _json
+
+    from resell.db import kv_set
+
+    finding = getattr(proposal, "negative_finding", None)
+    if not finding:
+        return False
+    kv_set(conn, f"identity_search:{sku}", _json.dumps({
+        "surfaces_examined": list(finding.surfaces_examined),
+        "photos_reviewed": finding.photos_reviewed,
+        "note": finding.note,
+    }))
+    return True
 
 
 def record_trace(

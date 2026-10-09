@@ -33,6 +33,15 @@ class Basis(StrEnum):
 # than silently ranked.
 ADJUDICATING_BASES = frozenset({Basis.OPERATOR})
 
+# The one basis that is a conclusion rather than a look. Everything else here --
+# reading text, seeing a colour, measuring an edge -- is the object being
+# observed; `inference` is reasoning that goes beyond it, which is why the
+# observation contract insists it be labelled rather than passed off as seen.
+#
+# That labelling is what lets a disagreement between an observation and an
+# inference be settled without ranking two observations against each other.
+REASONED_BASES = frozenset({Basis.INFERENCE})
+
 
 class MeasurementMethod(StrEnum):
     """How a dimension was obtained. `estimated_from_photo` must look weaker."""

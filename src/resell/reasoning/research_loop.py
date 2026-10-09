@@ -1,64 +1,28 @@
-"""The identification research loop.
+"""What the identification claims, and whether the record earns it.
 
-One round: plan, allocate budget, retrieve, judge, select. Two model calls at the
-ends and deterministic machinery in between.
+This module used to hold a three-stage research loop -- plan, retrieve, judge --
+with two model calls at the ends. That loop is gone; [identity.py](identity.py)
+decides identity deterministically now, and the history behind that change is
+written up there. What remains here is the half that always worked: the gate that
+checks a declared mode against stored facts, and the derivation of whether anyone
+ever resolved the identifiers to a real product.
 
-The rule this module exists to enforce: **match confidence is not donation
-authority.** A model can produce a fluent, confident rationale for any pairing;
-that is the cheapest thing it makes. What a candidate is permitted to contribute is
-computed from three things it does not control -- whether the identifier carries a
-check digit, where the document came from, and whether both sides of the claim cite
-real evidence. The rationale is recorded for a human to read and feeds nothing.
+The rule this module exists to enforce is unchanged, and outlived the loop:
+**confidence is not authority.** What an identification is permitted to claim is
+computed from things nothing in the reasoning plane controls -- whether a brand was
+read off the object, whether a product-denoting code was, whether an external
+source confirmed it, and where that source came from.
 """
 
 from __future__ import annotations
 
-import sqlite3
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 from resell.db import log_event
-from resell.reasoning.adapters import AdapterError, ModelAdapter, get_adapter
-from resell.reasoning.adapters.research import (
-    ResearchAdapter,
-    ResearchError,
-    ResearchQuery,
-    get_research_adapter,
-)
-from resell.reasoning.budget import (
-    LookupBudget,
-    LookupRates,
-    LookupSpend,
-    StageBudget,
-    StageSpend,
-    check,
-    check_lookup_plan,
-    estimate_cost,
-)
-from resell.reasoning.ledger import CallStatus, begin_call, finalize_call
-from resell.reasoning.research import (
-    MatchStrength,
-    ResearchState,
-    Selection,
-    SourceAuthority,
-    donation_scope,
-    select_candidate,
-    should_stop,
-)
-from resell.reasoning.stages import (
-    matching_stage,
-    planning_stage,
-    render_observations,
-)
-from resell.reasoning.tools import (
-    ResearchPlan,
-    parse_match_tool_input,
-    parse_plan_tool_input,
-)
 
 
 class ResearchLoopError(RuntimeError):
-    pass
+    """Raised when an identification round cannot proceed."""
 
 
 @dataclass
@@ -69,429 +33,30 @@ class ModeDecision:
     reason: str
 
 
-@dataclass
-class RoundOutcome:
-    plan: ResearchPlan | None = None
-    mode: ModeDecision | None = None
-    performed: list[str] = field(default_factory=list)
-    deferred: list[str] = field(default_factory=list)
-    deferral_reason: str = ""
-    candidates_found: int = 0
-    selection: Selection | None = None
-    stopped: str | None = None
-    stop_reason: str = ""
-    notes: list[str] = field(default_factory=list)
-
-
-# --- helpers -----------------------------------------------------------------
-
-
-def _run_stage(conn, sku, adapter: ModelAdapter, request, *, purpose: str,
-               budget: StageBudget, spent: StageSpend):
-    """A ledgered, budgeted model call. Same shape as observation and mapping."""
-    rates = adapter.rates()
-    estimate = estimate_cost(adapter.estimate_input_tokens(request), budget, rates)
-    check(budget, spent, estimate)
-
-    call_id = begin_call(
-        conn, sku, purpose=purpose, provider=adapter.provider, model=adapter.model,
-        estimated_cost_micros=estimate.worst_case_micros, rate_basis=str(rates.basis),
-        request_key=request.replay_key(),
-    )
-    try:
-        result = adapter.run(request)
-    except AdapterError as exc:
-        finalize_call(conn, call_id, status=CallStatus.PROVIDER_ERROR, error=str(exc)[:2000])
-        raise ResearchLoopError(str(exc)) from exc
-
-    finalize_call(
-        conn, call_id, status=CallStatus.COMPLETED,
-        input_tokens=result.usage.input_tokens, output_tokens=result.usage.output_tokens,
-        cost_micros=rates.cost_micros(result.usage.input_tokens, result.usage.output_tokens),
-        latency_ms=result.latency_ms, response=result.raw_response,
-        raw_usage=result.usage.raw,
-    )
-    return result, call_id
-
-
-def _render_identifiers(rows) -> str:
-    import json as _json
-
-    lines = []
-    for row in rows:
-        if row["kind"] != "identifier_observation":
-            continue
-        payload = _json.loads(row["payload"])
-        lines.append(
-            f"[{row['id']}] {payload.get('scheme')}: {payload.get('normalized')} "
-            f"({payload.get('check_explanation', '')[:60]})"
-        )
-    return "\n".join(lines)
-
-
-def _render_candidates(conn, sku) -> str:
-    import json as _json
-
-    from resell.gateway import candidate_evidence
-
-    grouped: dict[str, list] = {}
-    for row in candidate_evidence(conn, sku):
-        grouped.setdefault(row["candidate_ref"], []).append(row)
-
-    lines = []
-    for ref, rows in grouped.items():
-        first = rows[0]
-        provenance = (
-            " (operator-transcribed; the system did not fetch this page)"
-            if first["retrieval_method"] == "operator_transcribed" else ""
-        )
-        lines.append(
-            f"Candidate {ref} — {first['source_url']} "
-            f"[{first['source_authority']}]{provenance}"
-        )
-        for row in rows:
-            payload = _json.loads(row["payload"])
-            domain = row["fact_domain"] or "identity"
-            lines.append(f"  [{row['id']}] ({domain}) {payload.get('claim', '')}")
-    return "\n".join(lines)
-
-
-def _prior_lookups(conn, sku, scope: str = "identity") -> list[str]:
-    return [
-        row["query"] for row in conn.execute(
-            "SELECT query FROM research_lookup WHERE sku = ? AND scope = ?", (sku, scope)
-        )
-    ]
-
-
-def _authority_by_candidate(conn, sku) -> dict[str, SourceAuthority]:
-    """Authority is a property of where the document came from, read from storage."""
-    mapping = {}
-    for row in conn.execute(
-        "SELECT DISTINCT candidate_ref, source_authority FROM evidence "
-        "WHERE sku = ? AND subject = 'candidate_product'", (sku,)
-    ):
-        try:
-            mapping[row["candidate_ref"]] = SourceAuthority(row["source_authority"])
-        except (ValueError, TypeError):
-            mapping[row["candidate_ref"]] = SourceAuthority.UNKNOWN
-    return mapping
-
-
-# --- the round ---------------------------------------------------------------
-
-
-def run_round(
-    conn: sqlite3.Connection,
-    gateway,
-    sku: str,
-    *,
-    unresolved: str = "",
-    model_adapter: ModelAdapter | None = None,
-    research_adapter: ResearchAdapter | None = None,
-    provider: str | None = None,
-    research_provider: str | None = None,
-    stage_budget: StageBudget | None = None,
-    lookup_budget: LookupBudget | None = None,
-    lookup_rates: LookupRates | None = None,
-    dry_run: bool = False,
-) -> RoundOutcome:
-    """One planning-and-matching round. Nothing is fetched before a validated plan."""
-    from resell.gateway import candidate_evidence, observations_in_scope
-
-    outcome = RoundOutcome()
-    observations = observations_in_scope(conn, sku)
-    if not observations:
-        raise ResearchLoopError(f"{sku} has no observations; run: resell item observe {sku}")
-
-    item = conn.execute(
-        "SELECT identification_effort FROM item WHERE sku = ?", (sku,)
-    ).fetchone()
-    identification = conn.execute(
-        "SELECT mode FROM identification WHERE sku = ? ORDER BY version DESC LIMIT 1", (sku,)
-    ).fetchone()
-
-    model_adapter = model_adapter or get_adapter(provider)
-    research_adapter = research_adapter or get_research_adapter(research_provider)
-    stage_budget = stage_budget or StageBudget.from_env("research")
-    lookup_budget = lookup_budget or LookupBudget.from_env("identity")
-    lookup_rates = lookup_rates or LookupRates.from_env(research_adapter.provider)
-
-    # --- stop before planning, where the answer is already known -------------
-    spend_row = conn.execute(
-        "SELECT COUNT(*) n, COALESCE(SUM(result_count), 0) c FROM research_lookup "
-        "WHERE sku = ? AND scope = 'identity'", (sku,)
-    ).fetchone()
-    best = conn.execute(
-        "SELECT strength FROM product_match WHERE sku = ? AND is_match = 1", (sku,)
-    ).fetchall()
-    best_strength = None
-    if best:
-        best_strength = max(
-            (MatchStrength(row["strength"]) for row in best),
-            key=lambda s: {"identifier_verified": 4, "identifier_asserted": 3,
-                           "attribute_convergence": 2, "similarity": 1}[str(s)],
-        )
-    has_identifiers = any(row["kind"] == "identifier_observation" for row in observations)
-
-    stop, reason, why = should_stop(
-        ResearchState(
-            lookups_performed=spend_row["n"],
-            new_candidates_last_round=1,
-            best_strength=best_strength,
-            has_identifiers=has_identifiers,
-            negative_finding_sufficient=False,
-            budget_calls_remaining=lookup_budget.max_lookups - spend_row["n"],
-        ),
-        max_lookups=lookup_budget.max_lookups,
-    )
-    if stop:
-        outcome.stopped, outcome.stop_reason = str(reason), why
-        return outcome
-
-    # --- R1: plan -------------------------------------------------------------
-    request = planning_stage(
-        observations=render_observations(observations),
-        identifiers=_render_identifiers(observations),
-        unresolved=unresolved,
-        prior_lookups="\n".join(_prior_lookups(conn, sku)),
-        current_mode=(identification["mode"] if identification else "unresolved"),
-        effort=item["identification_effort"],
-        max_output_tokens=stage_budget.max_output_tokens,
-    )
-    result, _ = _run_stage(
-        conn, sku, model_adapter, request, purpose="research_plan",
-        budget=stage_budget,
-        spent=_stage_spend(conn, sku, "research_plan"),
-    )
-    plan = parse_plan_tool_input(
-        result.tool_input,
-        valid_evidence_ids={row["id"] for row in observations},
-        already_searched=set(_prior_lookups(conn, sku)),
-    )
-    outcome.plan = plan
-    # Notes from two different model calls used to arrive unlabelled, so an
-    # "assessment missing" gave no clue which stage produced it.
-    outcome.notes.extend(f"plan: {note}" for note in plan.malformed)
-
-    # A response nothing could be read out of is not a decision about this item.
-    # Recording it as one wrote "research not pursued" into evidence, which is the
-    # audit trail for a deliberate choice not to search. Nothing reads those rows
-    # back today, so the immediate cost is a log that misdescribes what happened --
-    # but it is append-only, and `identity_resolution` derives the same fact from
-    # `research_lookup` instead, so the two would simply disagree with each other
-    # for the life of the item.
-    #
-    # Nothing is written, no mode is declared, and the call is already in the ledger
-    # with its reasons, so re-running is the whole remedy.
-    if not plan.usable:
-        outcome.stopped = "plan_unusable"
-        outcome.stop_reason = (
-            "the planner's arguments could not be read, so there is no assessment "
-            "and no lookups. Nothing was recorded and no lookup was spent; re-run "
-            "to try again."
-        )
-        return outcome
-
-    # Proposing no lookups and having every lookup refused are different facts,
-    # and collapsing them wrote "the evidence is already sufficient" onto an item
-    # whose planner had asked for two searches. Nothing is recorded here: no
-    # negative finding, no declared mode, no lookup spent -- the call is in the
-    # ledger with its reasons and re-running is the whole remedy.
-    if plan.proposed_but_unusable and not dry_run:
-        # One repair, with the exact complaint fed back. The planner asked for
-        # well-motivated searches and omitted a field the schema marks required;
-        # naming the omission is far more likely to fix it than re-asking the same
-        # question, and it is the same shape as the drafting repair.
-        outcome.notes.append(
-            f"plan: {plan.dropped_lookups} lookup(s) refused; asking again with the "
-            f"reason"
-        )
-        repair = _with_complaint(request, plan)
-        try:
-            retry_result, _ = _run_stage(
-                conn, sku, model_adapter, repair, purpose="research_plan",
-                budget=stage_budget, spent=_stage_spend(conn, sku, "research_plan"),
-            )
-        except Exception as exc:  # noqa: BLE001 - a failed retry is not a crash
-            outcome.notes.append(f"plan: the retry failed ({exc})")
-        else:
-            retried = parse_plan_tool_input(
-                retry_result.tool_input,
-                valid_evidence_ids={row["id"] for row in observations},
-                already_searched=set(_prior_lookups(conn, sku)),
-            )
-            outcome.notes.extend(f"plan retry: {n}" for n in retried.malformed)
-            if retried.lookups:
-                plan = retried
-                outcome.plan = plan
-
-    if plan.proposed_but_unusable:
-        outcome.stopped = "plan_rejected"
-        outcome.stop_reason = (
-            f"the planner proposed {plan.dropped_lookups} lookup(s) and every one "
-            f"was refused: " + "; ".join(
-                n for n in plan.malformed if n.startswith("lookup ")
-            )[:260]
-        )
-        return outcome
-
-    if plan.sufficient or not plan.lookups:
-        outcome.stopped = "sufficient"
-        outcome.stop_reason = plan.rationale or "the planner proposed no lookups"
-        if not dry_run:
-            gateway.record_research_negative(
-                sku, summary=f"research not pursued: {outcome.stop_reason[:200]}",
-                detail={"proposed_mode": plan.proposed_mode, "lookups_planned": 0},
-            )
-            outcome.mode = declare_mode(
-                conn, gateway, sku, plan.proposed_mode, plan.rationale
-            )
-        return outcome
-
-    # --- budget allocation, with the deferrals recorded ----------------------
-    spent = LookupSpend(lookups=spend_row["n"], cost_micros=0)
-    allocation = check_lookup_plan(lookup_budget, spent, len(plan.lookups), lookup_rates)
-    outcome.deferral_reason = allocation.reason
-    outcome.deferred = [plan.lookups[i].query for i in allocation.deferred]
-
-    if allocation.trimmed and not dry_run:
-        # Trimming silently would make the plan a fiction. What the agent judged
-        # worth doing, and why it did not happen, both belong in the record.
-        log_event(
-            conn, "research.lookups_deferred",
-            {"reason": allocation.reason,
-             "deferred": [
-                 {"query": plan.lookups[i].query,
-                  "motivation": plan.lookups[i].motivation,
-                  "cites": list(plan.lookups[i].evidence_ids)}
-                 for i in allocation.deferred
-             ]},
-            item_id=sku,
-        )
-
-    if dry_run:
-        outcome.performed = [l.query for l in plan.lookups[: allocation.allowed]]
-        return outcome
-
-    # --- R2: retrieve ---------------------------------------------------------
-    for planned in plan.lookups[: allocation.allowed]:
-        try:
-            documents = research_adapter.search(
-                ResearchQuery(planned.query, planned.source_kind, planned.motivation)
-            )
-        except ResearchError as exc:
-            outcome.notes.append(f"lookup failed ({planned.query}): {exc}")
-            continue
-
-        recorded: list[int] = []
-        for document in documents:
-            recorded.extend(
-                gateway.record_candidate_facts(
-                    sku, candidate_ref=document.candidate_ref,
-                    source_url=document.url, authority=str(document.authority),
-                    facts=[
-                        (fact.claim, str(fact.domain), fact.excerpt)
-                        for fact in document.facts
-                    ],
-                    restriction=document.restriction, title=document.title,
-                    retrieval_method=str(document.retrieval_method),
-                )
-            )
-        gateway.record_lookup(
-            sku, provider=research_adapter.provider, query=planned.query,
-            motivation=planned.motivation, evidence_ids=list(planned.evidence_ids),
-            result_count=len(documents),
-        )
-        outcome.performed.append(planned.query)
-        outcome.candidates_found += len(documents)
-
-    candidates = candidate_evidence(conn, sku)
-    if not candidates:
-        if outcome.performed:
-            outcome.stopped = "searched_not_found"
-            outcome.stop_reason = (
-                f"{len(outcome.performed)} lookup(s) returned no candidates"
-            )
-            gateway.record_research_negative(
-                sku, summary=outcome.stop_reason,
-                detail={"queries": outcome.performed},
-            )
-        else:
-            # Every lookup failed before it ran -- no backend, or the network was
-            # down. "Searched and found nothing" is a fact about the object;
-            # "could not search" is a fact about us, and recording the first when
-            # the second happened would put a claim in evidence nobody made.
-            outcome.stopped = "not_retrieved"
-            outcome.stop_reason = (
-                f"{len(plan.lookups)} lookup(s) were planned and none could be "
-                f"performed; nothing was recorded"
-            )
-        return outcome
-
-    # --- R3: judge ------------------------------------------------------------
-    match_request = matching_stage(
-        observations=render_observations(observations),
-        candidates=_render_candidates(conn, sku),
-        max_output_tokens=stage_budget.max_output_tokens,
-    )
-    match_result, _ = _run_stage(
-        conn, sku, model_adapter, match_request, purpose="research_match",
-        budget=stage_budget, spent=_stage_spend(conn, sku, "research_match"),
-    )
-    proposal = parse_match_tool_input(
-        match_result.tool_input,
-        valid_item_evidence={row["id"] for row in observations},
-        valid_candidate_evidence={row["id"] for row in candidates},
-    )
-    outcome.notes.extend(f"match: {note}" for note in proposal.malformed)
-
-    if not proposal.claims:
-        # Retrieval succeeded and judging produced nothing usable. Without saying
-        # what came back, this is indistinguishable from finding no candidates --
-        # and the lookups have already been paid for.
-        shape = (
-            sorted(match_result.tool_input)
-            if isinstance(match_result.tool_input, dict)
-            else type(match_result.tool_input).__name__
-        )
-        outcome.notes.append(
-            f"match: no usable claims from {len(candidates)} candidate fact(s) across "
-            f"{len({row['candidate_ref'] for row in candidates})} document(s); "
-            f"tool input keys: {shape}"
-        )
-
-    # --- selection and donation, both deterministic ---------------------------
-    authorities = _authority_by_candidate(conn, sku)
-    selection = select_candidate(proposal.claims, authorities)
-    outcome.selection = selection
-
-    for claim in proposal.claims:
-        authority = authorities.get(claim.candidate_ref, SourceAuthority.UNKNOWN)
-        # Donation is computed from strength and authority. The claim's rationale --
-        # however persuasive -- is stored and consulted by nobody.
-        scope, _ = donation_scope(claim.strength, authority) if claim.is_match else (
-            __import__("resell.reasoning.research", fromlist=["DonationScope"]).DonationScope.NONE,
-            "",
-        )
-        gateway.record_product_match(
-            sku, claim, authority=str(authority), donation_scope=str(scope),
-        )
-
-    if not selection.selected:
-        gateway.record_research_negative(
-            sku, summary=selection.reason,
-            detail={"considered": selection.considered, "ruled_out": selection.ruled_out},
-        )
-    if plan.proposed_mode:
-        outcome.mode = declare_mode(
-            conn, gateway, sku, plan.proposed_mode, plan.rationale
-        )
-    return outcome
-
-
 def identity_resolution(conn, sku: str):
-    """Whether the identifiers were ever resolved, computed from the record."""
+    """Whether the identifiers were ever resolved to a real product.
+
+    Computed from the record, never stored as an opinion.
+
+    One way to be RESOLVED: a match of identifier strength, marked `is_match`, from
+    a source good enough that `donation_scope` lets it contribute. That is the
+    original rule and it is deliberately the only one.
+
+    A corroboration branch briefly lived here -- two independent domains naming the
+    same identifier -- on the reasoning that *which product this is* and *whose
+    description may attach to it* are different questions. The reasoning still
+    looks right and the rule was not: replayed against all 54 historical items it
+    resolved 13 and got 6 of them wrong, including a suit jacket resolved as a
+    sewage pump. See `EXACT_RESOLUTION_SHIPPED` in
+    [identity.py](identity.py) for the full account.
+
+    So this stays narrow, and `is_match` is the seam: nothing sets it while exact
+    resolution is held closed, which makes RESOLVED unreachable by construction
+    rather than by a flag somebody could flip. The comparability ceiling therefore
+    holds at `same_family_variant`, exactly where the LLM research system left it
+    after resolving 0 of 57 items -- so waiting costs nothing that was ever
+    available.
+    """
     from resell.reasoning.schema import IdentityResolution
 
     qualifying = conn.execute(
@@ -514,15 +79,39 @@ def identity_resolution(conn, sku: str):
 
 
 def mode_evidence(conn, sku: str) -> dict:
-    """Assemble what the mode gate needs, from stored facts only."""
-    from resell.reasoning.schema import Basis, EvidenceRef, IdentificationEffort
+    """Assemble what the mode gate needs, from structured facts only.
 
-    def cited(pattern: str) -> tuple:
+    This used to run `LIKE '%brand%'` and `LIKE '%line%'` over observation prose,
+    which meant a mode depended on whether the vision model happened to use a
+    particular English word. It was wrong in both directions on real items:
+    MP-000057's brand *is* `Dell` and it scored zero brand support because no
+    observation contained the string "brand"; MP-000058's only "line" support was
+    the sentence *"the right eyebrow is a short straight horizontal black line"*.
+    MP-000056 cited its own `research not pursued` summary back to itself.
+
+    So both are read from the record instead. The brand is a field on the
+    identification, and the evidence for it is the observations that actually name
+    that brand -- a search for `Swingline`, not for the word "brand". A product
+    line is a product-denoting identifier, which `observe` already classifies by
+    scheme; a `makers_mark` is a brand and a `serial` denotes one unit, and neither
+    establishes a family.
+    """
+    from resell.reasoning.identity import observed_brand, strong_identifiers
+    from resell.reasoning.schema import (
+        Basis, EvidenceRef, IdentificationEffort, IdentityResolution,
+    )
+
+    def naming(value: str) -> tuple:
+        """Observations of this item that name a specific string."""
+        if not value.strip():
+            return ()
         return tuple(
             EvidenceRef(row["id"], Basis(row["basis"] or "inference"))
             for row in conn.execute(
                 "SELECT id, basis FROM evidence WHERE sku = ? AND subject = 'this_item' "
-                "AND lower(payload) LIKE ?", (sku, pattern),
+                "AND kind IN ('vision_observation', 'identifier_observation') "
+                "AND lower(payload) LIKE ?",
+                (sku, f"%{value.strip().casefold()}%"),
             )
         )
 
@@ -537,14 +126,28 @@ def mode_evidence(conn, sku: str) -> dict:
             note=str(stored.get("note", "")),
         )
 
-    # A product line, a manufacturer style code or an MPN all establish a family.
-    line = cited("%line%") + cited("%style code%") + cited("%model%") + tuple(
-        EvidenceRef(row["id"], Basis.TEXT_READ)
-        for row in conn.execute(
-            "SELECT id FROM evidence WHERE sku = ? AND kind = 'identifier_observation'",
-            (sku,),
-        )
-    )
+    identification = conn.execute(
+        "SELECT brand, model FROM identification WHERE sku = ? AND superseded_at IS NULL",
+        (sku,),
+    ).fetchone()
+    brand = ((identification["brand"] if identification else None) or "").strip()
+    model = ((identification["model"] if identification else None) or "").strip()
+    # The same fallback `tier_for` uses, for the same reason: this gate runs before
+    # `map_aspects` writes `identification.brand`, so at the moment it matters that
+    # column is empty. Supplying the brand to the tier and not to the gate is worse
+    # than supplying it to neither -- the tier proposed `branded_generic`, the gate
+    # could not cite a brand for it, and every item in the replay came out
+    # `unresolved`, which is the one mode that still asks the seller a question.
+    if not brand:
+        brand = (observed_brand(conn, sku) or "").strip()
+
+    # A product-denoting code establishes a family on its own; so does a model the
+    # identification carries, when an observation actually names it.
+    line = tuple(
+        EvidenceRef(identifier.evidence_id, Basis.TEXT_READ)
+        for identifier in strong_identifiers(conn, sku)
+    ) + naming(model)
+
     return {
         "effort": IdentificationEffort(
             conn.execute(
@@ -552,16 +155,14 @@ def mode_evidence(conn, sku: str) -> dict:
             ).fetchone()[0]
         ),
         "negative_finding": finding,
-        "brand_support": cited("%brand%"),
-        "line_support": line,
-        "qualifying_match": bool(
-            conn.execute(
-                "SELECT COUNT(*) FROM product_match WHERE sku = ? AND is_match = 1 "
-                "AND donation_scope IS NOT NULL AND donation_scope != 'none' "
-                "AND strength IN ('identifier_verified', 'identifier_asserted')",
-                (sku,),
-            ).fetchone()[0]
-        ),
+        "brand_support": naming(brand),
+        "line_support": tuple(dict.fromkeys(line)),
+        # The same question `identity_resolution` answers, asked once. It used to
+        # be a second copy of the donation-based half of that query, so once
+        # corroboration could resolve an identity the two disagreed: a live replay
+        # produced items reading `resolution=resolved, mode=unresolved`, which is
+        # not a position anything downstream knows how to read.
+        "qualifying_match": identity_resolution(conn, sku) is IdentityResolution.RESOLVED,
     }
 
 
@@ -572,10 +173,13 @@ def declare_mode(conn, gateway, sku: str, proposed: str, rationale: str) -> Mode
     passed -- silently accepting a lesser mode would make the declaration look
     considered when it was salvaged. The modes that ARE supported are named, so the
     refusal is actionable.
-    """
-    import json as _json
 
-    from resell.gateway import current_identification
+    Nothing proposes a mode from a model call any more. The tier does, and a tier
+    is computed from the same evidence this gate checks, so a refusal now means the
+    tiering and the gate genuinely disagree -- which is worth seeing, rather than
+    the routine event it was when a planner guessed `exact_product` 21 times in a
+    row and was refused 21 times.
+    """
     from resell.reasoning.gaps import mode_is_supported, supported_modes
     from resell.reasoning.schema import IdentificationMode
 
@@ -642,96 +246,3 @@ def db_kv_negative(conn, sku) -> dict | None:
         return _json.loads(raw)
     except ValueError:
         return None
-
-
-def rejudge(
-    conn: sqlite3.Connection,
-    gateway,
-    sku: str,
-    *,
-    model_adapter: ModelAdapter | None = None,
-    provider: str | None = None,
-    stage_budget: StageBudget | None = None,
-) -> RoundOutcome:
-    """Judge the candidates already retrieved, without spending a lookup.
-
-    Retrieval and judging fail independently. When the matcher returns nothing
-    usable the documents are still there and already paid for, and making the
-    operator re-run the searches to try again would charge twice for one mistake.
-    """
-    from resell.gateway import candidate_evidence, observations_in_scope
-
-    outcome = RoundOutcome()
-    observations = observations_in_scope(conn, sku)
-    candidates = candidate_evidence(conn, sku)
-    if not candidates:
-        outcome.stopped = "no_candidates"
-        outcome.stop_reason = "nothing has been retrieved for this item yet"
-        return outcome
-
-    model_adapter = model_adapter or get_adapter(provider)
-    stage_budget = stage_budget or StageBudget.from_env("research")
-
-    request = matching_stage(
-        observations=render_observations(observations),
-        candidates=_render_candidates(conn, sku),
-        max_output_tokens=stage_budget.max_output_tokens,
-    )
-    result, _ = _run_stage(
-        conn, sku, model_adapter, request, purpose="research_match",
-        budget=stage_budget, spent=_stage_spend(conn, sku, "research_match"),
-    )
-    proposal = parse_match_tool_input(
-        result.tool_input,
-        valid_item_evidence={row["id"] for row in observations},
-        valid_candidate_evidence={row["id"] for row in candidates},
-    )
-    outcome.notes.extend(f"match: {note}" for note in proposal.malformed)
-    outcome.candidates_found = len({row["candidate_ref"] for row in candidates})
-
-    authorities = _authority_by_candidate(conn, sku)
-    selection = select_candidate(proposal.claims, authorities)
-    outcome.selection = selection
-    for claim in proposal.claims:
-        authority = authorities.get(claim.candidate_ref, SourceAuthority.UNKNOWN)
-        from resell.reasoning.research import DonationScope
-
-        scope = (
-            donation_scope(claim.strength, authority)[0]
-            if claim.is_match else DonationScope.NONE
-        )
-        gateway.record_product_match(
-            sku, claim, authority=str(authority), donation_scope=str(scope)
-        )
-    if not selection.selected:
-        gateway.record_research_negative(
-            sku, summary=selection.reason,
-            detail={"considered": selection.considered, "ruled_out": selection.ruled_out},
-        )
-    return outcome
-
-
-def _stage_spend(conn, sku, purpose) -> StageSpend:
-    from resell.reasoning.vision import spend_so_far
-
-    return spend_so_far(conn, sku, purpose)
-
-
-def _with_complaint(request, plan):
-    """The same planning request, with what was wrong with the last one appended.
-
-    Appended rather than rebuilt so the retry is asking the same question under
-    the same rules, differing only in that it now knows why the first answer was
-    thrown away.
-    """
-    from dataclasses import replace
-
-    refused = "; ".join(n for n in plan.malformed if n.startswith("lookup "))[:600]
-    return replace(request, instruction=(
-        f"{request.instruction}\n\n"
-        f"A previous attempt was refused and none of its lookups could be used:\n"
-        f"{refused}\n\n"
-        f"Every lookup must carry `evidence_ids`: the ids of the observations "
-        f"above that motivate it. A lookup without them is discarded whatever its "
-        f"motivation says, so cite them explicitly."
-    ))

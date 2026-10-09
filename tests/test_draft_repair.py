@@ -442,3 +442,189 @@ def test_a_title_over_the_limit_is_measured_and_not_just_described():
     assert review.measures["title"].value == 96
     assert review.measures["title"].limit == 80
     assert review.measures["title"].excess == 16
+
+
+# --- a retried draft is told what the reviewer already refused -----------------
+#
+# MP-000063, a crocheted hacky sack, spent six model calls and 47.9 seconds --
+# 58% of the whole item's cost -- arguing about the word `handmade`. The stage
+# drafted, two repairs failed to shift it, the stage raised, `advance` retried,
+# and the retry started from nothing: it proposed `handmade` again and the
+# repairs fought it again. Three of the six calls re-litigated a decision that
+# had already been made.
+#
+# `handmade` is in `CONDITIONAL_TERMS`, mapped to `manufacture`. A crocheted item
+# with no manufacture evidence can never satisfy it, so the refusal is permanent
+# -- no evidence appears between two attempts a second apart -- and the only
+# thing that resolves it is not writing the word.
+
+
+def test_the_reviewer_names_the_word_and_not_only_the_complaint():
+    """The word is a dictionary key. Reading it back out of the sentence about it
+    would be parsing our own prose, which is the kind of thing that breaks
+    quietly."""
+    from resell.reasoning.listing import review_draft
+
+    draft = ListingDraft(
+        title="Crocheted Wool Footbag Hacky Sack Multicolor",
+        description="A handmade crocheted wool footbag.",
+        marketing_copy="Soft and hand-sized.",
+        claims=(DraftClaim(text="crocheted wool footbag", evidence_ids=(1,)),),
+    )
+    review = review_draft(
+        draft, supported_text="crocheted wool footbag multicolor",
+        valid_evidence_ids={1}, available_support=frozenset({"condition"}),
+    )
+    assert not review.ok
+    assert "handmade" in review.refused_terms
+    assert any("manufacture evidence" in p for p in review.problems)
+
+
+def test_a_supported_term_is_not_refused():
+    """The list must carry what was refused, not every conditional word seen."""
+    from resell.reasoning.listing import review_draft
+
+    draft = ListingDraft(
+        title="Crocheted Wool Footbag Hacky Sack Multicolor",
+        description="A handmade crocheted wool footbag.",
+        marketing_copy="Soft.",
+        claims=(DraftClaim(text="crocheted wool footbag", evidence_ids=(1,)),),
+    )
+    review = review_draft(
+        draft, supported_text="crocheted wool footbag multicolor",
+        valid_evidence_ids={1},
+        available_support=frozenset({"condition", "manufacture"}),
+    )
+    assert "handmade" not in review.refused_terms
+
+
+def test_the_refusal_is_recorded_as_words_beside_the_prose(tmp_path):
+    from resell.orchestrator import DRAFT_REFUSED, _record_refused_draft
+
+    conn, gateway, sku = fixture(tmp_path)
+    outcome = refused(problem="'handmade' requires manufacture evidence, and none is recorded")
+    outcome.review.refused_terms = ("handmade",)
+    _record_refused_draft(conn, sku, outcome)
+
+    payload = json.loads(conn.execute(
+        "SELECT payload FROM events WHERE item_id = ? AND kind = ?",
+        (sku, DRAFT_REFUSED)).fetchone()["payload"])
+    assert payload["refused_terms"] == ["handmade"]
+    assert any("manufacture evidence" in p for p in payload["problems"])
+
+
+def test_the_next_draft_is_given_the_refused_word(tmp_path):
+    """The channel, end to end: what the reviewer refused reaches the retry."""
+    from resell.orchestrator import _record_refused_draft, previously_refused_terms
+
+    conn, gateway, sku = fixture(tmp_path)
+    assert previously_refused_terms(conn, sku) == (), "nothing refused yet"
+
+    outcome = refused(problem="'handmade' requires manufacture evidence, and none is recorded")
+    outcome.review.refused_terms = ("handmade",)
+    _record_refused_draft(conn, sku, outcome)
+
+    assert previously_refused_terms(conn, sku) == ("handmade",)
+
+
+def test_refusals_accumulate_across_attempts_without_repeating(tmp_path):
+    from resell.orchestrator import _record_refused_draft, previously_refused_terms
+
+    conn, gateway, sku = fixture(tmp_path)
+    for terms in (("handmade",), ("handmade", "rare")):
+        outcome = refused()
+        outcome.review.refused_terms = terms
+        _record_refused_draft(conn, sku, outcome)
+
+    assert previously_refused_terms(conn, sku) == ("handmade", "rare")
+
+
+def test_the_retried_draft_call_actually_carries_it(tmp_path):
+    """The assertion that would have caught MP-000063: the second attempt's
+    request must contain the word, and say it cannot be used."""
+    from resell.reasoning.drafting import draft_listing
+
+    conn, gateway, sku = fixture(tmp_path)
+    adapter = FakeAdapter({
+        "title": TITLE,
+        "description": "A Bowflex SelectTech 552 adjustable dumbbell.",
+        "marketing_copy": "One dial.",
+        "claims": [{"text": "Bowflex SelectTech 552", "evidence_ids": [1]}],
+    })
+    draft_listing(
+        conn, sku, aspects={}, condition_id="USED_GOOD",
+        refused_terms=("handmade",), adapter=adapter,
+    )
+    instruction = adapter.requests[0].instruction
+    assert "'handmade'" in instruction
+    assert "review refused it" in instruction
+    assert "Do not use them" in instruction
+
+
+def test_a_first_draft_is_told_nothing(tmp_path):
+    """No refusal has happened, so there is nothing to carry. The reviewer's
+    verdict is evidence about a draft, and on the first attempt there is no draft
+    to have one -- precomputing the item's unsupportable vocabulary is a different
+    idea and is deliberately not this one."""
+    from resell.reasoning.drafting import draft_listing
+
+    conn, gateway, sku = fixture(tmp_path)
+    adapter = FakeAdapter({
+        "title": TITLE,
+        "description": "A Bowflex SelectTech 552 adjustable dumbbell.",
+        "marketing_copy": "One dial.",
+        "claims": [{"text": "Bowflex SelectTech 552", "evidence_ids": [1]}],
+    })
+    draft_listing(conn, sku, aspects={}, condition_id="USED_GOOD", adapter=adapter)
+    assert "earlier attempt" not in adapter.requests[0].instruction
+
+
+def test_the_handmade_loop_end_to_end(tmp_path):
+    """MP-000063's exact sequence, with the fix in place.
+
+    First draft says `handmade`; the reviewer refuses it and the word is recorded.
+    Second draft is handed that word, does not repeat it, and passes. Three calls
+    become two, and -- the part that matters -- the second attempt is a different
+    question rather than the same one asked again.
+    """
+    from resell.orchestrator import _record_refused_draft, previously_refused_terms
+    from resell.reasoning.drafting import draft_listing
+
+    conn, gateway, sku = fixture(tmp_path)
+
+    class Scripted(FakeAdapter):
+        """Says the unsupported word until it is told not to."""
+
+        def run(self, request):
+            told = "'handmade'" in request.instruction
+            self.payload = {
+                "title": TITLE,
+                "description": (
+                    "A Bowflex SelectTech 552 adjustable dumbbell."
+                    if told else
+                    "A handmade Bowflex SelectTech 552 adjustable dumbbell."
+                ),
+                "marketing_copy": "One dial.",
+                "claims": [{"text": "Bowflex SelectTech 552", "evidence_ids": [1]}],
+            }
+            return super().run(request)
+
+    adapter = Scripted(None)
+
+    first = draft_listing(conn, sku, aspects={}, condition_id="USED_GOOD",
+                          adapter=adapter)
+    assert not first.review.ok
+    assert "handmade" in first.review.refused_terms
+    assert "handmade" in first.draft.description
+
+    _record_refused_draft(conn, sku, first)
+    carried = previously_refused_terms(conn, sku)
+    assert carried == ("handmade",)
+
+    second = draft_listing(conn, sku, aspects={}, condition_id="USED_GOOD",
+                           refused_terms=carried, adapter=adapter)
+
+    assert "'handmade'" in adapter.requests[1].instruction, "the retry was told"
+    assert "handmade" not in second.draft.description, "and it did not repeat it"
+    assert second.review.ok, "so the reviewer passed it"
+    assert len(adapter.requests) == 2, "two calls, not six"

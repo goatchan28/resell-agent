@@ -1104,3 +1104,196 @@ def test_the_card_never_asks_for_links():
         )
         assert 'name="urls"' not in html
         assert "paste" not in html.lower()
+
+
+# --- setting a price by hand, when the market never turned up ------------------
+#
+# MP-000061 reached this screen with a correct identification and no comps, the
+# seller clicked "Set my own price", and Flask returned 500. The route computed
+# `build_strategies(rec, ...)` -- a name it never imported, from a variable it
+# never assigned, into a variable nothing read. Both NameErrors were on one line
+# added by the V1 pricing deletion, so the path had been dead since that commit
+# and no test had ever POSTed to it. These do.
+
+
+def priced_by_hand_fixture(tmp_path):
+    """An item that has reached pricing with nothing to price from."""
+    app, conn, gateway, sku = seeded(tmp_path, identified=True)
+    gateway.begin_pricing(sku)
+    conn.commit()
+    return app, conn, gateway, sku
+
+
+def test_setting_a_price_by_hand_records_a_proposal_and_approves_it(tmp_path):
+    app, conn, gateway, sku = priced_by_hand_fixture(tmp_path)
+
+    response = app.test_client().post(
+        f"/items/{sku}/set-price", data={"price": "45.00", "why": "it is what it is"},
+    )
+    assert response.status_code in (302, 303), response.data[:400]
+
+    proposals = list(conn.execute(
+        "SELECT * FROM price_proposal WHERE sku = ?", (sku,)))
+    assert len(proposals) == 1
+    assert proposals[0]["price_cents"] == 4500
+    approvals = list(conn.execute(
+        "SELECT * FROM price_approval WHERE proposal_id = ?",
+        (proposals[0]["proposal_id"],)))
+    assert len(approvals) == 1, "a price that is not approved cannot reach a listing"
+
+
+def test_a_hand_set_price_records_that_it_rests_on_nothing(tmp_path):
+    """The fields that would normally carry evidence stay empty *and say so*. An
+    empty band and a band nobody computed look identical afterwards otherwise."""
+    app, conn, gateway, sku = priced_by_hand_fixture(tmp_path)
+    app.test_client().post(f"/items/{sku}/set-price", data={"price": "45.00"})
+
+    row = conn.execute("SELECT * FROM price_proposal WHERE sku = ?", (sku,)).fetchone()
+    assert "operator_judgement" in (row["qualifiers_json"] or "")
+    assert row["comp_set_id"] is None
+    assert row["basis"] is None
+    assert row["band_central_cents"] is None
+    assert "no comparable evidence" in (row["rationale"] or "")
+
+
+def test_a_rejected_price_mutates_nothing(tmp_path):
+    """The failure mode that matters on this route: a half-applied price. Whatever
+    goes wrong, the item must not end up with a proposal and no approval."""
+    app, conn, gateway, sku = priced_by_hand_fixture(tmp_path)
+
+    for bad in ("", "free", "0", "-10"):
+        app.test_client().post(f"/items/{sku}/set-price", data={"price": bad})
+    assert conn.execute(
+        "SELECT COUNT(*) FROM price_proposal WHERE sku = ?", (sku,)).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM price_event WHERE sku = ?", (sku,)).fetchone()[0] == 0
+
+
+def test_the_route_never_500s(tmp_path):
+    """Written as its own assertion because that is what the seller actually met.
+    `set_price` catches only ValueError and LookupError, so anything else -- a
+    NameError in dead code, say -- reaches Flask as an Internal Server Error."""
+    app, conn, gateway, sku = priced_by_hand_fixture(tmp_path)
+    response = app.test_client().post(f"/items/{sku}/set-price", data={"price": "45.00"})
+    assert response.status_code != 500, response.data[:600]
+
+
+# --- screen-sized photographs -------------------------------------------------
+#
+# The shelf renders one card per item and served every one as the original: 34 of
+# them came to 36.3 MB across 35 requests in a single page load, against twelve
+# Waitress threads. The log recorded a queue depth of 37 twice, which is that page
+# almost exactly. A phone does not need a 24-megapixel capture to decide which
+# item to tap.
+#
+# Originals stay put. Everything that reasons about or sells the object -- the
+# vision stage, eBay's uploader, the integrity check at publish -- reads
+# `photo.source_path`, and a resampled image is evidence of a different thing.
+
+
+def photo_fixture(tmp_path):
+    """An item whose one photograph is a real, large JPEG on disk."""
+    import hashlib
+
+    from test_oauth import _jpeg_bytes  # noqa: PLC0415
+
+    app, conn, gateway = app_for(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=1800).sku
+    source = tmp_path / "big.jpg"
+    source.write_bytes(_jpeg_bytes(2400, 1800) + b"\x00" * 40000)
+    gateway.attach_photo(
+        sku, source_path=str(source),
+        content_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        image_format="jpeg", size_bytes=source.stat().st_size, validation_errors=None,
+    )
+    conn.commit()
+    return app, conn, gateway, sku
+
+
+def test_a_sized_request_is_served_as_that_rendition(tmp_path):
+    app, conn, gateway, sku = photo_fixture(tmp_path)
+    client = app.test_client()
+    for size in ("thumb", "view"):
+        r = client.get(f"/items/{sku}/photo/1?size={size}")
+        assert r.status_code == 200, r.data[:200]
+        assert r.headers.get("X-Photo-Size") == size
+
+
+def test_no_size_still_serves_the_original(tmp_path):
+    """The correction form and anything else wanting the real bytes."""
+    app, conn, gateway, sku = photo_fixture(tmp_path)
+    r = app.test_client().get(f"/items/{sku}/photo/1")
+    assert r.status_code == 200
+    assert r.headers.get("X-Photo-Size") == "original"
+
+
+def test_an_unknown_size_falls_through_to_the_original(tmp_path):
+    """A typo in a template should serve a large correct image, never a 404."""
+    app, conn, gateway, sku = photo_fixture(tmp_path)
+    r = app.test_client().get(f"/items/{sku}/photo/1?size=enormous")
+    assert r.status_code == 200
+    assert r.headers.get("X-Photo-Size") == "original"
+
+
+def test_a_thumb_is_much_smaller_than_the_original(tmp_path):
+    """The load-bearing claim, so it needs a real decodable photograph rather than
+    the synthetic header the other tests use."""
+    import hashlib
+
+    pytest.importorskip("PIL", reason="needs a real image to downscale")
+    from PIL import Image
+
+    app, conn, gateway = app_for(tmp_path)
+    sku = gateway.ingest_item(purchase_cost_cents=1800).sku
+    source = tmp_path / "real.jpg"
+    Image.effect_noise((2400, 1800), 64).convert("RGB").save(
+        source, format="JPEG", quality=92)
+    gateway.attach_photo(
+        sku, source_path=str(source),
+        content_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        image_format="jpeg", size_bytes=source.stat().st_size, validation_errors=None,
+    )
+    conn.commit()
+
+    client = app.test_client()
+    original = len(client.get(f"/items/{sku}/photo/1").data)
+    thumb = len(client.get(f"/items/{sku}/photo/1?size=thumb").data)
+    view = len(client.get(f"/items/{sku}/photo/1?size=view").data)
+
+    assert thumb < view < original, (thumb, view, original)
+    # The shelf is the page that mattered: 34 of these at full size was 36.3 MB.
+    assert thumb < original / 4, f"thumb {thumb} vs original {original}"
+
+
+def test_the_shelf_asks_for_thumbs_and_the_workspace_for_a_view(tmp_path):
+    """Asserted on the templates, because getting the size right at the call site
+    is the entire change -- the route only honours what it is asked for."""
+    from pathlib import Path as _Path
+
+    templates = _Path("src/resell/webui/templates")
+    for name, expected in (
+        ("consumer/shelf.html", "size='thumb'"),
+        ("_card.html", "size='thumb'"),
+        ("consumer/workspace.html", "size='view'"),
+        ("consumer/_review.html", "size='view'"),
+    ):
+        body = (templates / name).read_text()
+        assert "url_for('photo'" in body, name
+        assert expected in body, f"{name} should request {expected}"
+
+
+def test_the_original_file_is_never_replaced(tmp_path):
+    """The digest recorded at upload is what publish checks against."""
+    import hashlib
+
+    app, conn, gateway, sku = photo_fixture(tmp_path)
+    row = conn.execute("SELECT source_path, content_sha256 FROM photo WHERE sku=?",
+                       (sku,)).fetchone()
+    before = hashlib.sha256(Path(row["source_path"]).read_bytes()).hexdigest()
+
+    client = app.test_client()
+    for size in ("thumb", "view", ""):
+        client.get(f"/items/{sku}/photo/1?size={size}")
+
+    after = hashlib.sha256(Path(row["source_path"]).read_bytes()).hexdigest()
+    assert after == before == row["content_sha256"]

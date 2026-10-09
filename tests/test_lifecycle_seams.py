@@ -108,21 +108,34 @@ def test_the_confirmation_is_on_the_record(tmp_path):
     assert payload["note"] == "matches the dial markings"
 
 
-def test_a_resolved_item_is_never_asked(tmp_path):
+def test_an_item_with_a_supported_mode_is_never_asked(tmp_path):
     """Stopping on an identification the agent can defend would be a rubber stamp,
-    and a click on every item is how a seam stops being read."""
+    and a click on every item is how a seam stops being read.
+
+    The seam used to require `RESOLVED`, which is held closed, so it asked on all
+    54 items of the historical replay -- a pricing decision leaking out as a
+    question to the seller."""
     conn, gateway, sku = drafted(*fixture(tmp_path))
-    conn.execute(
-        "INSERT INTO product_match (sku, candidate_ref, is_match, strength, "
-        "source_authority, donation_scope, created_at, rationale, item_evidence, "
-        "candidate_evidence) VALUES (?,?,1,?,?,?,?,?,?,?)",
-        (sku, "cand-1", "identifier_verified", "manufacturer", "attributes",
-         db.now_iso(), "matched the catalogue", "[1]", "[2]"),
-    )
-    conn.commit()
+    supported_mode(conn, sku)
 
     assert next_step(conn, sku).step is Step.BEGIN_PRICING
     assert not identity_confirmed(conn, sku)
+
+
+def test_a_supported_mode_does_not_lift_the_pricing_ceiling(tmp_path):
+    """The separation the change rests on. Continuing without a question is a
+    statement about what we know; `same_product` is a statement about what the
+    comps may claim. Only the second is gated on resolution."""
+    from resell.pricing.comps import Comparability, ceiling_for_identity
+    from resell.reasoning.research_loop import identity_resolution
+
+    conn, gateway, sku = drafted(*fixture(tmp_path))
+    supported_mode(conn, sku, "product_family")
+
+    assert next_step(conn, sku).step is Step.BEGIN_PRICING
+    assert ceiling_for_identity(str(identity_resolution(conn, sku))) is (
+        Comparability.SAME_FAMILY_VARIANT
+    )
 
 
 # --- upload is observable in the same way Run is -----------------------------------
@@ -249,7 +262,7 @@ def test_pressing_run_over_and_over_through_the_real_route_changes_nothing(tmp_p
 def test_a_resolved_item_proceeds_into_pricing_on_its_own(tmp_path):
     """The other half. A seam that stopped everything would be a wall."""
     conn, gateway, sku = drafted(*fixture(tmp_path))
-    resolve(conn, sku)
+    supported_mode(conn, sku)
 
     report = advance(conn, gateway, sku, runner=_QuietRunner(gateway), max_steps=8)
 
@@ -269,6 +282,19 @@ def test_confirming_an_unresolved_item_then_lets_it_proceed(tmp_path):
     assert conn.execute(
         "SELECT state FROM item WHERE sku = ?", (sku,)
     ).fetchone()[0] == str(ItemState.PRICING)
+
+
+def supported_mode(conn, sku, mode="branded_generic"):
+    """A mode the gate accepted: what "the agent has a claim it can defend" means.
+
+    Written straight onto the current identification, the way `declare_mode` does,
+    because what the seam reads is the accepted mode and not how it got there.
+    """
+    conn.execute(
+        "UPDATE identification SET mode = ? WHERE sku = ? AND superseded_at IS NULL",
+        (mode, sku),
+    )
+    conn.commit()
 
 
 def resolve(conn, sku):
@@ -305,23 +331,32 @@ def _settle(seconds: float = 1.0):
     time.sleep(seconds)
 
 
-def test_the_seam_is_derived_from_resolution_not_from_a_flag(tmp_path):
-    """A boolean somebody sets is a boolean somebody forgets to set. The gate asks
-    `identity_resolution`, which is computed from `product_match` and
-    `research_lookup` -- the same function pricing uses to cap the comparability
-    ladder, so the two cannot disagree about whether this item is known."""
+def test_the_seam_is_derived_from_the_record_not_from_a_flag(tmp_path):
+    """A boolean somebody sets is a boolean somebody forgets to set.
+
+    The gate reads the *accepted mode*, which `declare_mode` writes only when
+    `mode_is_supported` says the stored evidence earns it -- so the question is
+    still derived, and still from evidence rather than from an opinion. What
+    changed is which derived fact it reads.
+    """
     import inspect
 
     from resell import orchestrator
 
     source = inspect.getsource(orchestrator.identity_needs_confirming)
-    assert "identity_resolution(conn, sku)" in source
-    assert "IdentityResolution.RESOLVED" in source
+    body = source[source.index('"""', source.index('"""') + 3) + 3:]
+
+    assert "current_identification(conn, sku)" in body
+    assert "IdentificationMode.UNRESOLVED" in body
+    # And deliberately not the pricing signal: the gate and the ladder read
+    # different facts now, which is the whole point of the change.
+    assert "identity_resolution" not in body
 
 
-def test_the_ladder_and_the_gate_agree(tmp_path):
-    """Both read the same resolution: an item the gate lets through is an item
-    whose comps may claim `same_product`, and one it stops is capped below that."""
+def test_the_ladder_still_answers_only_to_resolution(tmp_path):
+    """The gate and the ladder read different facts on purpose, so this pins the
+    ladder's own rule: nothing but a resolved identity lifts it to `same_product`,
+    and no mode, however well supported, has any say."""
     from resell.pricing.comps import Comparability, ceiling_for_identity
     from resell.reasoning.research_loop import identity_resolution
 
@@ -330,6 +365,13 @@ def test_the_ladder_and_the_gate_agree(tmp_path):
         Comparability.SAME_FAMILY_VARIANT
     )
 
+    supported_mode(conn, sku, "product_family")
+    assert ceiling_for_identity(str(identity_resolution(conn, sku))) is (
+        Comparability.SAME_FAMILY_VARIANT
+    )
+
+    # Only a donating catalogue match does, and exact resolution is held closed --
+    # so this is reachable in a test and not in the product.
     resolve(conn, sku)
     assert ceiling_for_identity(str(identity_resolution(conn, sku))) is (
         Comparability.SAME_PRODUCT

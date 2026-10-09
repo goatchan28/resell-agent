@@ -30,7 +30,12 @@ from resell.reasoning.budget import (
     estimate_cost,
 )
 from resell.reasoning.gaps import AspectOutcome, Candidate, Gap, analyse, gap_for
-from resell.reasoning.ledger import CallStatus, begin_call, finalize_call
+from resell.reasoning.ledger import (
+    CallStatus,
+    begin_call,
+    completion_status,
+    finalize_call,
+)
 from resell.reasoning.schema import Basis, EvidenceRef
 from resell.reasoning.stages import (
     StageRequest,
@@ -382,10 +387,8 @@ def map_aspects(
                 )
             )
 
-    status = (
-        CallStatus.PARSE_FAILED
-        if not proposal.candidates_by_aspect and proposal.malformed
-        else CallStatus.COMPLETED
+    status = completion_status(
+        bool(proposal.candidates_by_aspect) or not proposal.malformed
     )
     finalize_call(
         conn, call_id, status=status,

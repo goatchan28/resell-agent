@@ -262,6 +262,17 @@ class DraftReview:
     untraceable: tuple[str, ...] = ()
     # Keyed by what is being measured, so two reviews can be compared.
     measures: dict[str, Measure] = field(default_factory=dict)
+    # Words this draft used that the record cannot support, as the words
+    # themselves rather than as the sentence complaining about them.
+    #
+    # They are dictionary keys here -- `CONDITIONAL_TERMS['handmade']` and
+    # `PROHIBITED_TERMS['bargain']` -- and the refusal prose is generated *from*
+    # them, so a caller wanting to know what to avoid should read this and never
+    # parse that. The distinction earns its keep on a retry: a length complaint is
+    # positional and a different sample may well fix it, but "handmade requires
+    # manufacture evidence" is permanent -- the evidence will not appear between
+    # two attempts, so the only thing that resolves it is not writing the word.
+    refused_terms: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -424,9 +435,11 @@ def review_draft(
                 + ", ".join(repr(word) for word in wear)
             )
 
+    refused_terms: list[str] = []
     for term, why in PROHIBITED_TERMS.items():
         if _contains_phrase(combined, term):
             review.problems.append(f"{term!r} cannot be supported by evidence: {why}")
+            refused_terms.append(term)
 
     for term, needs in CONDITIONAL_TERMS.items():
         if not _contains_phrase(combined, term) or needs in available_support:
@@ -445,6 +458,7 @@ def review_draft(
         review.problems.append(
             f"{term!r} requires {needs} evidence, and none is recorded"
         )
+        refused_terms.append(term)
 
     for index, claim in enumerate(draft.claims):
         if not claim.text.strip():
@@ -539,6 +553,7 @@ def review_draft(
             f"the description states value(s) the record does not contain: "
             f"{', '.join(dict.fromkeys(body_values))}"
         )
+    review.refused_terms = tuple(dict.fromkeys(refused_terms))
     return review
 
 

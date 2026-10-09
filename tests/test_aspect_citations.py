@@ -169,3 +169,215 @@ def test_the_fibre_substitution_case_still_reaches_the_substitution_check():
     )
     assert problem is not None
     assert "Spandex" in problem
+
+
+# --- a free-text aspect's values are suggestions, and the form must say so -----
+#
+# eBay marks every aspect SELECTION_ONLY or FREE_TEXT, and only the first is a
+# closed set. Both used to print under `allowed:`.
+#
+# MP-000063 and MP-000065 are crocheted yarn hacky sacks. eBay's `Material` for
+# their category is free text with five suggestions -- Carbon Fiber, Foam, Metal,
+# Plastic, Wood -- and a ball of yarn is none of them. Told those were the allowed
+# values, the mapper chose `Wood` three times across the two items, and MP-000065
+# went to eBay with it. Replayed against the corrected form, six samples produced
+# `Fabric`, `Cotton/Yarn (Crochet)` and similar, and `Wood` not once.
+
+
+def _spec(name, mode, values=(), required=False):
+    from resell.ebay.publisher import AspectSpec
+
+    return AspectSpec(name, required, mode, "SINGLE", "STRING", None, tuple(values))
+
+
+def test_free_text_values_are_offered_as_suggestions():
+    from resell.reasoning.stages import render_aspect_form
+
+    form = render_aspect_form([
+        _spec("Material", "FREE_TEXT", ("Carbon Fiber", "Foam", "Wood")),
+    ])
+    assert "common values" in form
+    assert "not a closed list" in form
+    assert "allowed:" not in form, "the word that caused the problem"
+
+
+def test_a_free_text_aspect_is_told_what_to_do_when_nothing_fits():
+    """The instruction that replaces picking the nearest wrong answer."""
+    from resell.reasoning.stages import render_aspect_form
+
+    form = render_aspect_form([_spec("Material", "FREE_TEXT", ("Foam", "Wood"))])
+    assert "write the observed value instead" in form
+    assert "never pick the nearest one" in form
+
+
+def test_a_selection_only_aspect_is_still_a_closed_set():
+    """The other half must not soften: eBay refuses a value outside the list."""
+    from resell.reasoning.stages import render_aspect_form
+
+    form = render_aspect_form([
+        _spec("Age Level", "SELECTION_ONLY", ("1-2 Years", "3-4 Years")),
+    ])
+    assert "allowed (choose one of these or leave it unset)" in form
+    assert "common values" not in form
+    assert "write the observed value" not in form
+
+
+def test_an_aspect_with_no_values_is_plain_free_text():
+    from resell.reasoning.stages import render_aspect_form
+
+    form = render_aspect_form([_spec("Notes", "FREE_TEXT")])
+    assert "free text -- write the observed value" in form
+
+
+def test_the_truncation_notice_survives_on_both_kinds():
+    """A missing value must still be visibly a truncation rather than an absence."""
+    from resell.reasoning.stages import render_aspect_form
+
+    many = tuple(f"v{i}" for i in range(80))
+    for mode in ("FREE_TEXT", "SELECTION_ONLY"):
+        form = render_aspect_form([_spec("Year", mode, many)], max_values=60)
+        assert "and 20 more not shown" in form, mode
+
+
+# --- a phrasing is not a substitution -----------------------------------------
+#
+# MP-000066 is a back cushion. Its observation reads "a contoured lumbar cushion
+# for chair back support"; the mapping proposed Type = "Back Cushion" and cited
+# it; and the substitution guard refused, because "Back Support" is also one of
+# eBay's allowed values for that category and *is* in that sentence. Two
+# near-synonyms from one list read as a swap, Type became unsupported, and the
+# seller was asked to supply a value the system had already worked out.
+
+
+def test_a_value_the_evidence_names_in_pieces_is_not_a_substitution():
+    from resell.reasoning.gaps import detect_value_substitution
+
+    allowed = ("Back Cushion", "Back Support", "Seat Cushion", "Lumbar Roll")
+    assert detect_value_substitution(
+        "Type", "Back Cushion",
+        "The item is a contoured lumbar cushion for chair back support",
+        allowed,
+    ) is None
+
+
+def test_a_genuine_swap_is_still_caught():
+    """The case the guard exists for: elastodiene is a rubber-based fibre and
+    elastane is polyurethane. Both legal values, real citation, different thing."""
+    from resell.reasoning.gaps import detect_value_substitution
+
+    allowed = ("Wool", "Polyester", "Spandex", "Elastodiene")
+    complaint = detect_value_substitution(
+        "Material", "Elastodiene",
+        "The tag lists fabric content 'Plain 88% Wool, 8% Polyester, 4% Elastane'",
+        allowed,
+    )
+    assert complaint and "Elastodiene" in complaint
+
+
+def test_a_trailing_plus_is_part_of_the_word():
+    """Without it "Beats Pill+" and "Beats Pill" tokenise the same, and they are
+    different speakers. A model designation is exactly where this is load-bearing."""
+    from resell.reasoning.gaps import _every_word_present
+
+    assert not _every_word_present(
+        "Beats Pill+", "The item is a Beats Pill portable Bluetooth speaker.")
+    assert _every_word_present(
+        "Beats Pill", "The item is a Beats Pill portable Bluetooth speaker.")
+
+
+def test_the_guard_still_refuses_what_the_evidence_does_not_name():
+    from resell.reasoning.gaps import detect_value_substitution
+
+    for value, cited, allowed in (
+        ("Gray", "the overall panel is black", ("Gray", "Black")),
+        ("Steel", "a chrome/metal grip bar section", ("Steel", "Chrome")),
+        ("40 lb", "the dial is marked 5 lb", ("40 lb", "5 lb")),
+        ("Herringbone", "a subtle mini check pattern", ("Herringbone", "Check")),
+    ):
+        assert detect_value_substitution("A", value, cited, allowed), value
+
+
+# --- an inference does not contradict a look ----------------------------------
+#
+# MP-000067 is a Canon EOS Rebel T6i. Two pieces of evidence read that designation
+# off the body; a third *inferred* "This is a Canon EOS Rebel T6i (also marketed
+# as EOS 750D)" -- one sentence saying the two names are the same camera. The
+# mapping split it into two candidates with disjoint evidence, and the seller was
+# asked to choose between two names for the object in their hand.
+
+
+def _at(evidence_id, basis):
+    from resell.reasoning.schema import EvidenceRef
+
+    return EvidenceRef(evidence_id, basis)
+
+
+def test_an_inference_does_not_contradict_an_observation():
+    from resell.reasoning.gaps import Candidate, Resolution, resolve_aspect
+    from resell.reasoning.schema import Basis
+
+    outcome = resolve_aspect("Model", [
+        Candidate("EOS Rebel T6i", (_at(2548, Basis.TEXT_READ),)),
+        Candidate("EOS 750D", (_at(2572, Basis.INFERENCE),)),
+    ])
+    assert outcome.resolution is Resolution.RESOLVED
+    assert outcome.value == "EOS Rebel T6i"
+    assert "inferred" in outcome.explanation
+    # The rejected reading is retained, not erased.
+    assert any(c.value == "EOS 750D" for c in outcome.candidates)
+
+
+def test_a_value_with_mixed_support_counts_as_observed():
+    """MP-000053: 'Suit Jacket' rested on a visual observation and a spec tag,
+    'Sport Coat' on an inference alone."""
+    from resell.reasoning.gaps import Candidate, Resolution, resolve_aspect
+    from resell.reasoning.schema import Basis
+
+    outcome = resolve_aspect("Type", [
+        Candidate("Suit Jacket", (_at(1, Basis.VISUAL_OBSERVATION),
+                                  _at(2, Basis.TEXT_READ))),
+        Candidate("Sport Coat", (_at(3, Basis.INFERENCE),)),
+    ])
+    assert outcome.resolution is Resolution.RESOLVED
+    assert outcome.value == "Suit Jacket"
+
+
+def test_two_observations_that_disagree_are_still_a_question():
+    """MP-000052 is a sneaker with a white toe box, a black collar and a grey
+    panel, every one a `visual_observation`. That is a real question about a
+    genuinely multi-coloured shoe, and it must still be asked."""
+    from resell.reasoning.gaps import Candidate, Resolution, resolve_aspect
+    from resell.reasoning.schema import Basis
+
+    outcome = resolve_aspect("Color", [
+        Candidate("White", (_at(2153, Basis.VISUAL_OBSERVATION),)),
+        Candidate("Black", (_at(2155, Basis.VISUAL_OBSERVATION),)),
+        Candidate("Gray", (_at(2154, Basis.VISUAL_OBSERVATION),)),
+    ])
+    assert outcome.resolution is Resolution.CONTRADICTED
+
+
+def test_text_read_does_not_outrank_visual_observation():
+    """The principle `ADJUDICATING_BASES` was kept narrow to protect: no hidden
+    ranking *between observations*. Only the operator adjudicates those."""
+    from resell.reasoning.gaps import Candidate, Resolution, resolve_aspect
+    from resell.reasoning.schema import Basis
+
+    outcome = resolve_aspect("Size", [
+        Candidate("42R", (_at(1, Basis.TEXT_READ),)),
+        Candidate("38", (_at(2, Basis.VISUAL_OBSERVATION),)),
+    ])
+    assert outcome.resolution is Resolution.CONTRADICTED
+
+
+def test_two_inferences_that_disagree_are_still_a_question():
+    """The rule needs exactly one observed value to prefer. Two inferences against
+    each other is not something a basis can settle."""
+    from resell.reasoning.gaps import Candidate, Resolution, resolve_aspect
+    from resell.reasoning.schema import Basis
+
+    outcome = resolve_aspect("Model", [
+        Candidate("A", (_at(1, Basis.INFERENCE),)),
+        Candidate("B", (_at(2, Basis.INFERENCE),)),
+    ])
+    assert outcome.resolution is Resolution.CONTRADICTED

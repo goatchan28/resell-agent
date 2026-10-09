@@ -289,4 +289,83 @@ document.addEventListener("change", function (event) {
   }
 }, false);
 
+// Uploading without leaving the page.
+//
+// A phone that moves from Wi-Fi to cellular changes IP, and every open
+// connection dies with it. As a plain form post that means the browser navigates
+// to its own error page -- and takes the FileList with it, so the seller re-picks
+// every photograph and uploads the same bytes again. It is reproducible, it is
+// not our error, and the page it lands on is not ours either.
+//
+// So the same form is sent by XHR and the page stays put. On failure the button
+// comes back and says Retry; the <input type=file> still holds exactly the same
+// files, so a retry re-sends them with nothing to re-pick. Whole upload each
+// time -- no chunking, no resumable protocol, no state to keep on the server.
+//
+// Progressive enhancement: if XHR or FormData are missing the listener does
+// nothing and the native form posts as it always did.
+(function () {
+  if (!window.XMLHttpRequest || !window.FormData) { return; }
+
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!form.matches("form.c-picker")) { return; }
+    if (form.dataset.uploading === "1") { event.preventDefault(); return; }
+
+    var problem = form.querySelector("[data-upload-problem]");
+    var button = form.querySelector("button[type=submit]");
+    if (!problem || !button) { return; }   // not the shape we expected; leave it
+
+    event.preventDefault();
+    form.dataset.uploading = "1";
+    problem.hidden = true;
+    problem.textContent = "";
+
+    var label = button.dataset.busy || "Uploading…";
+    var xhr = new XMLHttpRequest();
+
+    function finished(message) {
+      form.dataset.uploading = "";
+      button.disabled = false;
+      button.textContent = "Retry";
+      problem.textContent = message;
+      problem.hidden = false;
+    }
+
+    xhr.upload.addEventListener("progress", function (e) {
+      // A real percentage. These uploads take tens of seconds on a phone and the
+      // button used to say "Uploading…" whether it was moving or stalled.
+      if (!e.lengthComputable) { return; }
+      button.textContent = label + " " + Math.round((e.loaded / e.total) * 100) + "%";
+    });
+
+    xhr.addEventListener("load", function () {
+      if (xhr.status >= 200 && xhr.status < 400) {
+        window.location = xhr.responseURL || window.location.pathname;
+        return;
+      }
+      if (xhr.status === 413) {
+        finished("Those photos are too large to upload together. Try fewer at once.");
+        return;
+      }
+      finished("The upload did not go through (" + xhr.status + "). Tap Retry.");
+    });
+
+    // What a network change produces. Nothing reached the server, so nothing was
+    // created: retrying sends the same photographs to the same place.
+    xhr.addEventListener("error", function () {
+      finished("Upload interrupted — your photos are still here. Tap Retry.");
+    });
+    xhr.addEventListener("abort", function () {
+      finished("Upload stopped. Tap Retry.");
+    });
+    xhr.addEventListener("timeout", function () {
+      finished("The upload timed out. Tap Retry.");
+    });
+
+    xhr.open("POST", form.getAttribute("action"), true);
+    xhr.send(new FormData(form));
+  }, false);
+})();
+
 </script>

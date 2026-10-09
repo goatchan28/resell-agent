@@ -40,8 +40,13 @@ page may assert about an object nobody has photographed carefully.
 flowchart TD
     Photos(["photographs attached"]) --> Observe["observe<br/>vision.py: what is visible"]
     Observe --> Category["suggest_category<br/>eBay taxonomy"]
-    Category --> Research["research_identity<br/>search, fetch, extract candidate facts"]
-    Research --> Mode["declare_mode<br/>is the evidence enough to name the product?"]
+    Category --> Tier{"what was read off it?<br/>identity.py: tier_for"}
+    Tier -->|"nothing"| T0["tier 0: described_object"]
+    Tier -->|"a brand only"| T1["tier 1: branded_generic"]
+    Tier -->|"a product code"| T2["tier 2: one search<br/>then a deterministic read"]
+    T0 --> Mode["declare_mode<br/>is the evidence enough to name the product?"]
+    T1 --> Mode
+    T2 --> Mode
     Mode --> Aspects["map_aspects<br/>propose values for the category's fields"]
 
     Aspects --> Gaps{"anything unresolved<br/>that matters?"}
@@ -64,7 +69,38 @@ flowchart TD
     ConfirmOp --> Pricing
 ```
 
-Two behaviours worth knowing:
+Three behaviours worth knowing:
+
+**Identification is deterministic and spends no model call.** It used to be three
+— a planner, a per-page reader and a matcher. Across 57 items those ran 97 times
+for $2.73, performed 37 lookups, wrote 22 `product_match` rows of which **none**
+was a match, and never once resolved an identity. The half that worked was the
+deterministic half, so that is all that is left.
+
+What the tier decides is whether there is anything external worth asking about. A
+brand alone is a query that returns the catalogue rather than this object, so
+tiers 0 and 1 conclude without searching; `described_object` is the right answer
+for most household objects and is a conclusion, not a failure. Tier 2 asks the one
+question an identifier cannot answer about itself — *which product does this code
+denote?* — with a single static query, and reads the results by string comparison
+and source authority. No page is fetched and no model is consulted.
+
+**Exact resolution is not shipped, and fails closed.** A tier-2 search runs, and
+records every source that named the identifier and what a corroboration rule would
+have made of them — but nothing it finds lifts the comparability ceiling above
+`same_family_variant`. That rule was replayed against all 54 historical items with
+usable observations: it resolved 13 and **six were wrong**, including a Brooks
+Brothers suit jacket resolved as a Barmesa submersible sewage pump by three
+independent plumbing suppliers. `RESOLVED` is a pricing decision — it lifts comps
+to `same_product` — and it is not one to make on a 46% error rate.
+
+The hold costs nothing. The LLM research system this replaced resolved 0 of 57
+items over the project's life, so `same_family_variant` is exactly where the
+ceiling already was. `EXACT_RESOLUTION_SHIPPED` in
+[identity.py](../src/resell/reasoning/identity.py) carries the full account, and
+[tests/fixtures/identity_replay_cases.py](../tests/fixtures/identity_replay_cases.py)
+keeps the real search results for the cases that defeated it, so the next rule is
+designed against them rather than against invented ones.
 
 **Questions are a last resort.** `gaps.py` first tries `value_appears_in()` —
 casefolded matching, a small synonym table, spelling normalisation

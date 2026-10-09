@@ -20,6 +20,7 @@ from enum import StrEnum
 from resell.reasoning.schema import (
     ADJUDICATING_BASES,
     MODES_REQUIRING_NEGATIVE_FINDING,
+    REASONED_BASES,
     EvidenceRef,
     IdentificationEffort,
     IdentificationMode,
@@ -58,6 +59,17 @@ class Candidate:
     @property
     def has_adjudicating_support(self) -> bool:
         return any(ref.basis in ADJUDICATING_BASES for ref in self.support)
+
+    @property
+    def only_reasoned(self) -> bool:
+        """Whether every support for this value is an inference rather than a look.
+
+        See `REASONED_BASES`. A value with any observed support is not "only
+        reasoned", however much inference also backs it.
+        """
+        return bool(self.support) and all(
+            ref.basis in REASONED_BASES for ref in self.support
+        )
 
 
 @dataclass(frozen=True)
@@ -190,6 +202,39 @@ def resolve_aspect(
         detail = "; ".join(
             f"{c.value!r} from evidence {sorted(c.evidence_ids)}" for c in supported
         )
+        # An observation beats an inference drawn about the same object.
+        #
+        # MP-000067 is a Canon EOS Rebel T6i. One observation reads the designation
+        # off the body, an identifier observation records it, and a third says
+        # "This is a Canon EOS Rebel T6i (also marketed as EOS 750D)" -- one
+        # sentence asserting the two names are the same camera. The mapping split
+        # it into two candidates, their evidence sets were disjoint, and its owner
+        # was asked to choose between two names for the object in front of them.
+        #
+        # Nothing here reads that sentence. What separates the two is the `basis`
+        # already recorded against each: the losing value rests on `inference`
+        # alone, and the observation contract exists precisely so that reasoning
+        # beyond what was seen is labelled rather than passed off as seen. Where
+        # every rival to one value is inference-only, the observed value is the
+        # answer and there is nothing to ask.
+        #
+        # **This is not a ranking between observations.** `text_read` does not beat
+        # `visual_observation`; two readings that disagree are still a genuine
+        # disagreement, and MP-000052's white, black and grey sneaker -- three
+        # `visual_observation` values on a genuinely multi-coloured shoe -- is still
+        # a question worth asking. A hidden ranking among observations is exactly
+        # what `ADJUDICATING_BASES` was kept narrow to avoid.
+        observed = [c for c in supported if not c.only_reasoned]
+        reasoned = [c for c in supported if c.only_reasoned]
+        if len(observed) == 1 and reasoned:
+            winner = observed[0]
+            others = ", ".join(repr(c.value) for c in reasoned)
+            return AspectOutcome(
+                aspect_name, Resolution.RESOLVED, winner.value, tuple(supported),
+                f"{winner.value!r} was observed; {others} "
+                f"{'was' if len(reasoned) == 1 else 'were'} inferred, and an "
+                f"inference does not contradict a look",
+            )
         return AspectOutcome(
             aspect_name, Resolution.CONTRADICTED, None, tuple(supported),
             f"independent evidence disagrees on {aspect_name!r}: {detail}",
@@ -727,6 +772,26 @@ def synonym_for(read_term: str, allowed_values: tuple[str, ...]) -> str | None:
     return None
 
 
+# Tokens for the "is every word of this value already there" test. A trailing `+`
+# is part of its token: "Pill+" is not "Pill", and a model designation is exactly
+# where that distinction is load-bearing.
+_VALUE_WORD = __import__("re").compile(r"[a-z0-9]+\+*")
+
+# Words too common to carry a referent. Kept tiny on purpose -- this list only has
+# to stop "of"/"the" from making a value look present.
+_VALUE_NOISE = frozenset({"a", "an", "the", "of", "for", "and", "with", "in", "on", "to"})
+
+
+def _every_word_present(value: str, text: str) -> bool:
+    """Whether the cited text already contains every word of the value."""
+    wanted = [t for t in _VALUE_WORD.findall(value.casefold())
+              if t not in _VALUE_NOISE]
+    if not wanted:
+        return False
+    have = set(_VALUE_WORD.findall(text.casefold()))
+    return all(word in have for word in wanted)
+
+
 def detect_value_substitution(
     aspect_name: str,
     value: str,
@@ -754,6 +819,24 @@ def detect_value_substitution(
     # A value the evidence names under a different word is not a substitution. The
     # tag reads "Elastane" and eBay calls it "Spandex"; the fibre is the same one.
     if value_appears_in(value, cited_text):
+        return None
+    # Nor is a value the evidence names in pieces. MP-000066 is a back cushion: its
+    # observation reads "a contoured lumbar cushion for chair back support", the
+    # mapping proposed Type = "Back Cushion" and cited it, and this guard refused
+    # -- because "Back Support" is also an allowed value and *is* in that sentence.
+    # Two near-synonyms from eBay's own list for one category read as a swap.
+    #
+    # A substitution replaces the referent; a phrasing keeps it. So when every word
+    # of the proposed value is already in the cited text, there is nothing being
+    # substituted, whatever else the text also names.
+    #
+    # `+` survives tokenising, and it has to: without it "Beats Pill+" and "Beats
+    # Pill" become the same token list, and they are different speakers. Tested
+    # against all 33 historical firings, this stands down on 2 -- MP-000066 and a
+    # "Normal Skin" cited from "For Normal to Oily Skin" -- and still refuses the
+    # other 31, including Elastodiene, Gray/Black, Steel/Chrome, 40 lb/5 lb and
+    # Beats Pill+.
+    if _every_word_present(value, cited_text):
         return None
 
     alternatives = [

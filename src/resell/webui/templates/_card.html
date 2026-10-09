@@ -3,7 +3,7 @@
 <article class="card">
   <div class="shot">
     {% if card.photo_positions %}
-      <img src="{{ url_for('photo', sku=card.sku, position=card.photo_positions[0]) }}"
+      <img src="{{ url_for('photo', sku=card.sku, position=card.photo_positions[0], size='thumb') }}"
            alt="" loading="lazy">
     {% else %}
       <div class="shot-empty">no photo</div>

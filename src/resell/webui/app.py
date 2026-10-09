@@ -48,6 +48,21 @@ from resell.images import inspect
 
 _NEEDS_DERIVATIVE = {"heic", "heif", "tiff"}
 
+# Sizes a screen may ask for. Anything else falls through to the original, so a
+# typo in a template serves a correct-but-large image rather than a 404.
+_UI_SIZES = ("thumb", "view")
+
+
+def _served(response, size: str):
+    """Mark which rendition went out, so the saving can be counted afterwards.
+
+    A header rather than a log line: it costs nothing, it travels with the thing
+    it describes, and `curl -I` answers "is the shelf actually serving thumbs?"
+    without needing the server to be instrumented for it.
+    """
+    response.headers["X-Photo-Size"] = size
+    return response
+
 # What a single request may carry. Photos are shrunk to about 2048px in the
 # browser before they are sent, so a normal ten-photo upload is a few megabytes;
 # this is the ceiling for the case where that did not happen -- an older browser
@@ -290,7 +305,19 @@ def _register_routes(app: Flask) -> None:
 
     @app.get("/items/<sku>/photo/<int:position>")
     def photo(sku: str, position: int):
-        from resell.derivatives import ConversionError, for_model
+        """A photograph, at the size the screen asked for.
+
+        `?size=thumb` for a shelf card, `?size=view` for the workspace, and no
+        size for the original -- which is what the correction form and anything
+        wanting the real bytes still gets.
+
+        The default used to be the original for every JPEG, and the shelf renders
+        one card per item: 34 of them came to 36.3 MB and 35 requests in a single
+        page load, against twelve Waitress threads. The log recorded a queue depth
+        of 37 twice. A phone does not need a 24-megapixel capture to decide which
+        item to tap.
+        """
+        from resell.derivatives import ConversionError, for_model, for_ui
 
         _require_item(sku)
         detail = views.item_detail(
@@ -303,16 +330,26 @@ def _register_routes(app: Flask) -> None:
         source = Path(match.source_path)
         if not source.exists():
             abort(404)
+
+        cache = Path(g.config.db_path).resolve().parent / "derivatives"
+        size = (request.args.get("size") or "").strip().lower()
+        if size in _UI_SIZES:
+            try:
+                served = for_ui(source, cache, size, digest=match.content_sha256)
+            except ConversionError:
+                # A screen size is a convenience, not a requirement. Falling back
+                # to the original shows the photograph rather than a broken image
+                # -- slower, and still correct.
+                served = source
+            return _served(send_file(Path(served).resolve()), size)
+
         if (match.image_format or "").lower() not in _NEEDS_DERIVATIVE:
-            return send_file(source.resolve())
+            return _served(send_file(source.resolve()), "original")
         try:
-            derivative = for_model(
-                source, Path(g.config.db_path).resolve().parent / "derivatives",
-                digest=match.content_sha256,
-            )
+            derivative = for_model(source, cache, digest=match.content_sha256)
         except ConversionError:
             abort(415)
-        return send_file(Path(derivative).resolve())
+        return _served(send_file(Path(derivative).resolve()), "model")
 
     # --- the one write that starts everything ---------------------------------
 
@@ -522,7 +559,21 @@ def _register_routes(app: Flask) -> None:
                   f"first", "ask")
             return redirect(url_for("item", sku=sku, run=busy))
         _require_item(sku)
-        from resell.orchestrator import GRANT_CALLS, GRANT_LOOKUPS, grant_more_research
+        from resell.orchestrator import (
+            GRANT_CALLS, GRANT_LOOKUPS, _last_round_was_complete, grant_more_research,
+        )
+
+        # Refused at the button, not only at the routing, so the answer is "that
+        # would not help" rather than a run that starts, searches nothing and ends
+        # where it began. Pricing asks a fixed list of queries; once they have all
+        # run there is no second thing to ask.
+        if _last_round_was_complete(g.conn, sku):
+            flash(f"{sku}: the searches for this item have already run, and they "
+                  f"are the same every time — looking again would ask the same "
+                  f"questions of the same index", "ask")
+            flash("the market is what it is; set a price yourself or set the item "
+                  "aside", "reason")
+            return redirect(url_for("item", sku=sku))
 
         grant_more_research(g.conn, sku)
         flash(f"{sku}: {GRANT_CALLS} more research call(s) and {GRANT_LOOKUPS} more "
@@ -1153,7 +1204,11 @@ def _propose_operator_price(sku: str, price_cents: int, rationale: str) -> str:
         category_id=request_values.category_id,
     )
     costs = CostLines(seller_paid_shipping_cents=request_values.shipping_cost_cents)
-    strategies = build_strategies(rec, schedule=schedule, costs=costs)
+    # No strategies are built here, and there is nothing to build them from: this
+    # path exists precisely because there was no comp sample, and `build_strategies`
+    # needs a recommendation derived from one. A line computing them from an
+    # undefined `rec` survived the V1 deletion and made this route a guaranteed 500
+    # -- two NameErrors on one statement, assigned to a variable nothing read.
     proceeds = net_from_gross(price_cents, schedule=schedule, costs=costs)
 
     proposal = PriceProposal(

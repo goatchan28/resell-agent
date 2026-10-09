@@ -124,6 +124,11 @@ class RunReport:
     # Ordinary stops, kept apart from failures so the UI can say "that is as far
     # as this item's budget goes" rather than showing a red line.
     halts: list[str] = field(default_factory=list)
+    # The loop bound was reached. Never an outcome about the item -- it means the
+    # run stopped counting before the item stopped needing things, which is a
+    # fault in the bound. Recorded because the last time it happened, nothing
+    # anywhere said so and it reached the operator as an unexplained button.
+    exhausted: bool = False
     # A required agent stage that failed and did not clear on retry.
     #
     # Not the same as an error and not the same as a skip. The step is still
@@ -140,103 +145,40 @@ class RunReport:
 
 # --- is identification research worth doing on this item ----------------------
 #
-# Deterministic, and deliberately so. Whether to spend a research round is a
-# question about what the record contains, not a judgement a model should make
-# about its own next paid call.
-
-# Identifier schemes worth searching for. A code that names a manufacturer's
-# product is findable; a serial number identifies one physical unit and finds
-# nothing, and a size or a care symbol is not an identifier at all.
-SEARCHABLE_SCHEMES = frozenset({
-    "mpn", "model", "model_number", "style_number", "part_number",
-    "upc", "ean", "gtin", "isbn", "asin", "fcc_id", "other",
-})
-
-# Schemes that identify a unit rather than a product. Searching one is a lookup
-# that cannot succeed, and the planner has no way to know that from the string.
-UNSEARCHABLE_SCHEMES = frozenset({"serial", "serial_number", "imei"})
-
-
-def identifying_evidence(conn: sqlite3.Connection, sku: str) -> tuple[str, ...]:
-    """Things about this item that a search could actually pursue.
-
-    Two sources, both already recorded: identifiers the observation stage
-    transcribed, and a brand-plus-model pair on the identification. A brand alone
-    is not enough -- "Bowflex" is a query that returns the catalogue, not this
-    object -- so it counts only alongside a model or product line.
-    """
-    import json as _json
-
-    from resell.gateway import current_identification
-
-    found: list[str] = []
-    for row in conn.execute(
-        "SELECT payload FROM evidence WHERE sku = ? AND kind = 'identifier_observation' "
-        "ORDER BY id", (sku,),
-    ):
-        payload = _json.loads(row["payload"])
-        scheme = str(payload.get("scheme") or "").lower()
-        value = str(payload.get("normalized") or payload.get("raw_transcription") or "")
-        if not value.strip() or scheme in UNSEARCHABLE_SCHEMES:
-            continue
-        if scheme in SEARCHABLE_SCHEMES:
-            found.append(f"{scheme} {value}")
-
-    identification = current_identification(conn, sku)
-    if identification is not None:
-        brand = (identification["brand"] or "").strip()
-        model = (identification["model"] or "").strip()
-        if brand and model:
-            found.append(f"{brand} {model}")
-        aspects = _json.loads(identification["aspects"] or "{}")
-        for name in ("MPN", "Model", "Model Number", "Product Line", "Series"):
-            values = [str(v).strip() for v in (aspects.get(name) or []) if str(v).strip()]
-            if values:
-                found.append(f"{name}: {' + '.join(values)}")
-    return tuple(dict.fromkeys(found))
+# Deterministic, and deliberately so. Whether to run the round is a question about
+# what the record contains, not a judgement a model should make about its own next
+# paid call. `resell.reasoning.identity` holds the scheme classification now: the
+# question "which codes denote a product" is the same one the round itself asks,
+# and two answers to it would drift.
 
 
 def research_warranted(conn: sqlite3.Connection, sku: str) -> tuple[bool, str]:
-    """Whether to spend an identification research round, and why or why not.
+    """Whether the identification round still needs to run, and why or why not.
 
-    Four questions, in the order that makes the cheapest answer first:
+    One question now, not four. The round is deterministic and costs at most one
+    search, so there is nothing to ration: what used to be a budget decision is
+    just "has it happened yet".
 
-      is it already resolved      an exact product needs nothing further
-      is there anything to find   a query needs an identifier or a product line
-      has it already been tried   one round per item unless retrieval improves
-      is there budget left        the stage guard, asked before spending
-
-    Returning a reason either way is the point: "research was skipped" and
-    "research found nothing" are different facts about an item, and only one of
-    them says anything about the object.
+    That inversion is the point. The old gate asked *is there anything worth
+    searching for*, and answered no for every item without an identifier -- which
+    meant the plurality of items never reached the mode gate at all and stayed
+    `unresolved` by default rather than by conclusion. `described_object` is a
+    successful outcome for most household objects, and it was unreachable because
+    nothing ever ran to declare it.
     """
-    from resell.reasoning.budget import StageBudget
-    from resell.reasoning.research_loop import identity_resolution
-    from resell.reasoning.schema import IdentityResolution
-    from resell.reasoning.vision import spend_so_far
+    from resell.reasoning.identity import tier_for
 
-    resolution = identity_resolution(conn, sku)
-    if resolution is IdentityResolution.RESOLVED:
-        return False, "the product was already resolved to a catalogue entry"
+    declared = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE item_id = ? AND kind = 'identification.mode_declared'",
+        (sku,),
+    ).fetchone()[0]
+    if declared:
+        return False, "the identification mode has already been declared"
 
-    evidence = identifying_evidence(conn, sku)
-    if not evidence:
-        return False, (
-            "nothing distinctive enough to search for -- no model number, product "
-            "code or brand-and-line pair was read off the item"
-        )
-
-    budget = StageBudget.from_env("research")
-    spent = spend_so_far(conn, sku, "research_plan")
-    if spent.calls >= budget.max_calls:
-        return False, f"the research budget for this item is spent ({spent.calls} rounds)"
-    if spent.calls:
-        # Planned once already. Re-planning against the same record produces the
-        # same plan and charges for it again; only new retrieval would change the
-        # answer, and there is none.
-        return False, "already researched once; nothing new to search with"
-
-    return True, f"unresolved, and there is something to search for: {evidence[0]}"
+    tier = tier_for(conn, sku)
+    if tier.searches:
+        return True, f"tier 2: {tier.why}"
+    return True, f"tier {tier.tier}: {tier.why}"
 
 
 # --- reading the record ------------------------------------------------------
@@ -305,16 +247,18 @@ def next_step(conn: sqlite3.Connection, sku: str, *, marketplace: str = "EBAY_US
             Step.SUGGEST_CATEGORY, Actor.AGENT, "choose a category",
             "the aspect form and the condition list both hang off it",
         )
-    # Before aspect mapping, because what research finds becomes citable evidence
-    # that mapping can use -- running it afterwards would leave the donated facts
-    # with nothing to donate to until the next mapping run.
-    warranted, why = research_warranted(conn, sku)
-    if warranted:
-        return NextStep(
-            Step.RESEARCH_IDENTITY, Actor.AGENT, "work out exactly what it is", why,
-        )
-
     if not identification["aspects"]:
+        # Before aspect mapping, because what identification confirms becomes
+        # citable evidence that mapping can use -- running it afterwards would
+        # leave the donated facts with nothing to donate to until the next mapping
+        # run. And only before: an item that has already been mapped is past the
+        # moment, and offering the step to it would march every item ever priced
+        # back to the start of identification.
+        warranted, why = research_warranted(conn, sku)
+        if warranted:
+            return NextStep(
+                Step.RESEARCH_IDENTITY, Actor.AGENT, "work out exactly what it is", why,
+            )
         return NextStep(Step.MAP_ASPECTS, Actor.AGENT, "fill in the item's details")
     if not identification["condition_id"]:
         # Nothing set this before, so every item stalled at `begin_pricing`, which
@@ -490,11 +434,48 @@ def _record_refused_draft(conn: sqlite3.Connection, sku: str, outcome) -> None:
         "title": outcome.draft.title,
         "description": outcome.draft.description,
         "problems": list(outcome.review.problems),
+        # The words, beside the sentences about them. `problems` is for a person
+        # to read; this is for the next attempt to obey, and the two must not be
+        # the same string -- reading a refusal back out of its own prose is the
+        # kind of parsing that goes wrong quietly.
+        "refused_terms": list(outcome.review.refused_terms),
     }, item_id=sku)
     conn.commit()
 
 
 DRAFT_REFUSED = "draft_refused"
+
+
+def previously_refused_terms(conn: sqlite3.Connection, sku: str) -> tuple[str, ...]:
+    """Words the reviewer has already refused for this item, across attempts.
+
+    MP-000063 spent six model calls and 47.9 seconds -- 58% of the item's whole
+    cost -- arguing about `handmade`. The stage wrote a draft, two repairs failed
+    to shift the word, the stage raised, `advance` retried it, and the retry began
+    from nothing: it proposed `handmade` again and the repairs fought it again.
+    Three of the six calls re-litigated a decision already made.
+
+    They could not have known. A refused draft was recorded for the operator and
+    read by nobody else, so each attempt met the reviewer for the first time.
+
+    This is that record, read back. Only vocabulary travels: `handmade` is
+    permanent, because it needs manufacture evidence and no evidence appears
+    between two attempts a second apart. A length complaint is positional and a
+    different sample may well fix it, so it stays out of this.
+    """
+    import json as _json
+
+    terms: list[str] = []
+    for row in conn.execute(
+        "SELECT payload FROM events WHERE item_id = ? AND kind = ? ORDER BY id",
+        (sku, DRAFT_REFUSED),
+    ):
+        try:
+            payload = _json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        terms.extend(str(t) for t in (payload.get("refused_terms") or []))
+    return tuple(dict.fromkeys(terms))
 
 
 class CompRoundIncomplete(RuntimeError):
@@ -557,28 +538,53 @@ def confirm_identity(conn: sqlite3.Connection, sku: str, *, note: str = "") -> N
 def identity_needs_confirming(conn: sqlite3.Connection, sku: str) -> tuple[bool, str]:
     """Whether pricing should wait for a person to agree what this thing is.
 
-    Only when research could not resolve it. `resolved` means a catalogue match of
-    sufficient strength from a source good enough to donate -- an answer the agent
-    can defend -- and stopping there would be asking the operator to rubber-stamp
-    work that already carries its own evidence.
+    Only when the agent has **no supported claim** about the object -- when the
+    accepted mode is `unresolved`, which is the identification saying, through the
+    gate that grades it, that the record earns nothing.
 
-    Everything short of that is the agent saying it does not know. It can still
-    draft honestly from what it observed, and the comparability ladder is already
-    capped at `same_family_variant` for it, but spending a pricing budget on an
-    item whose identity is a guess is worth one question first.
+    It used to ask whenever `identity_resolution` was not `RESOLVED`, and that is a
+    different question with a different answer. RESOLVED is held closed on purpose
+    (see `EXACT_RESOLUTION_SHIPPED`), so the old test was true for every item ever
+    -- 54 of 54 on the historical replay. The confirmation screen had stopped being
+    a response to ambiguity and become a consequence of a pricing decision, which
+    is not a thing to ask a seller about.
+
+    A mode is not a softer test than resolution; it is a test of something else, and
+    it is already earned rather than asserted. `described_object` requires a cited
+    negative finding -- somebody looked at named surfaces across counted photographs
+    and found no identity. `branded_generic` requires that plus a cited brand.
+    `product_family` requires a cited brand and a cited product code. Those are
+    defensible answers to "what is this", and re-asking a person to agree with one
+    is asking them to rubber-stamp work that already carries its evidence.
+
+    **This says nothing about pricing.** The comparability ceiling is computed from
+    `identity_resolution` and is untouched: an item that continues on a supported
+    mode still prices at `same_family_variant`. Knowing what something is and being
+    entitled to price it as an exact catalogue match are separate claims, and the
+    whole point of the split is that the weaker one should not be gated on the
+    stronger one failing.
     """
-    from resell.reasoning.research_loop import identity_resolution
-    from resell.reasoning.schema import IdentityResolution
+    from resell.gateway import current_identification
+    from resell.reasoning.schema import IdentificationMode
 
     if identity_confirmed(conn, sku):
         return False, "you have confirmed this identification"
-    resolution = identity_resolution(conn, sku)
-    if resolution is IdentityResolution.RESOLVED:
-        return False, "the agent resolved this to a specific product"
+
+    identification = current_identification(conn, sku)
+    raw = (identification["mode"] if identification is not None else None) or ""
+    try:
+        mode = IdentificationMode(raw)
+    except ValueError:
+        mode = IdentificationMode.UNRESOLVED
+
+    if mode is not IdentificationMode.UNRESOLVED:
+        return False, f"the record supports calling this a {mode}"
     return True, (
-        f"the agent could not pin down exactly what this is "
-        f"({resolution}), so it drafted from what it could see"
+        "the agent could not work out what this is from the photographs, so "
+        "nothing it drafted rests on a supported identification"
     )
+
+
 RESEARCH_GRANTED = "comp_research_granted"
 
 # One press of "give it more" is worth about one more round: a plan, an
@@ -681,24 +687,66 @@ def _last_conclusion_reason(conn: sqlite3.Connection, sku: str) -> str:
         return ""
 
 
+def already_searched(conn: sqlite3.Connection, sku: str) -> bool:
+    """Whether any pricing lookup was ever recorded for this item."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM research_lookup WHERE sku = ? AND scope = 'pricing'",
+        (sku,),
+    ).fetchone()[0] > 0
+
+
+def _last_round_was_complete(conn: sqlite3.Connection, sku: str) -> bool:
+    """Whether a round has closed this item's stage with its retrieval intact.
+
+    Read from the conclusion event rather than recomputed, so it says what was true
+    when the round ran. Conclusions written before this flag existed are treated as
+    complete when they recorded searches, which is what they meant.
+    """
+    import json as _json
+
+    row = conn.execute(
+        "SELECT payload FROM events WHERE item_id = ? AND kind = ? ORDER BY id DESC "
+        "LIMIT 1", (sku, COMP_RESEARCH_CONCLUDED),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        payload = _json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return False
+    if "retrieval_complete" in payload:
+        return bool(payload["retrieval_complete"])
+    return bool(payload.get("searches"))
+
+
 def comp_research_exhausted(conn: sqlite3.Connection, sku: str) -> tuple[bool, str]:
     """Whether another comp round could even begin, and why not.
 
-    Planning is the gate. A round that cannot plan cannot search, so `comp_plan`
-    running out ends the stage regardless of what the other budgets have left --
-    and the pricing lookup allowance ends it just as finally.
+    Completeness is the gate, and the search allowance backs it up. Planning used
+    to be the gate -- a round that could not plan could not search -- but planning
+    was a model call then, and it is a fixed list of queries now.
     """
-    from resell.reasoning.vision import spend_so_far
+    _, lookups = comp_budgets_for(conn, sku)
 
-    plan_budget, lookups = comp_budgets_for(conn, sku)
-    planned = spend_so_far(conn, sku, "comp_plan")
-    if planned.calls >= plan_budget.max_calls:
+    # Pricing searches a fixed list of queries built from the identification. Once
+    # they have all run, running them again asks the same four questions of the
+    # same index and gets the same answers -- MP-000061 did it four times, and the
+    # second, third and fourth rounds logged twenty-four lines of "already
+    # recorded" apiece for twelve Brave calls that could not have changed anything.
+    #
+    # This is the deterministic path's version of the planning-budget gate that
+    # used to live here, which counted `comp_plan` calls -- a stage that no longer
+    # exists, so it counted zero forever and stopped nothing.
+    #
+    # It turns on completeness, not on emptiness. A round whose searches failed, or
+    # that never got to search, leaves `retrieval_complete` false and stays
+    # runnable: "we looked and there is nothing" is a fact about the market and
+    # closes the stage; "we could not look" is a fact about us and must not.
+    if _last_round_was_complete(conn, sku):
         return True, (
-            f"comp research is spent: {planned.calls} of {plan_budget.max_calls} "
-            f"planning calls used on this item"
+            "comp research is spent: the searches for this item have already run "
+            "and they are the same every time"
         )
-    if planned.cost_micros >= plan_budget.max_cost_micros:
-        return True, "comp research is spent: the stage cost ceiling was reached"
 
     performed = conn.execute(
         "SELECT COUNT(*) FROM research_lookup WHERE sku = ? AND scope = 'pricing'",
@@ -719,6 +767,28 @@ def comp_research_exhausted(conn: sqlite3.Connection, sku: str) -> tuple[bool, s
 # cost, and a stage that fails twice in a row is usually failing for a reason
 # another identical attempt will not change. The operator's retry is a third.
 STAGE_ATTEMPTS = 2
+
+
+# How far one run may travel before it stops for its own safety.
+#
+# A bound, not a budget -- every stage meters its own spend, and the thing this
+# stops is a mis-sequenced step cycling forever. So it should sit well clear of
+# the longest honest journey, and it did not: the agent chain from an uploaded
+# photograph to the first genuine decision is nine steps --
+#
+#   start_identification, observe, suggest_category, research_identity,
+#   map_aspects, grade_condition, draft, begin_pricing, comp_research
+#
+# -- and the bound was eight. MP-000062 ran all eight, stopped one short of the
+# comparables, and asked its owner to press "Carry on" for a stop that meant
+# nothing. It had been survivable only because identity used to ask a real
+# question at step seven; removing that question let the chain run into the
+# ceiling instead, and a stop with no reason behind it is worse than the question
+# it replaced.
+#
+# Doubled, so that adding a stage does not quietly reintroduce the same stop, and
+# so a genuine cycle still ends after one lap rather than running all night.
+MAX_AGENT_STEPS = 18
 
 
 def _worth_retrying(exc: Exception) -> bool:
@@ -745,7 +815,7 @@ def advance(
     sku: str,
     *,
     config=None,
-    max_steps: int = 8,
+    max_steps: int = MAX_AGENT_STEPS,
     stage_attempts: int = STAGE_ATTEMPTS,
     runner=None,
 ) -> RunReport:
@@ -756,7 +826,10 @@ def advance(
     stand up a model provider to assert the order of operations.
 
     `max_steps` is a loop bound rather than a budget. Each stage enforces its own
-    spend; this only stops a mis-sequenced step from cycling.
+    spend; this only stops a mis-sequenced step from cycling. Reaching it is a
+    fault rather than an outcome, so it is recorded as one -- `exhausted` on the
+    report -- because the last time this bound was reached nothing said so, and it
+    surfaced to the operator as an unexplained button.
     """
     report = RunReport(sku=sku)
     runner = runner or StageRunner(config)
@@ -772,10 +845,10 @@ def advance(
         # What is not acceptable is the previous behaviour, where the first
         # failure ended the run and the operator was shown a stack trace.
         detail = None
+        stalled = ""
         for attempt in range(1, max(1, stage_attempts) + 1):
             try:
                 detail = runner.run(conn, gateway, sku, step.step)
-                break
             except Exception as exc:  # noqa: BLE001 - a stage failing is normal
                 if attempt >= stage_attempts or not _worth_retrying(exc):
                     # Out of attempts, or an answer rather than an accident. This
@@ -794,21 +867,62 @@ def advance(
                     f"{self_says(step.step)} did not work; trying once more",
                     ok=False,
                 )
+                continue
+
+            # It returned. Whether it *did* anything is a separate question, and
+            # the answer to it is whether the item still needs the same step.
+            if next_step(conn, sku).step is not step.step:
+                stalled = ""
+                break
+            if STOPPED_MARKER in (detail or ""):
+                # A guard, not a failure: a budget reached, a backend absent.
+                # Attempting it again would meet the same guard.
+                stalled = "halt"
+                break
+
+            # The provider answered, nothing raised, and every value it produced
+            # failed validation -- so the item is exactly where it started. That
+            # is a *sample*, not a verdict, and the next one is drawn fresh:
+            # MP-000063's aspect mapping proposed `Material: Wood` for a crocheted
+            # wool ball, the citation gate correctly discarded it and every other
+            # candidate with it, and the run died. Its owner pressed Retry, the
+            # same call proposed `Wool`, and the item went through. That retry was
+            # ours to make.
+            stalled = "no progress"
+            if attempt >= stage_attempts:
+                break
+            report.retried.append(
+                f"{step.step}: ran, but nothing it produced survived validation"
+            )
+            progress.report(
+                progress.Phase.START,
+                f"{self_says(step.step)} produced nothing usable; trying once more",
+                ok=False,
+            )
+
         report.ran.append(f"{step.step}: {detail}" if detail else str(step.step))
 
-        # A step that leaves the item exactly where it was would otherwise spin.
-        if next_step(conn, sku).step is step.step:
+        if stalled == "halt":
             report.stopped_at = next_step(conn, sku)
-            if STOPPED_MARKER in (detail or ""):
-                report.halts.append(f"{step.step}: {detail}")
-            else:
-                report.errors.append(
-                    f"{step.step} ran but the item still needs it; stopping rather "
-                    f"than repeating"
-                )
+            report.halts.append(f"{step.step}: {detail}")
+            return report
+        if stalled == "no progress":
+            # Out of attempts. A step that leaves the item where it was would
+            # otherwise spin, so this is where the run ends.
+            report.stopped_at = next_step(conn, sku)
+            report.errors.append(
+                f"{step.step} ran {stage_attempts} time(s) and the item still "
+                f"needs it; stopping rather than repeating"
+            )
             return report
 
+    # The bound, reached. Flagged rather than raised: callers that deliberately
+    # ask for a short run -- one step at a time, a test -- are not in trouble, and
+    # turning their own instruction into an error would be nonsense. What this
+    # guards against is the *default* bound being too low, and the thing that
+    # catches that is a test walking the whole chain, not a runtime complaint.
     report.stopped_at = next_step(conn, sku)
+    report.exhausted = True
     return report
 
 
@@ -907,15 +1021,14 @@ class StageRunner:
         Asking the operator to choose one from a list of six is the kind of
         question this design exists to stop asking.
         """
+        from resell.db import log_event
         from resell.ebay.client import EbayClient
         from resell.ebay.publisher import Publisher
-        from resell.gateway import current_identification
 
         config = self._config()
-        identification = current_identification(conn, sku)
-        query = (identification["title"] if identification else None) or _query_from_evidence(
-            conn, sku
-        )
+        query, source = category_query(conn, sku)
+        if not query:
+            raise RuntimeError(f"nothing to categorise {sku} by; run observe first")
         with EbayClient(config, conn) as client:
             publisher = Publisher(gateway, client, conn)
             suggestions = publisher.suggest_categories(config.marketplace_id, query)
@@ -936,7 +1049,12 @@ class StageRunner:
             conn, sku, category_id=chosen, category_path=path
         )
         gateway.propose_identification(sku, **fields)
-        return f"category {chosen}"
+        log_event(
+            conn, "identification.category_chosen",
+            {"category_id": chosen, "path": path, "query": query, "query_source": source},
+            item_id=sku,
+        )
+        return f"category {chosen} from the {source}: {query[:60]!r}"
 
     @staticmethod
     def _first_usable(client, publisher, config, suggestions) -> str | None:
@@ -982,46 +1100,29 @@ class StageRunner:
         return incomplete
 
     def _research_identity(self, conn, gateway, sku) -> str:
-        """One identification research round, with whatever retrieval exists.
+        """Decide what the item is. Deterministic; at most one search.
 
-        The planning half runs regardless and is where most of the value is: the
-        planner decides whether searching would help, and answering "no, the
-        evidence already supports the best identification available" declares the
-        item's mode without a single lookup.
-
-        Retrieval used to be the missing part. With a search backend configured
-        the planner's lookups actually run: the backend finds pages, the fetcher
-        loads them, the extraction stage reads them. Without one, `NoRetrievalAdapter`
-        still refuses every lookup rather than returning nothing, so no lookup is
-        recorded and the item stays `unattempted` rather than claiming somebody
-        searched and found nothing. The gap is reported as a gap.
+        Three model calls used to live behind this name -- a planner, a per-page
+        reader and a matcher. Across the whole history they produced no match at
+        all, while the deterministic parts around them did the work. So the round
+        is deterministic end to end now, and the only external question it asks is
+        the narrow one an identifier cannot answer about itself: *which product
+        does this code denote?*
         """
-        from resell.reasoning.adapters import get_adapter
-        from resell.reasoning.adapters.research import NoRetrievalAdapter
-        from resell.reasoning.adapters.search import NoSearchBackend, get_search_backend
-        from resell.reasoning.adapters.web import SearchedResearchAdapter
-        from resell.reasoning.research_loop import run_round
+        from resell.reasoning.identity import run_identity_round
 
-        backend = get_search_backend()
-        if isinstance(backend, NoSearchBackend):
-            adapter = NoRetrievalAdapter()
-        else:
-            adapter = SearchedResearchAdapter(
-                backend, conn=conn, sku=sku,
-                model_adapter=get_adapter(),
-                echo=lambda *a, **k: None,
-            )
-        outcome = run_round(conn, gateway, sku, research_adapter=adapter)
-        if outcome.mode is not None:
-            return f"identified as {outcome.mode.accepted}"
+        outcome = run_identity_round(conn, gateway, sku)
+        accepted = outcome.mode.accepted if outcome.mode is not None else "unresolved"
+        if outcome.tier < 2:
+            return f"tier {outcome.tier}: {accepted}, no lookup needed"
         if outcome.stopped == "not_retrieved":
-            return (
-                f"planned {len(outcome.plan.lookups)} lookup(s); none could run "
-                f"without a search backend"
-            )
-        if outcome.stopped:
-            return f"{outcome.stopped}: {outcome.stop_reason[:80]}"
-        return "researched"
+            return f"{accepted}; {outcome.stop_reason[:80]}"
+        confirmed = outcome.confirmation
+        sources = len(confirmed.sources) if confirmed else 0
+        return (
+            f"{accepted} from {outcome.hits} result(s), "
+            f"{sources} naming the identifier"
+        )
 
     def _map_aspects(self, conn, gateway, sku) -> str:
         from resell.cli_item import _apply_mapping
@@ -1058,7 +1159,12 @@ class StageRunner:
         from resell.gateway import current_identification, observations_in_scope
         from resell.reasoning.adapters import get_adapter
         from resell.reasoning.budget import StageBudget, check, estimate_cost
-        from resell.reasoning.ledger import CallStatus, begin_call, finalize_call
+        from resell.reasoning.ledger import (
+    CallStatus,
+    begin_call,
+    completion_status,
+    finalize_call,
+)
         from resell.reasoning.stages import condition_stage, render_observations
         from resell.reasoning.tools import parse_condition_tool_input
         from resell.reasoning.vision import spend_so_far
@@ -1119,7 +1225,7 @@ class StageRunner:
         )
         finalize_call(
             conn, call_id,
-            status=CallStatus.COMPLETED if choice.usable else CallStatus.PARSE_FAILED,
+            status=completion_status(choice.usable),
             input_tokens=result.usage.input_tokens,
             output_tokens=result.usage.output_tokens,
             cost_micros=rates.cost_micros(
@@ -1158,8 +1264,13 @@ class StageRunner:
         identification = current_identification(conn, sku)
         aspects = json.loads(identification["aspects"] or "{}")
         condition_id = identification["condition_id"]
+        # What this item's reviewer has already refused, if this is not the first
+        # attempt. Empty on the first, which is deliberate: the reviewer's verdict
+        # is evidence about *this draft*, and there is no draft yet to have one.
+        refused_before = previously_refused_terms(conn, sku)
         outcome = draft_listing(
             conn, sku, aspects=aspects, condition_id=condition_id, unresolved=(),
+            refused_terms=refused_before,
         )
         note = ""
         if not outcome.review.ok:
@@ -1228,7 +1339,9 @@ class StageRunner:
         # came back to this step forever.
         spent, why = comp_research_exhausted(conn, sku)
         if spent:
-            return self._conclude_comp_research(conn, sku, why)
+            return self._conclude_comp_research(
+                conn, sku, why, retrieval_complete=already_searched(conn, sku),
+            )
 
         # The same budgets the predicate above consulted, grants included. Passing
         # them explicitly is what keeps "can this run" and "may this spend" the
@@ -1331,7 +1444,8 @@ class StageRunner:
             f"{proposed} worth reviewing{tail}"
         )
 
-    def _conclude_comp_research(self, conn, sku, why: str) -> str:
+    def _conclude_comp_research(self, conn, sku, why: str, *,
+                                retrieval_complete: bool = True) -> str:
         """Close the stage out, once, with whatever it collected.
 
         Records what is there rather than what was hoped for. Orphaned
@@ -1364,6 +1478,11 @@ class StageRunner:
                 "candidates": collected,
                 "claims": claimed,
                 "usable": usable,
+                # Whether the searches ran, as distinct from whether they found
+                # anything. "We looked and the market is thin" and "we could not
+                # look" are different facts, and only the first of them makes
+                # looking again pointless.
+                "retrieval_complete": retrieval_complete,
                 # Whether there is anything to price from, which is what the word
                 # has to mean. A round that judged twelve listings and excluded
                 # all twelve found nothing, however many rows it wrote.
@@ -1448,14 +1567,60 @@ class StageRunner:
         return self.config
 
 
-def _query_from_evidence(conn: sqlite3.Connection, sku: str) -> str:
-    """A search string from the highest-confidence observation, when no title exists."""
+def category_query(conn: sqlite3.Connection, sku: str) -> tuple[str, str]:
+    """What to ask eBay's category suggester, and where it came from.
+
+    A category is the routing decision every later stage inherits: `map_aspects`
+    fills that category's form, `draft` writes from those aspects, and the comp
+    matcher reads the `Type` aspect back. Nothing downstream checks it. So the one
+    input it takes had better be the most identifying thing we have.
+
+    It was `observe`'s first sentence, verbatim. MP-000061 -- a Canon EOS Rebel T6i
+    body with its kit lens -- opened with *"The item is a Canon DSLR camera with a
+    zoom lens attached."*, and eBay returned **Lenses & Filters > Lenses**. Ten
+    earlier T6i items landed in Digital Cameras; the only difference was that their
+    first sentence happened to say "camera body". From that one wrong category came
+    three unanswerable lens questions (the seller guessed `f/1.3` for a kit lens
+    that is f/3.5-5.6), a `Type` aspect of `Zoom lens`, a title carrying "Zoom
+    Lens", and a comp matcher that then threw away all fourteen genuine T6i
+    comparables for not saying "zoom".
+
+    The fix is not a better sentence. It is to stop asking a sentence.
+
+    Prefer the structured identity `observe` already recorded -- the brand from a
+    maker's mark and the product code -- which is `identity.query_for`, the same
+    string tier-2 identity confirmation searches with. `Canon EOS Rebel T6i` names
+    the product and nothing about its configuration, so "with a zoom lens attached"
+    cannot steer it. Only when there is no code at all does prose come back, and an
+    item with no code is one where prose is genuinely all there is.
+    """
     import json
 
+    from resell.reasoning.identity import best_identifier, observed_brand, query_for, tier_for
+
+    tier = tier_for(conn, sku)
+    identifier = best_identifier(tier.identifiers)
+    if identifier is not None:
+        return query_for(tier.brand, identifier), "identity"
+
+    # No product code. A stored title is the next most structured thing, but it is
+    # only present on a re-run -- and it is written by `draft` from the aspects of
+    # whatever category was chosen last time, so preferring it over a code would
+    # let a bad category reproduce itself.
+    identification = conn.execute(
+        "SELECT title FROM identification WHERE sku = ? AND superseded_at IS NULL",
+        (sku,),
+    ).fetchone()
+    title = ((identification["title"] if identification else None) or "").strip()
+    if title:
+        return title, "title"
+
+    brand = observed_brand(conn, sku)
     row = conn.execute(
         "SELECT payload FROM evidence WHERE sku = ? AND kind = 'vision_observation' "
         "ORDER BY id LIMIT 1", (sku,),
     ).fetchone()
-    if row is None:
-        return ""
-    return json.loads(row["payload"]).get("claim", "")[:120]
+    claim = json.loads(row["payload"]).get("claim", "") if row is not None else ""
+    if brand and claim:
+        return f"{brand} {claim}"[:120], "brand and observation"
+    return claim[:120], "observation"

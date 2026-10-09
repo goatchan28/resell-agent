@@ -17,7 +17,12 @@ from typing import Any
 
 from resell.reasoning.adapters import AdapterError, ModelAdapter, get_adapter
 from resell.reasoning.budget import ModelRates, StageBudget, StageSpend, check, estimate_cost
-from resell.reasoning.ledger import CallStatus, begin_call, finalize_call
+from resell.reasoning.ledger import (
+    CallStatus,
+    begin_call,
+    completion_status,
+    finalize_call,
+)
 from resell.reasoning.listing import DraftReview, ListingDraft, review_draft, support_kinds
 from resell.reasoning.stages import StageRequest, StageResult, drafting_stage, render_observations
 from resell.reasoning.tools import parse_draft_tool_input
@@ -67,6 +72,7 @@ def draft_listing(
     aspects: dict[str, Any],
     condition_id: str | None,
     unresolved: tuple[str, ...] = (),
+    refused_terms: tuple[str, ...] = (),
     adapter: ModelAdapter | None = None,
     provider: str | None = None,
     model: str | None = None,
@@ -109,6 +115,7 @@ def draft_listing(
         aspects=instruction_aspects,
         condition=condition_id or "",
         max_output_tokens=budget.max_output_tokens,
+        refused_terms=tuple(refused_terms),
     )
     estimate = estimate_cost(adapter.estimate_input_tokens(request), budget, rates)
     check(budget, spent, estimate)
@@ -141,8 +148,7 @@ def draft_listing(
 
     finalize_call(
         conn, call_id,
-        status=CallStatus.PARSE_FAILED if draft.malformed and not draft.title
-        else CallStatus.COMPLETED,
+        status=completion_status(bool(draft.title) or not draft.malformed),
         input_tokens=result.usage.input_tokens, output_tokens=result.usage.output_tokens,
         cost_micros=rates.cost_micros(result.usage.input_tokens, result.usage.output_tokens),
         latency_ms=result.latency_ms, response=result.raw_response,
@@ -336,7 +342,7 @@ def repair_draft(
     )
     finalize_call(
         conn, call_id,
-        status=CallStatus.COMPLETED if review.ok else CallStatus.PARSE_FAILED,
+        status=completion_status(review.ok),
         input_tokens=result.usage.input_tokens,
         output_tokens=result.usage.output_tokens,
         cost_micros=rates.cost_micros(result.usage.input_tokens, result.usage.output_tokens),

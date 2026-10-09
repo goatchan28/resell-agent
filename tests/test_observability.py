@@ -211,3 +211,58 @@ def test_nothing_reads_the_new_columns_back():
         source = inspect.getsource(module)
         assert "strategy_prices_json" not in source
         assert "round_detail" not in source
+
+
+# --- a call we could not read is not a call that worked -----------------------
+#
+# MP-000057's `research_plan` returned a literal `<parameter name="lookups">` tag
+# inside a JSON string. The parser could not read it, the round correctly stopped
+# and recorded nothing, and the ledger filed the call as `completed`. The audit
+# trail therefore said the stage had run and produced a usable result, when what
+# had happened was that we were billed for an unreadable answer.
+
+
+def test_an_unusable_response_is_recorded_as_a_parse_failure():
+    from resell.reasoning.ledger import CallStatus, completion_status
+
+    assert completion_status(True) is CallStatus.COMPLETED
+    assert completion_status(False) is CallStatus.PARSE_FAILED
+
+
+def test_a_parse_failure_is_still_billable():
+    """The provider answered and charged for it. `PARSE_FAILED` says we could not
+    use the answer, not that we were not billed -- so the budget guard must keep
+    counting it."""
+    from resell.reasoning.ledger import BILLABLE_STATUSES, CallStatus
+
+    assert CallStatus.PARSE_FAILED in BILLABLE_STATUSES
+
+
+def test_no_stage_hands_the_ledger_an_unconditional_success():
+    """The rule, enforced where it can be checked rather than trusted.
+
+    Every site that finalises a call the provider *answered* must derive its
+    status from whether the response parsed. A literal `CallStatus.COMPLETED`
+    means the site decided the answer was usable without looking at it, which is
+    exactly what the research loop did.
+    """
+    import ast
+    import pathlib
+
+    offenders = []
+    for path in pathlib.Path("src/resell").rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and getattr(node.func, "id", None) == "finalize_call"):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "status":
+                    continue
+                value = keyword.value
+                # `CallStatus.COMPLETED` written out as an attribute access, with
+                # no conditional around it.
+                if (isinstance(value, ast.Attribute)
+                        and value.attr == "COMPLETED"):
+                    offenders.append(f"{path}:{value.lineno}")
+    assert offenders == []

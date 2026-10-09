@@ -42,6 +42,28 @@ BILLABLE_STATUSES = (
 )
 
 
+def completion_status(usable: bool) -> CallStatus:
+    """The status for a call the provider answered: did we get anything out of it?
+
+    One function so the question is asked the same way everywhere, because one
+    stage asked it differently and the difference was invisible. MP-000057's
+    `research_plan` returned a literal `<parameter name="lookups">` tag inside a
+    JSON string; the parser could not read it, the round correctly stopped and
+    recorded nothing, and the ledger filed the call as **`completed`**. The audit
+    trail therefore said a stage had run and produced a usable result, while what
+    had actually happened was that we were billed for an unreadable answer.
+
+    The rule it broke: the ledger records what the provider did *and* whether we
+    could use it. Those are two different facts and only the first is about the
+    provider. `PARSE_FAILED` is billable, so nothing about cost accounting changes
+    -- what changes is that a stage can no longer report health it did not have.
+
+    Never call this with a literal. If a call site knows the answer without
+    looking, it is not asking the question.
+    """
+    return CallStatus.COMPLETED if usable else CallStatus.PARSE_FAILED
+
+
 def begin_call(
     conn: sqlite3.Connection,
     sku: str,
@@ -116,12 +138,19 @@ STAGE_LABELS: dict[str, str] = {
     "draft_repair": "repairing the listing copy",
     "map_aspects": "filling in the item's details",
     "draft": "writing the listing",
-    "research_plan": "identification research: planning",
-    "research_extract": "identification research: reading pages",
-    "research_match": "identification research: judging matches",
-    "comp_plan": "comp research: planning",
-    "comp_extract": "comp research: reading listings",
-    "comp_judge": "comp research: judging comparables",
+    # --- retired stages, kept because the rows they wrote are still here -------
+    #
+    # Nothing writes these purposes any more: identification and pricing are both
+    # deterministic now. But 57 items carry calls under them, and an ops view that
+    # rendered a raw purpose string for every historical row would be reporting the
+    # deletion rather than the item. The ledger is append-only and the past is not
+    # rewritten, so the vocabulary for reading it back has to outlive the stage.
+    "research_plan": "identification research: planning (retired)",
+    "research_extract": "identification research: reading pages (retired)",
+    "research_match": "identification research: judging matches (retired)",
+    "comp_plan": "comp research: planning (retired)",
+    "comp_extract": "comp research: reading listings (retired)",
+    "comp_judge": "comp research: judging comparables (retired)",
 }
 
 # Stages that reach a marketplace API rather than a model. eBay's Taxonomy,

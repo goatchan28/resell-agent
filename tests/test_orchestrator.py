@@ -48,11 +48,11 @@ def with_photo(conn, gateway, sku):
     )
 
 
-def with_observation(conn, sku):
+def with_observation(conn, sku, text="a red speaker"):
     conn.execute(
         "INSERT INTO evidence (sku, kind, source, payload, send_to_model, "
         "recorded_at, basis, subject) VALUES (?,?,?,?,1,?,?,'this_item')",
-        (sku, "vision_observation", "fake/m", json.dumps({"claim": "a red speaker"}),
+        (sku, "vision_observation", "fake/m", json.dumps({"claim": text}),
          db.now_iso(), "visual_observation"),
     )
     conn.commit()
@@ -281,6 +281,10 @@ class FakeRunner:
             with_observation(conn, sku)
         elif step is Step.SUGGEST_CATEGORY:
             gateway.propose_identification(sku, category_id="111694")
+        elif step is Step.RESEARCH_IDENTITY:
+            from resell.reasoning.identity import run_identity_round
+
+            run_identity_round(conn, gateway, sku)
         elif step is Step.MAP_ASPECTS:
             from resell.cli_item import merged_identification
 
@@ -311,7 +315,8 @@ def test_advance_runs_the_agent_steps_in_order(tmp_path):
 
     assert runner.ran == [
         Step.START_IDENTIFICATION, Step.OBSERVE, Step.SUGGEST_CATEGORY,
-        Step.MAP_ASPECTS, Step.GRADE_CONDITION, Step.DRAFT,
+        Step.RESEARCH_IDENTITY, Step.MAP_ASPECTS, Step.GRADE_CONDITION,
+        Step.DRAFT,
     ]
     # Research never resolved this fixture to a product, so the agent stops and
     # asks rather than spending a pricing budget on a guess. MP-000013 went
@@ -336,27 +341,49 @@ def test_a_confirmed_identity_lets_pricing_begin(tmp_path):
     assert report.stopped_at.step is Step.COMP_RESEARCH
 
 
-def test_a_resolved_identity_is_not_rubber_stamped(tmp_path):
+def test_a_supported_identification_is_not_rubber_stamped(tmp_path):
     """Stopping on an identification the agent can defend would be asking the
-    operator to approve work that already carries its own evidence."""
+    operator to approve work that already carries its own evidence.
+
+    MP-000059 and MP-000060 were both asked, and neither was ambiguous: a Swingline
+    stapler and a handmade crocheted footbag, each with a mode the gate had already
+    accepted. The seam was reading `RESOLVED`, which is held closed."""
     from resell.orchestrator import identity_needs_confirming
 
     conn, gateway, sku = fixture(tmp_path)
     with_photo(conn, gateway, sku)
+    gateway.begin_identification(sku)
+    with_observation(conn, sku)
+    gateway.propose_identification(sku, category_id="111694", title="A stapler")
     needs, why = identity_needs_confirming(conn, sku)
-    assert needs and "could not pin down" in why
+    assert needs and "could not work out what this is" in why
 
     conn.execute(
-        "INSERT INTO product_match (sku, candidate_ref, is_match, strength, "
-        "source_authority, donation_scope, created_at, rationale, "
-        "item_evidence, candidate_evidence) VALUES (?,?,1,?,?,?,?,?,?,?)",
-        (sku, "cand-1", "identifier_verified", "manufacturer", "attributes",
-         db.now_iso(), "matched", "[1]", "[2]"),
+        "UPDATE identification SET mode = 'described_object' "
+        "WHERE sku = ? AND superseded_at IS NULL", (sku,),
     )
     conn.commit()
     needs, why = identity_needs_confirming(conn, sku)
     assert not needs
-    assert "resolved this to a specific product" in why
+    assert "described_object" in why
+
+
+def test_an_unresolved_mode_is_still_a_question(tmp_path):
+    """The narrow case that remains: the record earns nothing, so nothing the
+    agent drafted rests on a supported identification."""
+    from resell.orchestrator import identity_needs_confirming
+
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+    gateway.begin_identification(sku)
+    with_observation(conn, sku)
+    gateway.propose_identification(sku, category_id="111694", title="A thing")
+    conn.execute(
+        "UPDATE identification SET mode = 'unresolved' "
+        "WHERE sku = ? AND superseded_at IS NULL", (sku,),
+    )
+    conn.commit()
+    assert identity_needs_confirming(conn, sku)[0] is True
 
 
 def test_advance_stops_at_a_question_without_running_anything(tmp_path):
@@ -575,37 +602,52 @@ def test_research_is_warranted_when_identity_is_open_and_there_is_a_code(tmp_pat
     assert "A3211" in why
 
 
-def test_research_is_skipped_when_there_is_nothing_to_search_for(tmp_path):
-    """A brand alone returns the catalogue, not this object."""
+def test_a_brand_alone_still_runs_the_round_but_searches_for_nothing(tmp_path):
+    """A brand alone returns the catalogue, not this object -- so no lookup. But
+    the round still runs: `branded_generic` is a conclusion, and the old gate
+    skipped the round entirely, which left every such item `unresolved` by
+    default rather than by decision."""
     from resell.orchestrator import research_warranted
+    from resell.reasoning.identity import tier_for
 
     conn, gateway, sku = identified(tmp_path)
+    gateway.propose_identification(sku, brand="Beats by Dr. Dre")
     warranted, why = research_warranted(conn, sku)
-    assert not warranted
-    assert "nothing distinctive enough" in why
+    assert warranted
+    assert "tier 1" in why
+    assert not tier_for(conn, sku).searches
 
 
 def test_a_serial_number_is_not_something_to_search_for(tmp_path):
     """It identifies one physical unit. A lookup on it cannot succeed."""
-    from resell.orchestrator import identifying_evidence
+    from resell.reasoning.identity import strong_identifiers, tier_for
 
     conn, gateway, sku = identified(tmp_path)
     with_identifier(conn, sku, scheme="serial", value="FK4HQR32390")
-    assert identifying_evidence(conn, sku) == ()
+    assert strong_identifiers(conn, sku) == ()
+    assert not tier_for(conn, sku).searches
 
 
-def test_a_brand_and_model_pair_is_enough_without_any_code(tmp_path):
-    from resell.orchestrator import identifying_evidence
+def test_the_brand_joins_the_query_when_a_code_was_read(tmp_path):
+    """A brand is not a search on its own; it is what disambiguates one. `17070`
+    is ambiguous across every manufacturer that ever numbered a product."""
+    from resell.reasoning.identity import best_identifier, query_for, tier_for
 
     conn, gateway, sku = identified(tmp_path)
-    gateway.propose_identification(sku, brand="Bowflex", model="SelectTech 552")
-    assert any("Bowflex SelectTech 552" in e for e in identifying_evidence(conn, sku))
+    with_identifier(conn, sku, scheme="model_number", value="SelectTech 552")
+    gateway.propose_identification(sku, brand="Bowflex")
+    tier = tier_for(conn, sku)
+    assert tier.searches
+    assert query_for(tier.brand, best_identifier(tier.identifiers)) == (
+        "Bowflex SelectTech 552"
+    )
 
 
-def test_research_is_skipped_once_identity_is_resolved(tmp_path):
-    """An exact catalogue match leaves nothing to look up."""
-    from resell.orchestrator import research_warranted
-    from resell.pricing.comps import Comparability
+def test_one_donating_match_resolves_the_identity(tmp_path):
+    """The original rule, unchanged: an identifier-strength match from a source
+    good enough to donate."""
+    from resell.reasoning.research_loop import identity_resolution
+    from resell.reasoning.schema import IdentityResolution
 
     conn, gateway, sku = identified(tmp_path)
     with_identifier(conn, sku)
@@ -613,30 +655,27 @@ def test_research_is_skipped_once_identity_is_resolved(tmp_path):
         "INSERT INTO product_match (sku, candidate_ref, strength, source_authority, "
         "rationale, item_evidence, candidate_evidence, is_match, donation_scope, "
         "created_at) VALUES (?,?,?,?,?,?,?,1,?,?)",
-        (sku, "cand-1", "identifier_verified", "manufacturer", "matched",
+        (sku, "beatsbydre.com", "identifier_verified", "manufacturer", "matched",
          "[]", "[]", "attributes", db.now_iso()),
     )
     conn.commit()
-    warranted, why = research_warranted(conn, sku)
-    assert not warranted
-    assert "already resolved" in why
+    assert identity_resolution(conn, sku) is IdentityResolution.RESOLVED
 
 
-def test_research_is_not_repeated_against_an_unchanged_record(tmp_path):
-    """Re-planning produces the same plan and charges for it again."""
+def test_the_round_is_not_repeated_once_a_mode_has_been_declared(tmp_path):
+    """The round is deterministic, so running it twice against an unchanged record
+    produces the same answer and spends a second lookup to get it."""
     from resell.orchestrator import research_warranted
 
     conn, gateway, sku = identified(tmp_path)
     with_identifier(conn, sku)
-    conn.execute(
-        "INSERT INTO model_call (sku, purpose, provider, model, called_at, status, "
-        "cost_micros) VALUES (?,?,?,?,?,?,?)",
-        (sku, "research_plan", "anthropic", "m", db.now_iso(), "completed", 1000),
-    )
+    assert research_warranted(conn, sku)[0]
+    db.log_event(conn, "identification.mode_declared", {"accepted": "product_family"},
+                 item_id=sku)
     conn.commit()
     warranted, why = research_warranted(conn, sku)
     assert not warranted
-    assert "already researched once" in why
+    assert "already been declared" in why
 
 
 def test_the_orchestrator_offers_research_before_aspect_mapping(tmp_path):
@@ -655,20 +694,32 @@ def test_the_orchestrator_offers_research_before_aspect_mapping(tmp_path):
 
 def test_research_is_the_agents_and_never_the_operators(tmp_path):
     """The product rule: the operator does not trigger research."""
-    conn, gateway, sku = identified(tmp_path)
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+    gateway.begin_identification(sku)
+    with_observation(conn, sku)
     with_identifier(conn, sku)
-    assert next_step(conn, sku).actor is Actor.AGENT
+    gateway.propose_identification(sku, category_id="111694")
+    step = next_step(conn, sku)
+    assert step.step is Step.RESEARCH_IDENTITY
+    assert step.actor is Actor.AGENT
     from resell.orchestrator import StageRunner
 
     assert hasattr(StageRunner, "_research_identity")
 
 
-def test_an_item_with_no_identifier_goes_straight_on_to_mapping(tmp_path):
+def test_an_item_with_no_identifier_declares_its_mode_then_maps(tmp_path):
+    """Even with nothing to search for. `described_object` is the conclusion for
+    most household objects, and it has to be reached rather than defaulted to."""
+    from resell.reasoning.identity import run_identity_round
+
     conn, gateway, sku = fixture(tmp_path)
     with_photo(conn, gateway, sku)
     gateway.begin_identification(sku)
     with_observation(conn, sku)
     gateway.propose_identification(sku, category_id="111694", title="A speaker")
+    assert next_step(conn, sku).step is Step.RESEARCH_IDENTITY
+    run_identity_round(conn, gateway, sku)
     assert next_step(conn, sku).step is Step.MAP_ASPECTS
 
 
@@ -751,15 +802,27 @@ def test_resolved_brand_and_model_reach_the_columns(tmp_path):
     ) == {"brand": "Bowflex", "model": "SelectTech 552"}
 
 
-def test_the_columns_make_research_warranted_on_a_branded_line(tmp_path):
-    """The end of it: an item like MP-000009 becomes researchable."""
-    from resell.orchestrator import identifying_evidence, research_warranted
+def test_a_model_an_observation_names_is_searchable(tmp_path):
+    """The end of MP-000009: a model somebody read off the object reaches tier 2
+    even though it was written down on the identification rather than as an
+    identifier observation."""
+    from resell.reasoning.identity import tier_for
+
+    conn, gateway, sku = identified(tmp_path)
+    with_observation(conn, sku, text="The base is printed SelectTech 552.")
+    gateway.propose_identification(sku, brand="Bowflex", model="SelectTech 552")
+    tier = tier_for(conn, sku)
+    assert tier.tier == 2
+    assert tier.identifiers[0].normalized == "SelectTech 552"
+
+
+def test_a_model_nothing_observed_is_an_inference_and_stays_at_tier_one(tmp_path):
+    """It was inferred rather than read, so there is nothing to cite for it."""
+    from resell.reasoning.identity import tier_for
 
     conn, gateway, sku = identified(tmp_path)
     gateway.propose_identification(sku, brand="Bowflex", model="SelectTech 552")
-    assert any("Bowflex SelectTech 552" in e for e in identifying_evidence(conn, sku))
-    warranted, _ = research_warranted(conn, sku)
-    assert warranted
+    assert tier_for(conn, sku).tier == 1
 
 
 # --- who finds the comparables ----------------------------------------------------
@@ -886,14 +949,45 @@ def test_a_step_that_genuinely_stalls_is_still_an_error(tmp_path, monkeypatch):
 # --- a spent budget ends the stage; it does not re-arm it -------------------------
 
 
-def spend_comp_plan(conn, sku, calls=3):
-    """Burn the planning budget the way three real rounds did."""
-    for _ in range(calls):
+def spend_comp_lookups(conn, sku, searches=6):
+    """Burn the pricing search allowance the way real rounds do.
+
+    This used to burn a `comp_plan` model budget, which is how the stage ran out
+    when planning was a model call. Planning is deterministic now and `comp_plan`
+    no longer exists, so counting it counted zero forever -- which is one of the
+    two reasons MP-000061 could be told to "look again" four times.
+    """
+    for n in range(searches):
         conn.execute(
-            "INSERT INTO model_call (sku, purpose, provider, model, status, "
-            "called_at, estimated_cost_micros) VALUES (?,?,?,?,?,?,?)",
-            (sku, "comp_plan", "fake", "m", "completed", db.now_iso(), 1000),
+            "INSERT INTO research_lookup (sku, scope, provider, query, motivation, "
+            "evidence_ids, result_count, performed_at) "
+            "VALUES (?, 'pricing', 'brave', ?, 'comp research', '[]', 0, ?)",
+            (sku, f"a spent search {n}", db.now_iso()),
         )
+    conn.commit()
+
+
+def concluded_completely(conn, sku, *, usable=0):
+    """A round that closed the stage with its retrieval intact."""
+    from resell.orchestrator import COMP_RESEARCH_CONCLUDED
+
+    db.log_event(conn, COMP_RESEARCH_CONCLUDED, {
+        "reason": "4 search(es) found nothing usable", "searches": 4,
+        "candidates": 0, "claims": 24, "usable": usable, "sufficient": False,
+        "retrieval_complete": True,
+    }, item_id=sku)
+    conn.commit()
+
+
+def concluded_incompletely(conn, sku):
+    """A round that closed without its searches ever running."""
+    from resell.orchestrator import COMP_RESEARCH_CONCLUDED
+
+    db.log_event(conn, COMP_RESEARCH_CONCLUDED, {
+        "reason": "no search backend was configured", "searches": 0,
+        "candidates": 0, "claims": 0, "usable": 0, "sufficient": False,
+        "retrieval_complete": False,
+    }, item_id=sku)
     conn.commit()
 
 
@@ -904,7 +998,7 @@ def test_an_exhausted_comp_budget_does_not_send_the_item_back_to_searching(tmp_p
     Forever."""
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku)
+    spend_comp_lookups(conn, sku)
 
     first = next_step(conn, sku)
     assert first.step is Step.COMP_RESEARCH      # one last visit, to close it out
@@ -918,7 +1012,7 @@ def test_carrying_on_from_an_exhausted_budget_advances(tmp_path, monkeypatch):
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     monkeypatch.setenv("BRAVE_API_KEY", "test")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku)
+    spend_comp_lookups(conn, sku)
 
     searched = []
     monkeypatch.setattr(
@@ -941,7 +1035,7 @@ def test_the_conclusion_is_recorded_explicitly(tmp_path, monkeypatch):
 
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku)
+    spend_comp_lookups(conn, sku)
     advance(conn, gateway, sku, max_steps=4)
 
     assert comp_research_concluded(conn, sku)
@@ -958,7 +1052,7 @@ def test_the_conclusion_is_recorded_explicitly(tmp_path, monkeypatch):
 def test_the_stage_is_concluded_once_however_often_it_is_visited(tmp_path, monkeypatch):
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku)
+    spend_comp_lookups(conn, sku)
     for _ in range(3):
         advance(conn, gateway, sku, max_steps=4)
 
@@ -973,7 +1067,7 @@ def test_an_item_with_budget_left_still_searches(tmp_path, monkeypatch):
     """The guard must not turn into a reason never to research anything."""
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku, calls=1)
+    spend_comp_lookups(conn, sku, searches=1)
 
     step = next_step(conn, sku)
     assert step.step is Step.COMP_RESEARCH
@@ -986,7 +1080,7 @@ def test_comps_that_did_arrive_still_take_precedence(tmp_path, monkeypatch):
     item prices normally."""
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku)
+    spend_comp_lookups(conn, sku)
     sp.record_comp_observation(conn, CompObservation(
         comp_id="c1", marketplace="ebay.com", external_id="1",
         price_kind=PriceKind.ASKING, basis=CompBasis.ACTIVE_SIMILAR,
@@ -1003,15 +1097,15 @@ def test_comps_that_did_arrive_still_take_precedence(tmp_path, monkeypatch):
     assert step.step is not Step.COMP_RESEARCH
 
 
-def test_a_grant_lets_research_resume(tmp_path, monkeypatch):
+def test_a_grant_lets_research_resume_when_it_never_actually_searched(tmp_path, monkeypatch):
     """The conclusion records what happened; it must not become a permanent ban.
-    Reopening is the grant, because that is the thing with a button behind it."""
+    Reopening is the grant, because that is the thing with a button behind it --
+    and this is the case it is for: the searches never ran."""
     from resell.orchestrator import grant_more_research
 
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku)
-    advance(conn, gateway, sku, max_steps=4)
+    concluded_incompletely(conn, sku)
     assert next_step(conn, sku).step is Step.PRICE_WITHOUT_COMPS
 
     grant_more_research(conn, sku)
@@ -1021,6 +1115,43 @@ def test_a_grant_lets_research_resume(tmp_path, monkeypatch):
     assert "searching the marketplaces" in resumed.detail
 
 
+def test_a_grant_after_a_complete_round_cannot_search_again(tmp_path, monkeypatch):
+    """MP-000061 was granted three times. Pricing asks a fixed list of queries, so
+    every extra round asked the same four questions of the same index and logged
+    twenty-four lines of "already recorded" -- twelve Brave calls that could not
+    have changed anything."""
+    from resell.orchestrator import comp_research_exhausted, grant_more_research
+
+    monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
+    conn, gateway, sku = priced_and_unclaimed(tmp_path)
+    concluded_completely(conn, sku)
+
+    grant_more_research(conn, sku)
+    spent, why = comp_research_exhausted(conn, sku)
+    assert spent
+    assert "already run" in why
+    # The routing still pays one visit to close the stage out again -- what it must
+    # not do is search, and the card says so rather than promising a hunt.
+    step = next_step(conn, sku)
+    assert "spent" in step.detail
+    assert "searching the marketplaces" not in step.detail
+
+
+def test_the_two_kinds_of_empty_are_told_apart(tmp_path, monkeypatch):
+    """"We looked and there is nothing" closes the stage; "we could not look" must
+    not. Only the first makes looking again pointless."""
+    from resell.orchestrator import comp_research_exhausted
+
+    monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
+    conn, gateway, sku = priced_and_unclaimed(tmp_path)
+    concluded_incompletely(conn, sku)
+    assert comp_research_exhausted(conn, sku)[0] is False
+
+    conn2, gateway2, sku2 = priced_and_unclaimed(tmp_path / "b")
+    concluded_completely(conn2, sku2)
+    assert comp_research_exhausted(conn2, sku2)[0] is True
+
+
 def test_raising_the_env_budget_does_not_reopen_a_concluded_item(tmp_path, monkeypatch):
     """Two mechanisms that both reopen is how the loop came back: a grant would
     reopen, the round would find nothing, the conclusion would land, and a
@@ -1028,7 +1159,7 @@ def test_raising_the_env_budget_does_not_reopen_a_concluded_item(tmp_path, monke
     environment sets the base allowance; the grant reopens one item."""
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku)
+    spend_comp_lookups(conn, sku)
     advance(conn, gateway, sku, max_steps=4)
 
     monkeypatch.setenv("RESELL_BUDGET_COMP_RESEARCH_MAX_CALLS", "10")
@@ -1044,8 +1175,10 @@ def test_a_granted_attempt_that_finds_nothing_concludes_again(tmp_path, monkeypa
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     monkeypatch.setenv("BRAVE_API_KEY", "test")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku)
-    advance(conn, gateway, sku, max_steps=4)
+    # Incomplete, so the grant genuinely buys an attempt. A grant after a *complete*
+    # round buys nothing and is refused before it runs -- that is
+    # `test_a_grant_after_a_complete_round_cannot_search_again`.
+    concluded_incompletely(conn, sku)
     grant_more_research(conn, sku)
     assert next_step(conn, sku).step is Step.COMP_RESEARCH
 
@@ -1090,8 +1223,8 @@ def test_a_grant_reopens_research_for_one_item_only(tmp_path, monkeypatch):
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
     other = gateway.ingest_item(purchase_cost_cents=500).sku
-    spend_comp_plan(conn, sku)
-    spend_comp_plan(conn, other)
+    spend_comp_lookups(conn, sku)
+    spend_comp_lookups(conn, other)
 
     grant_more_research(conn, sku)
 
@@ -1182,7 +1315,7 @@ def test_a_priced_item_leaves_the_blocked_step(tmp_path, monkeypatch):
 
     monkeypatch.setenv("RESELL_SEARCH_BACKEND", "brave")
     conn, gateway, sku = priced_and_unclaimed(tmp_path)
-    spend_comp_plan(conn, sku)
+    spend_comp_lookups(conn, sku)
     advance(conn, gateway, sku, max_steps=4)
     assert next_step(conn, sku).step is Step.PRICE_WITHOUT_COMPS
 
@@ -1199,3 +1332,146 @@ def test_a_priced_item_leaves_the_blocked_step(tmp_path, monkeypatch):
     moved = next_step(conn, sku)
     assert moved.step is not Step.PRICE_WITHOUT_COMPS
     assert moved.step is not Step.COMP_RESEARCH
+
+
+# --- the run reaches a decision without asking to be nudged --------------------
+
+
+def test_the_bound_clears_the_whole_agent_chain(tmp_path):
+    """MP-000062 ran eight steps, stopped one short of the comparables, and asked
+    its owner to press "Carry on" for a stop that meant nothing.
+
+    The chain is what it is; the bound has to clear it. Asserted against the real
+    step sequence rather than a number, so adding a stage fails here instead of
+    surfacing as an unexplained button."""
+    from resell.orchestrator import MAX_AGENT_STEPS
+
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+    runner = FakeRunner(gateway)
+    report = advance(conn, gateway, sku, runner=runner)
+
+    assert not report.exhausted, (
+        f"the run hit its {MAX_AGENT_STEPS}-step bound after {len(runner.ran)} "
+        f"steps: {[str(s) for s in runner.ran]}"
+    )
+    assert next_step(conn, sku).actor is Actor.OPERATOR, (
+        "a run should stop because a person is needed, not because it ran out of "
+        "permission to keep going"
+    )
+
+
+def test_the_bound_still_bounds(tmp_path):
+    """It is a spin guard, so it must still stop something that never settles."""
+    class Spinner:
+        ran = []
+
+        def run(self, conn, gateway, sku, step):
+            return "did nothing at all"
+
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+    report = advance(conn, gateway, sku, runner=Spinner(), max_steps=3)
+    assert report.errors or report.exhausted
+
+
+def test_reaching_the_bound_is_recorded_rather_than_silent(tmp_path):
+    """Nothing anywhere said the bound had been reached, so it arrived at the
+    operator as a button with no reason behind it."""
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+    # Every step progresses; there are simply more of them than the bound allows.
+    report = advance(conn, gateway, sku, runner=FakeRunner(gateway), max_steps=2)
+    assert report.exhausted is True
+    assert report.errors == [], "the bound is not a fault of the item's"
+
+
+# --- a rejected sample is not a verdict ---------------------------------------
+
+
+def test_a_stage_that_produces_nothing_usable_is_tried_again(tmp_path):
+    """MP-000063's aspect mapping proposed `Material: Wood` for a crocheted wool
+    ball. The citation gate correctly discarded it -- and every other candidate
+    with it -- so the item was exactly where it started and the run died. Its
+    owner pressed Retry, the same call proposed `Wool`, and it went through.
+
+    The provider answered and nothing raised; what failed was validation, and the
+    next sample is drawn fresh. That retry was ours to make."""
+    class OnceUseless:
+        """Produces nothing the first time, then works -- like a resampled call."""
+
+        def __init__(self, gateway):
+            self.gateway, self.calls, self.ran = gateway, 0, []
+
+        def run(self, conn, gateway, sku, step):
+            self.ran.append(step)
+            if step is Step.START_IDENTIFICATION:
+                gateway.begin_identification(sku)
+                return "started"
+            if step is Step.OBSERVE:
+                self.calls += 1
+                if self.calls == 1:
+                    return "0 observation(s)"      # ran clean, nothing survived
+                with_observation(conn, sku)
+                return "1 observation(s)"
+            if step is Step.SUGGEST_CATEGORY:
+                gateway.propose_identification(sku, category_id="111694")
+                return "category 111694"
+            return "done"
+
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+    runner = OnceUseless(gateway)
+    report = advance(conn, gateway, sku, runner=runner, max_steps=3)
+
+    assert runner.calls == 2, "the useless sample should have been drawn again"
+    assert report.errors == [], f"the retry fixed it: {report.errors}"
+    assert any("nothing it produced survived validation" in r for r in report.retried)
+
+
+def test_a_stage_useless_twice_still_stops_the_run(tmp_path):
+    """The anti-spin guard survives: a retry is one more sample, not a licence to
+    keep drawing."""
+    class AlwaysUseless:
+        def __init__(self, gateway):
+            self.gateway, self.calls = gateway, 0
+
+        def run(self, conn, gateway, sku, step):
+            if step is Step.START_IDENTIFICATION:
+                gateway.begin_identification(sku)
+                return "started"
+            self.calls += 1
+            return "0 observation(s)"
+
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+    runner = AlwaysUseless(gateway)
+    report = advance(conn, gateway, sku, runner=runner, max_steps=6)
+
+    assert runner.calls == 2, "twice, not forever"
+    assert any("still needs it" in e for e in report.errors)
+
+
+def test_an_ordinary_halt_is_not_retried(tmp_path):
+    """A budget reached or a backend absent is a guard, not a bad sample. Drawing
+    again would meet the same guard and spend money to find out."""
+    from resell.orchestrator import STOPPED_MARKER
+
+    class Halting:
+        def __init__(self, gateway):
+            self.gateway, self.calls = gateway, 0
+
+        def run(self, conn, gateway, sku, step):
+            if step is Step.START_IDENTIFICATION:
+                gateway.begin_identification(sku)
+                return "started"
+            self.calls += 1
+            return f"{STOPPED_MARKER} this item's search budget"
+
+    conn, gateway, sku = fixture(tmp_path)
+    with_photo(conn, gateway, sku)
+    runner = Halting(gateway)
+    report = advance(conn, gateway, sku, runner=runner, max_steps=6)
+
+    assert runner.calls == 1, "a guard is an answer; asking again costs money"
+    assert report.halts and not report.errors

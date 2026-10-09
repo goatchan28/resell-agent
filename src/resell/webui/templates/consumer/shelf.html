@@ -11,7 +11,7 @@
         <a class="c-card-link" href="{{ url_for('item', sku=row.sku) }}">
           <span class="c-card-shot">
             {% if row.photo_position is not none %}
-              <img src="{{ url_for('photo', sku=row.sku, position=row.photo_position) }}"
+              <img src="{{ url_for('photo', sku=row.sku, position=row.photo_position, size='thumb') }}"
                    alt="" loading="lazy">
             {% endif %}
           </span>

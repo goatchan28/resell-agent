@@ -2941,6 +2941,39 @@ def test_identifier_contract_demands_structured_capture():
     assert "Style codes, product codes" in OBSERVE_SYSTEM_PROMPT
 
 
+def test_a_legible_brand_is_captured_the_same_way_a_code_is():
+    """Brands were described in prose and structured only by accident -- 53 marks
+    across the whole history, emitted when the model happened to feel like it,
+    because the contract named codes and never named brands. 21 of the 25 items
+    that stopped to ask "is this your product?" already carried an unambiguous
+    brand in their observations."""
+    from resell.reasoning.stages import OBSERVE_SYSTEM_PROMPT
+    from resell.reasoning.tools import OBSERVE_TOOL_SCHEMA
+
+    description = OBSERVE_TOOL_SCHEMA["input_schema"]["properties"]["identifiers"]["description"]
+    assert "maker's mark" in description
+    assert "brand name" in description
+
+    assert "with scheme `makers_mark`" in OBSERVE_SYSTEM_PROMPT
+    # Read, never recognised. A logo the model knows but cannot read is an
+    # inference about the object, and inferences do not become identifiers.
+    assert "a brand you recognised is not a brand you read" in OBSERVE_SYSTEM_PROMPT
+    # The exclusions come from the two real values that reached a live query:
+    # `MADE IN EGYPT` and `BROOKS BROTHERS EXPLORER SLIM`.
+    assert "not the product line printed beside it" in OBSERVE_SYSTEM_PROMPT
+    assert "not the country" in OBSERVE_SYSTEM_PROMPT
+
+
+def test_a_brand_never_becomes_something_to_search_for():
+    """Making brands identifiers must not make them *searchable* identifiers: a
+    maker's mark is a brand, which is tier 1, and a tier-2 query built on one
+    would search the catalogue instead of the object."""
+    from resell.reasoning.identity import STRONG_SCHEMES
+    from resell.reasoning.schema import IdentifierScheme
+
+    assert IdentifierScheme.MAKERS_MARK not in STRONG_SCHEMES
+
+
 def test_parser_is_total_against_malformed_tool_output(tmp_path: Path):
     """Regression from a real run: the model returned `observations` as a list of
     strings rather than objects, and the parser raised TypeError. It guarded
@@ -3078,6 +3111,40 @@ def _ledger_setup(tmp_path: Path, monkeypatch):
     conn = db.connect(tmp_path / "ledger.db")
     sku = Gateway(conn, environment="sandbox").ingest_item(purchase_cost_cents=None).sku
     return conn, sku, [photo]
+
+
+def test_observing_stores_how_hard_it_looked_for_an_identity(tmp_path: Path, monkeypatch):
+    """`branded_generic` and `described_object` both assert that no product identity
+    is discoverable, and `mode_is_supported` requires a cited negative finding for
+    exactly that reason. `observe` produces one on every item.
+
+    It used to be persisted by `cli_item` and nowhere else, so the orchestrator --
+    the path every phone-processed item takes -- parsed the finding, validated it
+    and dropped it. The two commonest honest outcomes were unreachable through the
+    web UI, and each fell back to `unresolved`.
+    """
+    from resell.reasoning.budget import StageBudget
+    from resell.reasoning.research_loop import db_kv_negative
+    from resell.reasoning.vision import observe_and_record
+
+    conn, sku, photos = _ledger_setup(tmp_path, monkeypatch)
+    adapter = _LedgerAdapter(tool_input={
+        "observations": [{"claim": "a black stapler", "basis": "visual_observation",
+                          "photo_positions": [1]}],
+        "identity_search": {
+            "photos_reviewed": 3,
+            "surfaces_examined": ["top surface", "underside", "staple channel"],
+            "note": "no model number is legible on any surface",
+        },
+    })
+    observe_and_record(
+        conn, sku, photos, cache_dir=tmp_path, adapter=adapter,
+        budget=StageBudget(max_calls=9, max_cost_micros=1_000_000),
+    )
+
+    stored = db_kv_negative(conn, sku)
+    assert stored["photos_reviewed"] == 3
+    assert "staple channel" in stored["surfaces_examined"]
 
 
 def test_a_paid_call_survives_a_parse_failure(tmp_path: Path, monkeypatch):
@@ -3516,9 +3583,13 @@ def test_mapping_distinguishes_ambiguity_from_contradiction(tmp_path: Path):
     assert resolved.resolution is Resolution.RESOLVED
     assert resolved.value == "Navy"
 
+    # Two *observations* that disagree. Both readings, disjoint evidence: that is a
+    # contradiction and only the operator can settle it. (One of these used to be
+    # an `inference`, which made it the other case entirely -- see
+    # `test_an_inference_does_not_contradict_an_observation`.)
     contradicted, _ = _map(conn, sku, {"aspects": [
         {"aspect_name": "Size", "candidates": [
-            {"value": "40R", "evidence_ids": [ids["dept"]]},
+            {"value": "40R", "evidence_ids": [ids["brand"]]},
             {"value": "38R", "evidence_ids": [ids["navy"]]},
         ]},
     ]})
@@ -3878,32 +3949,6 @@ def test_match_claims_must_cite_both_sides():
     assert claim((42,), (7,)).problems() == []
 
 
-def test_stopping_records_searched_but_not_found():
-    """The mirror of a negative observation. An item whose identifiers were looked
-    up and matched nothing is in a different position from one nobody researched,
-    and the distinction is what lets branded_generic be declared honestly."""
-    from resell.reasoning.research import MatchStrength, ResearchState, StopReason, should_stop
-
-    achieved = should_stop(ResearchState(2, 1, MatchStrength.IDENTIFIER_VERIFIED, True, False, 3))
-    assert achieved[:2] == (True, StopReason.ACHIEVED)
-
-    # A well-supported described_object stops without searching at all.
-    not_applicable = should_stop(ResearchState(0, 0, None, False, True, 3))
-    assert not_applicable[:2] == (True, StopReason.NOT_APPLICABLE)
-
-    exhausted = should_stop(ResearchState(2, 1, MatchStrength.SIMILARITY, True, False, 0))
-    assert exhausted[:2] == (True, StopReason.EXHAUSTED)
-
-    searched = should_stop(ResearchState(6, 1, MatchStrength.SIMILARITY, True, False, 3))
-    assert searched[:2] == (True, StopReason.SEARCHED_NOT_FOUND)
-    assert "not repeated" in searched[2]
-
-    assert should_stop(ResearchState(2, 0, None, True, False, 3))[1] is StopReason.DIMINISHING
-    assert should_stop(
-        ResearchState(1, 2, MatchStrength.ATTRIBUTE_CONVERGENCE, True, False, 3)
-    )[0] is False
-
-
 def test_identity_and_retail_facts_are_separable(tmp_path: Path):
     """A product page states both what the thing is and what it costs. Those feed
     different stages under different rules — and potentially different licences."""
@@ -4107,91 +4152,6 @@ def test_prompt_forbids_least_wrong_values():
 # --- research planning -------------------------------------------------------
 
 
-def test_planner_can_conclude_that_searching_is_not_warranted():
-    """The most valuable answer is often an empty plan. "The brand is established
-    and no model number exists on any examined surface, so searching for one will
-    not find it" is a conclusion, not a failure to try."""
-    from resell.reasoning.tools import parse_plan_tool_input
-
-    plan = parse_plan_tool_input(
-        {"assessment": {
-            "sufficient": True, "proposed_mode": "branded_generic",
-            "rationale": "Brand established from the pocket label; no model number on "
-                         "any examined surface, so searching for one will not find it.",
-        }, "lookups": []},
-        valid_evidence_ids={41},
-    )
-    assert plan.sufficient is True
-    assert plan.proposed_mode == "branded_generic"
-    assert plan.lookups == []
-    assert plan.malformed == []
-
-    # A rationale is mandatory; "sufficient" without one asserts rather than argues.
-    silent = parse_plan_tool_input(
-        {"assessment": {"sufficient": True, "proposed_mode": "described_object",
-                        "rationale": ""}, "lookups": []},
-        valid_evidence_ids=set(),
-    )
-    assert any("no rationale" in entry for entry in silent.malformed)
-
-
-def test_a_lookup_without_a_motivating_observation_is_browsing():
-    from resell.reasoning.tools import parse_plan_tool_input
-
-    plan = parse_plan_tool_input(
-        {"assessment": {"sufficient": False, "proposed_mode": "unresolved",
-                        "rationale": "look around"},
-         "lookups": [{"query": "Brooks Brothers jackets", "source_kind": "general_web",
-                      "motivation": "see what is out there", "evidence_ids": []}]},
-        valid_evidence_ids={41, 42},
-    )
-    assert plan.lookups == []
-    assert any("browsing, not planning" in entry for entry in plan.malformed)
-
-    # Citing evidence that is not in scope is refused the same way.
-    forged = parse_plan_tool_input(
-        {"assessment": {"sufficient": False, "proposed_mode": "unresolved", "rationale": "r"},
-         "lookups": [{"query": "q", "source_kind": "manufacturer", "motivation": "m",
-                      "evidence_ids": [9999]}]},
-        valid_evidence_ids={41},
-    )
-    assert forged.lookups == []
-    assert any("not in scope" in entry for entry in forged.malformed)
-
-
-def test_repeat_searches_are_dropped():
-    """Searching twice for the same thing pays twice for one answer, and a loop that
-    cannot remember what it tried will do it indefinitely."""
-    from resell.reasoning.tools import parse_plan_tool_input
-
-    plan = parse_plan_tool_input(
-        {"assessment": {"sufficient": False, "proposed_mode": "product_family",
-                        "rationale": "r"},
-         "lookups": [{"query": "Brooks Brothers 100220547", "source_kind": "manufacturer",
-                      "motivation": "m", "evidence_ids": [42]}]},
-        valid_evidence_ids={42},
-        already_searched={"brooks brothers 100220547"},
-    )
-    assert plan.lookups == []
-    assert any("already performed" in entry for entry in plan.malformed)
-
-
-def test_sufficient_with_lookups_resolves_toward_searching():
-    """A contradictory assessment should not silently pick the cheaper reading."""
-    from resell.reasoning.tools import parse_plan_tool_input
-
-    plan = parse_plan_tool_input(
-        {"assessment": {"sufficient": True, "proposed_mode": "branded_generic",
-                        "rationale": "done"},
-         "lookups": [{"query": "q", "source_kind": "manufacturer", "motivation": "m",
-                      "evidence_ids": [41]}]},
-        valid_evidence_ids={41},
-    )
-    assert plan.sufficient is False
-    assert len(plan.lookups) == 1
-    assert any("treating the lookups as the intent" in entry for entry in plan.malformed)
-
-
 def test_retrieval_budget_is_separate_from_inference_budget():
     """An agent that plans cheaply and then fetches forty pages has stayed inside its
     inference budget and spent real money."""
@@ -4231,59 +4191,6 @@ def test_lookup_scopes_do_not_share_an_allowance():
     assert pricing.scope == "pricing"
 
 
-def test_research_adapters_exclude_ebay_until_licensing_is_settled():
-    """eBay's agreement restricts ingesting Restricted API data into a third-party
-    AI without written consent, and their user agreement prohibits LLM-driven
-    scraping of the site. Nothing here may depend on a Catalog adapter."""
-    from resell.reasoning.adapters.research import ADAPTERS, get_research_adapter, ResearchError
-
-    assert "ebay_catalog" not in ADAPTERS
-    assert "manual" in ADAPTERS
-    with pytest.raises(ResearchError, match="no adapter registered"):
-        get_research_adapter("ebay_catalog")
-
-
-def test_manual_adapter_separates_identity_from_retail_facts():
-    """A product page states both what the thing is and what it costs. Those feed
-    different stages under different rules."""
-    from resell.reasoning.adapters.research import ManualResearchAdapter, ResearchQuery
-    from resell.reasoning.research import FactDomain, SourceAuthority
-
-    answers = iter([
-        "https://brooksbrothers.com/p/100220547", "Explorer Slim Suit Jacket",
-        "manufacturer", "Colourway: Navy Mini Houndstooth", "$List price 398 USD", ".",
-    ])
-    adapter = ManualResearchAdapter(prompt=lambda _: next(answers), echo=lambda *a: None)
-    documents = adapter.search(
-        ResearchQuery("Brooks Brothers 100220547", "manufacturer", "confirm the code")
-    )
-
-    assert len(documents) == 1
-    document = documents[0]
-    assert document.authority is SourceAuthority.MANUFACTURER
-    domains = {fact.domain for fact in document.facts}
-    assert domains == {FactDomain.IDENTITY, FactDomain.RETAIL}
-    assert adapter.cost_micros_per_lookup() == 0
-
-    # The system never loaded that page, and the record says so.
-    from resell.reasoning.adapters.research import RetrievalMethod
-
-    assert document.retrieval_method is RetrievalMethod.OPERATOR_TRANSCRIBED
-    assert document.authority_is_asserted is True
-
-
-def test_planning_prompt_forbids_browsing_and_names_the_stop():
-    from resell.reasoning.stages import PLAN_SYSTEM_PROMPT
-
-    assert "planning, not searching" in PLAN_SYSTEM_PROMPT
-    assert "is browsing" in PLAN_SYSTEM_PROMPT
-    # The stop condition is stated as a success, not a fallback.
-    assert "successful outcome" in PLAN_SYSTEM_PROMPT
-    assert "branded_generic" in PLAN_SYSTEM_PROMPT
-    # And the limits of a lookup are named, so it does not search for the unsearchable.
-    assert "cannot tell you the size" in PLAN_SYSTEM_PROMPT
-
-
 # --- candidate matching ------------------------------------------------------
 
 
@@ -4314,296 +4221,188 @@ def test_budget_trimming_records_what_it_withheld():
     assert untouched.trimmed is False
 
 
-def test_no_candidate_matching_is_a_successful_outcome():
-    """A research loop that always selects a product will always find one, and what
-    it finds will increasingly be whatever it was hoping for."""
-    from resell.reasoning.research import select_candidate
-    from resell.reasoning.tools import parse_match_tool_input
-
-    proposal = parse_match_tool_input(
-        {"assessment": {"any_match": False,
-                        "rationale": "both candidates are the 2024 season"},
-         "claims": [
-             {"candidate_ref": "c1", "is_match": False, "rationale": "season differs",
-              "item_evidence": [41], "candidate_evidence": [101],
-              "ruled_out_by": ["candidate is SS2024; observation 41 reads SS2025"]},
-             {"candidate_ref": "c2", "is_match": False, "rationale": "three-button",
-              "item_evidence": [29], "candidate_evidence": [102]},
-         ]},
-        valid_item_evidence={41, 29}, valid_candidate_evidence={101, 102},
-    )
-    assert proposal.any_match is False
-    assert proposal.malformed == []
-    # The non-matches are retained: knowing a candidate was ruled out is worth keeping.
-    assert len(proposal.non_matches) == 2
-
-    selection = select_candidate(proposal.claims, {})
-    assert selection.selected is False
-    assert selection.ruled_out == 2
-    assert "ruled out" in selection.reason
-
-
-def test_found_is_not_selected(tmp_path: Path):
-    """Retrieval produces candidates; only a claim that donates anything counts as a
-    selection. A resemblance from an authoritative source is still a resemblance."""
-    from resell.reasoning.research import DonationScope, SourceAuthority, select_candidate
-    from resell.reasoning.tools import parse_match_tool_input
-
-    similar = parse_match_tool_input(
-        {"assessment": {"any_match": True, "rationale": "a very similar jacket"},
-         "claims": [{"candidate_ref": "c3", "is_match": True, "strength": "similarity",
-                     "rationale": "same brand, navy, two-button",
-                     "item_evidence": [29], "candidate_evidence": [103]}]},
-        valid_item_evidence={29}, valid_candidate_evidence={103},
-    )
-    assert similar.any_match is True          # the model did claim a match
-    selection = select_candidate(similar.claims, {"c3": SourceAuthority.MANUFACTURER})
-    assert selection.selected is False        # and it was not selected
-    assert selection.scope is DonationScope.NONE
-
-    asserted = parse_match_tool_input(
-        {"assessment": {"any_match": True, "rationale": "style code matches"},
-         "claims": [{"candidate_ref": "c4", "is_match": True,
-                     "strength": "identifier_asserted",
-                     "rationale": "SUJT EXP 2BSV SLIM matches the swing tag",
-                     "item_evidence": [41], "candidate_evidence": [101]}]},
-        valid_item_evidence={41}, valid_candidate_evidence={101},
-    )
-    chosen = select_candidate(asserted.claims, {"c4": SourceAuthority.MANUFACTURER})
-    assert chosen.selected is True
-    assert chosen.scope is DonationScope.ATTRIBUTES_MARKED
-
-
-def test_authority_comes_from_retrieval_not_from_the_matcher():
-    """Where a page came from is a fact about retrieval, not a judgment the matcher
-    should make about its own evidence."""
-    from resell.reasoning.research import SourceAuthority, select_candidate
-    from resell.reasoning.tools import parse_match_tool_input
-
-    payload = {"assessment": {"any_match": True, "rationale": "code matches"},
-               "claims": [{"candidate_ref": "c1", "is_match": True,
-                           "strength": "identifier_asserted", "rationale": "code matches",
-                           "item_evidence": [41], "candidate_evidence": [101]}]}
-    proposal = parse_match_tool_input(
-        payload, valid_item_evidence={41}, valid_candidate_evidence={101}
-    )
-    # The parsed claim carries no authority of its own.
-    assert proposal.claims[0].authority is SourceAuthority.UNKNOWN
-
-    # The same claim resolves differently depending on where the document came from.
-    from_manufacturer = select_candidate(
-        proposal.claims, {"c1": SourceAuthority.MANUFACTURER}
-    )
-    from_reseller = select_candidate(proposal.claims, {"c1": SourceAuthority.RESELLER})
-    assert from_manufacturer.selected is True
-    assert from_reseller.selected is False
-
-
-def test_match_claims_need_both_sides_including_non_matches():
-    """"This isn't it" is only useful if it says what conflicts."""
-    from resell.reasoning.tools import parse_match_tool_input
-
-    one_sided = parse_match_tool_input(
-        {"assessment": {"any_match": True, "rationale": "looks right"},
-         "claims": [{"candidate_ref": "c5", "is_match": True,
-                     "strength": "identifier_asserted",
-                     "rationale": "the page describes a navy Explorer Slim",
-                     "item_evidence": [], "candidate_evidence": [101]}]},
-        valid_item_evidence={41}, valid_candidate_evidence={101},
-    )
-    assert one_sided.claims == []
-    assert one_sided.any_match is False       # corrected, not trusted
-    assert any("no evidence about this item" in entry for entry in one_sided.malformed)
-
-    empty_non_match = parse_match_tool_input(
-        {"assessment": {"any_match": False, "rationale": "none of these"},
-         "claims": [{"candidate_ref": "c6", "is_match": False, "rationale": "no",
-                     "item_evidence": [41], "candidate_evidence": []}]},
-        valid_item_evidence={41}, valid_candidate_evidence={101},
-    )
-    assert empty_non_match.claims == []
-
-
-def test_a_match_without_a_strength_is_refused():
-    from resell.reasoning.tools import parse_match_tool_input
-
-    proposal = parse_match_tool_input(
-        {"assessment": {"any_match": True, "rationale": "it matches"},
-         "claims": [{"candidate_ref": "c1", "is_match": True, "rationale": "matches",
-                     "item_evidence": [41], "candidate_evidence": [101]}]},
-        valid_item_evidence={41}, valid_candidate_evidence={101},
-    )
-    assert proposal.claims == []
-    assert any("needs a strength" in entry for entry in proposal.malformed)
-
-
-def test_matching_prompt_names_the_confirmation_bias():
-    from resell.reasoning.stages import MATCH_SYSTEM_PROMPT
-
-    assert "always find one" in MATCH_SYSTEM_PROMPT
-    assert "Resemblance is not identity" in MATCH_SYSTEM_PROMPT
-    assert "allowed to be unidentifiable" in MATCH_SYSTEM_PROMPT
-    # Non-matches are asked for explicitly, not merely permitted.
-    assert "Record the non-matches" in MATCH_SYSTEM_PROMPT
-
-
 # --- the research executor ---------------------------------------------------
 
 
-class _LoopModel:
-    provider = "fake"
-    model = "m"
+#: Which host stands for which authority, so a test can ask for one by name.
+_HOST_FOR = {
+    "manufacturer": "https://www.brooksbrothers.com/p/explorer-slim",
+    "reference": "https://www.discogs.com/release/explorer-slim",
+    "reseller": "https://poshmark.com/listing/explorer-slim",
+    "reseller_2": "https://www.mercari.com/us/item/explorer-slim",
+    "unknown": "https://blog.example.test/explorer-slim",
+}
 
-    def __init__(self, plan, match_fn=None):
-        self.plan = plan
-        self.match_fn = match_fn
-        self.calls = 0
-
-    def estimate_input_tokens(self, request):
-        return 1500
-
-    def rates(self):
-        from resell.reasoning.budget import ModelRates
-
-        return ModelRates()
-
-    def run(self, request):
-        from resell.reasoning.stages import StageResult, Usage
-
-        self.calls += 1
-        payload = self.plan if self.calls == 1 else self.match_fn()
-        return StageResult(
-            tool_input=payload, usage=Usage(1500, 400, {}), latency_ms=800,
-            provider="fake", model="m", stop_reason="tool_use", raw_response={},
-        )
+STYLE_CODE = "SUJT EXP 2BSV SLIM"
 
 
-class _LoopRetriever:
-    provider = "stub"
+class _Hit:
+    """The shape `SearchBackend.find` returns, reduced to what identity reads."""
 
-    def __init__(self, documents):
-        self.documents = documents
-        self.queries: list[str] = []
+    def __init__(self, url, title, snippet=""):
+        self.url, self.title, self.snippet = url, title, snippet
+        self.extra_snippets = ()
 
-    def cost_micros_per_lookup(self):
-        return 5000
 
-    def search(self, query):
+class _Backend:
+    provider = "fake_search"
+
+    def __init__(self, hits):
+        self.hits = hits
+        self.queries = []
+
+    def find(self, query, limit=20):
         self.queries.append(query.query)
-        return self.documents.get(query.query, [])
-
-
-def _candidate_document(authority):
-    from resell.reasoning.adapters.research import RetrievedDocument, RetrievedFact
-    from resell.reasoning.research import FactDomain
-
-    return RetrievedDocument(
-        candidate_ref="cand-a", title="Explorer Slim", url="https://x/p",
-        authority=authority,
-        facts=(
-            RetrievedFact("Colourway: Navy Mini Houndstooth", FactDomain.IDENTITY),
-            RetrievedFact("List price 398 USD", FactDomain.RETAIL),
-        ),
-    )
+        return list(self.hits)[:limit]
 
 
 def _research_fixture(tmp_path: Path, name: str):
     from resell.gateway import Gateway
-    from resell.reasoning.schema import Basis, Observation
+    from resell.reasoning.schema import (
+        Basis, IdentifierObservation, IdentifierScheme, Observation,
+    )
 
     conn = db.connect(tmp_path / f"{name}.db")
     gateway = Gateway(conn, environment="sandbox")
     sku = gateway.ingest_item(purchase_cost_cents=2500).sku
     evidence_id = gateway.record_observation(
         sku,
-        Observation(claim="Style code 'SUJT EXP 2BSV SLIM'", basis=Basis.TEXT_READ,
+        Observation(claim=f"Style code {STYLE_CODE!r}", basis=Basis.TEXT_READ,
                     photo_positions=(2,)),
     ).data["evidence_id"]
+    gateway.record_identifier(
+        sku,
+        IdentifierObservation(IdentifierScheme.STYLE_NUMBER, STYLE_CODE,
+                              photo_position=2),
+    )
+    gateway.propose_identification(sku, brand="Brooks Brothers", category_id="3001")
     return conn, gateway, sku, evidence_id
 
 
-def _run_research(conn, gateway, sku, evidence_id, authority, *, is_match=True,
-                  strength="identifier_asserted", rationale="the style code matches",
-                  lookups=1, budget_lookups=6):
-    from resell.gateway import candidate_evidence
-    from resell.reasoning.budget import LookupBudget, LookupRates, StageBudget
-    from resell.reasoning.research_loop import run_round
+def _run_research(conn, gateway, sku, *sources, title=None):
+    """One deterministic identity round against a fixed set of sources."""
+    from resell.reasoning.budget import LookupBudget, LookupRates
+    from resell.reasoning.identity import run_identity_round
 
-    plan = {
-        "assessment": {"sufficient": False, "proposed_mode": "product_family",
-                       "rationale": "two codes, unclear which is the MPN"},
-        "lookups": [
-            {"query": f"q{i}", "source_kind": "manufacturer", "motivation": "m",
-             "evidence_ids": [evidence_id]}
-            for i in range(lookups)
-        ],
-    }
-
-    def match():
-        cited = [row["id"] for row in candidate_evidence(conn, sku)][:1]
-        return {"assessment": {"any_match": is_match, "rationale": "m"},
-                "claims": [{"candidate_ref": "cand-a", "is_match": is_match,
-                            "strength": strength, "rationale": rationale,
-                            "item_evidence": [evidence_id], "candidate_evidence": cited}]}
-
-    retriever = _LoopRetriever({"q0": [_candidate_document(authority)]})
-    outcome = run_round(
-        conn, gateway, sku, model_adapter=_LoopModel(plan, match),
-        research_adapter=retriever,
-        lookup_budget=LookupBudget(max_lookups=budget_lookups, max_cost_micros=60_000),
-        lookup_rates=LookupRates(), 
-        stage_budget=StageBudget(max_calls=9, max_cost_micros=9_000_000),
+    backend = _Backend([
+        _Hit(_HOST_FOR[s], title or f"Explorer Slim Suit Jacket {STYLE_CODE}")
+        for s in sources
+    ])
+    outcome = run_identity_round(
+        conn, gateway, sku, backend=backend,
+        lookup_budget=LookupBudget(max_lookups=6, max_cost_micros=60_000),
+        lookup_rates=LookupRates(),
     )
-    return outcome, retriever
+    return outcome, backend
 
 
 def test_donation_ignores_how_confident_the_claim_sounds(tmp_path: Path):
-    """Match confidence is not donation authority. A fluent rationale is the
-    cheapest thing a model produces; what a candidate may contribute is computed
-    from the identifier's strength, where the document came from, and whether both
-    sides cite real evidence."""
-    from resell.gateway import citable_candidate_evidence
-    from resell.reasoning.research import SourceAuthority
+    """Match confidence is not donation authority. What a candidate may contribute
+    is computed from the identifier's strength and where the document came from --
+    never from how convincing the page reads.
 
-    conn, gateway, sku, evidence_id = _research_fixture(tmp_path, "authority")
-    outcome, _ = _run_research(
-        conn, gateway, sku, evidence_id, SourceAuthority.MANUFACTURER
+    Asked of `donation_scope` directly. Nothing reaches it through the round while
+    exact resolution is held closed, and this rule is what the hold is protecting:
+    it decides what a resolution would be allowed to do once there is one.
+    """
+    from resell.reasoning.research import (
+        DonationScope, MatchStrength, SourceAuthority, donation_scope,
     )
-    row = conn.execute("SELECT donation_scope FROM product_match").fetchone()
-    assert row["donation_scope"] == "attributes_marked"
-    assert outcome.selection.selected is True
-    assert citable_candidate_evidence(conn, sku)
 
-    # Same strength, same wording, weaker source: donates nothing.
-    conn2, gateway2, sku2, evidence2 = _research_fixture(tmp_path, "reseller")
-    outcome2, _ = _run_research(
-        conn2, gateway2, sku2, evidence2, SourceAuthority.RESELLER
-    )
-    assert conn2.execute(
-        "SELECT donation_scope FROM product_match"
-    ).fetchone()["donation_scope"] == "none"
-    assert outcome2.selection.selected is False
-    assert citable_candidate_evidence(conn2, sku2) == {}
+    firm = MatchStrength.IDENTIFIER_ASSERTED
+    assert donation_scope(firm, SourceAuthority.MANUFACTURER)[0] is (
+        DonationScope.ATTRIBUTES_MARKED)
+    assert donation_scope(firm, SourceAuthority.REFERENCE)[0] is DonationScope.FAMILY_ONLY
+    # Same strength, weaker source: donates nothing.
+    assert donation_scope(firm, SourceAuthority.RESELLER)[0] is DonationScope.NONE
+    assert donation_scope(firm, SourceAuthority.UNKNOWN)[0] is DonationScope.NONE
+    # Similarity donates nothing at any authority at all.
+    assert donation_scope(
+        MatchStrength.SIMILARITY, SourceAuthority.MANUFACTURER)[0] is DonationScope.NONE
 
-    # An emphatic rationale changes nothing.
-    conn3, gateway3, sku3, evidence3 = _research_fixture(tmp_path, "emphatic")
-    _run_research(
-        conn3, gateway3, sku3, evidence3, SourceAuthority.RESELLER,
-        rationale="This is unambiguously and certainly the exact product.",
-    )
-    assert conn3.execute(
-        "SELECT donation_scope FROM product_match"
-    ).fetchone()["donation_scope"] == "none"
+
+def test_a_search_records_its_sources_without_promoting_them(tmp_path: Path):
+    """The lookup still runs and still says what it found. What it may not do is
+    turn that into a resolution."""
+    conn, gateway, sku, _ = _research_fixture(tmp_path, "recorded")
+    outcome, _ = _run_research(conn, gateway, sku, "manufacturer")
+
+    assert outcome.confirmation.provisional is True
+    assert outcome.confirmation.resolved is False
+    rows = list(conn.execute(
+        "SELECT is_match, donation_scope FROM product_match WHERE sku = ?", (sku,)))
+    assert rows and {r["is_match"] for r in rows} == {0}
+    assert {r["donation_scope"] for r in rows} == {"none"}
+
+
+def test_corroboration_does_not_lift_the_ceiling(tmp_path: Path):
+    """Two independent resellers naming the same code is the rule that was replayed
+    and rejected -- it resolved a Brooks Brothers suit jacket as a Barmesa
+    submersible sewage pump. The verdict is recorded; the ceiling does not move."""
+    from resell.reasoning.research_loop import identity_resolution
+    from resell.reasoning.schema import IdentityResolution
+
+    conn, gateway, sku, _ = _research_fixture(tmp_path, "corroborated")
+    outcome, _ = _run_research(conn, gateway, sku, "reseller", "reseller_2")
+
+    assert outcome.confirmation.provisional is True
+    assert outcome.confirmation.resolved is False
+    assert identity_resolution(conn, sku) is IdentityResolution.SEARCHED_NOT_FOUND
+
+
+def test_one_reseller_alone_does_not_lift_the_ceiling(tmp_path: Path):
+    """A single non-authoritative assertion is one stranger's word. It is recorded,
+    because it is half of a corroboration a later search may complete."""
+    from resell.reasoning.research_loop import identity_resolution
+    from resell.reasoning.schema import IdentityResolution
+
+    conn, gateway, sku, _ = _research_fixture(tmp_path, "lonely")
+    outcome, _ = _run_research(conn, gateway, sku, "reseller")
+
+    assert outcome.confirmation.provisional is False
+    assert outcome.confirmation.resolved is False
+    assert identity_resolution(conn, sku) is IdentityResolution.SEARCHED_NOT_FOUND
+    assert conn.execute("SELECT COUNT(*) FROM product_match").fetchone()[0] == 1
+
+
+def test_two_sources_that_describe_different_things_do_not_corroborate(tmp_path: Path):
+    """Both name the code and they agree on nothing else, which is a disagreement
+    rather than a confirmation."""
+    from resell.reasoning.identity import StrongIdentifier, confirm
+    from resell.reasoning.schema import IdentifierScheme
+
+    identifier = StrongIdentifier(1, IdentifierScheme.STYLE_NUMBER, STYLE_CODE)
+    outcome = confirm(identifier, [
+        _Hit(_HOST_FOR["reseller"], f"Explorer Slim Suit Jacket {STYLE_CODE}"),
+        _Hit(_HOST_FOR["reseller_2"], f"Garden Hose Reel {STYLE_CODE}"),
+    ])
+    assert outcome.resolved is False
+    assert "disagreement" in outcome.reason
 
 
 def test_retail_facts_are_never_citable_by_an_aspect(tmp_path: Path):
     """A product page states both what the thing is and what it costs. Only identity
     facts reach identification, whatever the match strength."""
     from resell.gateway import candidate_evidence, citable_candidate_evidence
-    from resell.reasoning.research import SourceAuthority
 
-    conn, gateway, sku, evidence_id = _research_fixture(tmp_path, "retail")
-    _run_research(conn, gateway, sku, evidence_id, SourceAuthority.MANUFACTURER)
+    conn, gateway, sku, _ = _research_fixture(tmp_path, "retail")
+    _run_research(conn, gateway, sku, "manufacturer")
+    gateway.record_candidate_facts(
+        sku, candidate_ref="brooksbrothers.com",
+        source_url=_HOST_FOR["manufacturer"], authority="manufacturer",
+        facts=[("List price $598", "retail", "List price $598")],
+    )
+    # A donating match by hand: the round records none while exact resolution is
+    # held closed, and the separation checked here is a property of the gate rather
+    # than of whatever produced the match.
+    conn.execute(
+        "INSERT INTO product_match (sku, candidate_ref, strength, source_authority, "
+        "rationale, item_evidence, candidate_evidence, is_match, donation_scope, "
+        "created_at) VALUES (?,?,?,?,?,?,?,1,?,?)",
+        (sku, "brooksbrothers.com", "identifier_verified", "manufacturer", "by hand",
+         "[]", "[]", "attributes", db.now_iso()),
+    )
+    conn.commit()
 
     citable = citable_candidate_evidence(conn, sku)
     domains = {
@@ -4616,110 +4415,15 @@ def test_retail_facts_are_never_citable_by_an_aspect(tmp_path: Path):
 def test_candidate_facts_never_enter_the_items_observation_scope(tmp_path: Path):
     """Letting them in would route around the donation gate entirely."""
     from resell.gateway import observations_in_scope
-    from resell.reasoning.research import SourceAuthority
 
-    conn, gateway, sku, evidence_id = _research_fixture(tmp_path, "scope")
-    _run_research(conn, gateway, sku, evidence_id, SourceAuthority.MANUFACTURER)
+    conn, gateway, sku, _ = _research_fixture(tmp_path, "scope")
+    _run_research(conn, gateway, sku, "manufacturer")
 
     kinds = {row["kind"] for row in observations_in_scope(conn, sku)}
     assert "candidate_product_fact" not in kinds
     subjects = {row["subject"] for row in observations_in_scope(conn, sku)}
     assert subjects == {"this_item"}
 
-
-def test_no_match_records_a_negative_and_keeps_the_ruled_out_candidate(tmp_path: Path):
-    from resell.gateway import citable_candidate_evidence
-    from resell.reasoning.research import SourceAuthority
-
-    conn, gateway, sku, evidence_id = _research_fixture(tmp_path, "nomatch")
-    outcome, _ = _run_research(
-        conn, gateway, sku, evidence_id, SourceAuthority.MANUFACTURER, is_match=False
-    )
-
-    assert outcome.selection.selected is False
-    assert outcome.selection.ruled_out == 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM product_match WHERE is_match = 0"
-    ).fetchone()[0] == 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM evidence WHERE kind = 'research_negative'"
-    ).fetchone()[0] == 1
-    assert citable_candidate_evidence(conn, sku) == {}
-
-
-def test_deferred_lookups_are_logged_not_silently_dropped(tmp_path: Path):
-    from resell.reasoning.research import SourceAuthority
-
-    conn, gateway, sku, evidence_id = _research_fixture(tmp_path, "deferred")
-    outcome, retriever = _run_research(
-        conn, gateway, sku, evidence_id, SourceAuthority.MANUFACTURER,
-        lookups=3, budget_lookups=1,
-    )
-    assert len(outcome.performed) == 1
-    assert len(outcome.deferred) == 2
-    assert retriever.queries == ["q0"]
-
-    logged = conn.execute(
-        "SELECT payload FROM events WHERE kind = 'research.lookups_deferred'"
-    ).fetchone()
-    assert logged is not None
-    payload = json.loads(logged["payload"])
-    assert len(payload["deferred"]) == 2
-    # The motivation survives, so a deferred lookup can be re-planned on its merits.
-    assert payload["deferred"][0]["motivation"]
-    assert "affordable" in payload["reason"]
-
-
-def test_dry_run_plans_without_retrieving(tmp_path: Path):
-    """Planning is not browsing: nothing is fetched before a validated plan exists,
-    and a dry run stops there."""
-    from resell.gateway import candidate_evidence
-    from resell.reasoning.budget import LookupBudget, LookupRates, StageBudget
-    from resell.reasoning.research import SourceAuthority
-    from resell.reasoning.research_loop import run_round
-
-    conn, gateway, sku, evidence_id = _research_fixture(tmp_path, "dry")
-    plan = {"assessment": {"sufficient": False, "proposed_mode": "product_family",
-                           "rationale": "r"},
-            "lookups": [{"query": "q0", "source_kind": "manufacturer", "motivation": "m",
-                         "evidence_ids": [evidence_id]}]}
-    retriever = _LoopRetriever({"q0": [_candidate_document(SourceAuthority.MANUFACTURER)]})
-
-    outcome = run_round(
-        conn, gateway, sku, model_adapter=_LoopModel(plan), research_adapter=retriever,
-        lookup_budget=LookupBudget(), lookup_rates=LookupRates(),
-        stage_budget=StageBudget(max_calls=9, max_cost_micros=9_000_000), dry_run=True,
-    )
-    assert outcome.performed == ["q0"]
-    assert retriever.queries == []
-    assert candidate_evidence(conn, sku) == []
-
-
-def test_planner_sufficiency_stops_before_any_retrieval(tmp_path: Path):
-    """"I have enough to call this branded_generic" ends the round, and the reason is
-    recorded rather than merely acted on."""
-    from resell.reasoning.budget import LookupBudget, LookupRates, StageBudget
-    from resell.reasoning.research_loop import run_round
-
-    conn, gateway, sku, _ = _research_fixture(tmp_path, "sufficient")
-    plan = {"assessment": {
-        "sufficient": True, "proposed_mode": "branded_generic",
-        "rationale": "Brand established from the pocket label; no model number on any "
-                     "examined surface, so searching for one will not find it.",
-    }, "lookups": []}
-    retriever = _LoopRetriever({})
-
-    outcome = run_round(
-        conn, gateway, sku, model_adapter=_LoopModel(plan), research_adapter=retriever,
-        lookup_budget=LookupBudget(), lookup_rates=LookupRates(),
-        stage_budget=StageBudget(max_calls=9, max_cost_micros=9_000_000),
-    )
-    assert outcome.stopped == "sufficient"
-    assert retriever.queries == []
-    negative = conn.execute(
-        "SELECT payload FROM evidence WHERE kind = 'research_negative'"
-    ).fetchone()
-    assert "branded_generic" in negative["payload"]
 
 
 def test_operator_transcription_is_distinguishable_from_a_fetch(tmp_path: Path):
@@ -4757,43 +4461,6 @@ def test_operator_transcription_is_distinguishable_from_a_fetch(tmp_path: Path):
     assert rows["cand-fetched"]["source"] == "https://brand.example/p/2"
     # The claimed URL is still kept — it is a claim, not a fabrication.
     assert rows["cand-typed"]["source_url"] == "https://brand.example/p/1"
-
-
-def test_transcription_provenance_reaches_the_matcher(tmp_path: Path):
-    """The matcher should know it is reading someone's account of a page rather than
-    the page, because that bears on how much weight the correspondence deserves."""
-    from resell.gateway import Gateway
-    from resell.reasoning.adapters.research import RetrievalMethod
-    from resell.reasoning.research import FactDomain, SourceAuthority
-    from resell.reasoning.research_loop import _render_candidates
-
-    conn = db.connect(tmp_path / "rendered.db")
-    gateway = Gateway(conn, environment="sandbox")
-    sku = gateway.ingest_item(purchase_cost_cents=2500).sku
-    gateway.record_candidate_facts(
-        sku, candidate_ref="cand-typed", source_url="https://brand.example/p/1",
-        authority=str(SourceAuthority.MANUFACTURER),
-        facts=[("Colourway: Navy", str(FactDomain.IDENTITY))],
-        retrieval_method=str(RetrievalMethod.OPERATOR_TRANSCRIBED),
-    )
-    rendered = _render_candidates(conn, sku)
-    assert "operator-transcribed" in rendered
-    assert "did not fetch" in rendered
-
-
-def test_manual_adapter_tells_the_operator_what_is_being_recorded():
-    """Recording a claim as though it were verified, without saying so to the person
-    making it, is the kind of thing that surprises someone months later."""
-    from resell.reasoning.adapters.research import ManualResearchAdapter, ResearchQuery
-
-    echoed: list[str] = []
-    answers = iter(["https://brand.example/p", "Title", "manufacturer", "Navy", "."])
-    adapter = ManualResearchAdapter(prompt=lambda _: next(answers), echo=echoed.append)
-    adapter.search(ResearchQuery("q", "manufacturer", "why"))
-
-    notice = " ".join(echoed)
-    assert "operator_transcribed" in notice
-    assert "does not fetch" in notice
 
 
 # --- donation reaching mapping -----------------------------------------------
@@ -4956,199 +4623,6 @@ def test_family_level_aspect_list_is_conservative():
         assert aspect_is_specific(specific) is True
 
 
-def test_research_dry_run_records_nothing(tmp_path: Path, monkeypatch):
-    """"Planning, not browsing" has to hold at the CLI too: a dry run that quietly
-    fetched would make the distinction decorative."""
-    import argparse
-
-    monkeypatch.setenv("RESELL_DB", str(tmp_path / "cli.db"))
-    monkeypatch.setenv("EBAY_ENV", "sandbox")
-    monkeypatch.setenv("EBAY_CLIENT_ID", "a")
-    monkeypatch.setenv("EBAY_CLIENT_SECRET", "b")
-    monkeypatch.setenv("EBAY_RUNAME", "X-Y-Z-abc")
-
-    from resell import cli_item
-    from resell.gateway import Gateway, candidate_evidence
-    import resell.reasoning.adapters as model_adapters
-    import resell.reasoning.adapters.research as research_adapters
-    from resell.reasoning.schema import Basis, Observation
-
-    conn = db.connect(tmp_path / "cli.db")
-    gateway = Gateway(conn, environment="sandbox")
-    sku = gateway.ingest_item(purchase_cost_cents=2500).sku
-    gateway.record_observation(
-        sku, Observation(claim="style code SUJT EXP", basis=Basis.TEXT_READ,
-                         photo_positions=(2,)),
-    )
-
-    plan = {"assessment": {"sufficient": False, "proposed_mode": "product_family",
-                           "rationale": "two codes, unclear which is the MPN"},
-            "lookups": [{"query": "q0", "source_kind": "manufacturer",
-                         "motivation": "settle it", "evidence_ids": [1]}]}
-    monkeypatch.setitem(
-        model_adapters.ADAPTERS, "anthropic", lambda **kw: _LoopModel(plan)
-    )
-    retriever = _LoopRetriever({"q0": []})
-    monkeypatch.setitem(research_adapters.ADAPTERS, "manual", lambda **kw: retriever)
-
-    assert cli_item.cmd_item_research(argparse.Namespace(
-        sku=sku, category=None, provider="anthropic", research_provider="manual",
-        dry_run=True, rejudge=False,
-    )) == 0
-
-    assert retriever.queries == []
-    assert candidate_evidence(conn, sku) == []
-    assert conn.execute("SELECT COUNT(*) FROM research_lookup").fetchone()[0] == 0
-
-
-def test_research_round_records_provenance_and_gates_retail(tmp_path: Path, monkeypatch):
-    """The whole loop, end to end: what an operator pastes is recorded as their
-    account, identity facts become citable, retail facts do not."""
-    import argparse
-
-    monkeypatch.setenv("RESELL_DB", str(tmp_path / "loop.db"))
-    monkeypatch.setenv("EBAY_ENV", "sandbox")
-    monkeypatch.setenv("EBAY_CLIENT_ID", "a")
-    monkeypatch.setenv("EBAY_CLIENT_SECRET", "b")
-    monkeypatch.setenv("EBAY_RUNAME", "X-Y-Z-abc")
-
-    from resell import cli_item
-    from resell.gateway import Gateway, candidate_evidence, citable_candidate_evidence
-    import resell.reasoning.adapters as model_adapters
-    import resell.reasoning.adapters.research as research_adapters
-    from resell.reasoning.adapters.research import ManualResearchAdapter
-    from resell.reasoning.schema import Basis, Observation
-
-    conn = db.connect(tmp_path / "loop.db")
-    gateway = Gateway(conn, environment="sandbox")
-    sku = gateway.ingest_item(purchase_cost_cents=2500).sku
-    gateway.record_observation(
-        sku, Observation(claim="style code SUJT EXP 2BSV SLIM", basis=Basis.TEXT_READ,
-                         photo_positions=(2,)),
-    )
-
-    plan = {"assessment": {"sufficient": False, "proposed_mode": "product_family",
-                           "rationale": "unclear which code is the MPN"},
-            "lookups": [{"query": "q0", "source_kind": "manufacturer",
-                         "motivation": "settle it", "evidence_ids": [1]}]}
-
-    def match():
-        rows = candidate_evidence(conn, sku)
-        return {"assessment": {"any_match": True, "rationale": "the code matches"},
-                "claims": [{"candidate_ref": rows[0]["candidate_ref"], "is_match": True,
-                            "strength": "identifier_asserted",
-                            "rationale": "style code appears on both",
-                            "item_evidence": [1],
-                            "candidate_evidence": [rows[0]["id"]]}]}
-
-    monkeypatch.setitem(
-        model_adapters.ADAPTERS, "anthropic", lambda **kw: _LoopModel(plan, match)
-    )
-    answers = iter([
-        "https://brand.example/p/1", "Slim Fit Suit Jacket", "manufacturer",
-        "Colourway: Navy Mini Houndstooth", "$List price 398 USD", ".",
-    ])
-    monkeypatch.setitem(
-        research_adapters.ADAPTERS, "manual",
-        lambda **kw: ManualResearchAdapter(
-            prompt=lambda _: next(answers, ""), echo=lambda *a: None
-        ),
-    )
-
-    assert cli_item.cmd_item_research(argparse.Namespace(
-        sku=sku, category=None, provider="anthropic", research_provider="manual",
-        dry_run=False, rejudge=False,
-    )) == 0
-
-    rows = candidate_evidence(conn, sku)
-    assert len(rows) == 2
-    # Every fact is recorded as the operator's account, not as a fetch.
-    assert {row["retrieval_method"] for row in rows} == {"operator_transcribed"}
-    assert {row["source"] for row in rows} == {"operator"}
-
-    citable = citable_candidate_evidence(conn, sku)
-    domains = {row["fact_domain"]: row["id"] in citable for row in rows}
-    assert domains == {"identity": True, "retail": False}
-
-    match_row = conn.execute("SELECT * FROM product_match WHERE sku = ?", (sku,)).fetchone()
-    assert match_row["donation_scope"] == "attributes_marked"
-    assert match_row["source_authority"] == "manufacturer"
-
-
-def test_manual_adapter_survives_multiline_paste(tmp_path: Path):
-    """The exact failure from the first real research round: a two-line page title
-    fed its second line to the authority prompt, which silently accepted it and fell
-    back to general_web — quietly changing what the page was allowed to contribute —
-    and the authority typed afterwards became a fact.
-
-    Free text now comes last, so overflow lands where many lines are expected, and
-    authority is re-prompted rather than guessed."""
-    from resell.reasoning.adapters.research import ManualResearchAdapter, ResearchQuery
-    from resell.reasoning.research import FactDomain, SourceAuthority
-
-    lines = iter([
-        "https://bb.example/p",
-        "Brooks Brothers Explorer Collection",   # title overflows onto the next line
-        "Slim Fit Wool Suit Jacket",
-        "manufacturer",
-        "Product line: Explorer Collection", "Fit: Slim Fit", "",
-        "Item number: MK01227", "$List price 398 USD", ".",
-    ])
-    echoed: list[str] = []
-    adapter = ManualResearchAdapter(prompt=lambda _: next(lines, "."), echo=echoed.append)
-    document = adapter.search(ResearchQuery("q", "manufacturer", "why"))[0]
-
-    assert document.authority is SourceAuthority.MANUFACTURER
-    assert any("not recognised" in line for line in echoed)
-    claims = [fact.claim for fact in document.facts]
-    assert "Item number: MK01227" in claims          # the blank did not truncate
-    assert "manufacturer" not in claims              # nor did the authority become a fact
-    assert [f.domain for f in document.facts].count(FactDomain.RETAIL) == 1
-
-
-def test_facts_loop_cannot_spin(tmp_path: Path):
-    """Requiring an explicit terminator fixed truncation and introduced a worse
-    failure: a prompt returning empty forever never stopped. Found by the suite
-    hanging."""
-    from resell.reasoning.adapters.research import ManualResearchAdapter, ResearchQuery
-
-    always_blank = ManualResearchAdapter(prompt=lambda _: "", echo=lambda *a: None)
-    assert always_blank.search(ResearchQuery("q", "manufacturer", "why")) == []
-
-    lines = iter(["https://x", "T", "manufacturer", "one", "", "two", "", "", "ignored"])
-    two_blanks = ManualResearchAdapter(prompt=lambda _: next(lines, ""), echo=lambda *a: None)
-    document = two_blanks.search(ResearchQuery("q", "manufacturer", "why"))[0]
-    assert [fact.claim for fact in document.facts] == ["one", "two"]
-
-
-def test_authority_is_never_silently_defaulted():
-    """Authority decides what a match may donate, so guessing it from an empty or
-    mistyped answer silently changes what a page may contribute."""
-    from resell.reasoning.adapters.research import ManualResearchAdapter, ResearchQuery
-    from resell.reasoning.research import SourceAuthority
-
-    def run(answers):
-        lines = iter(answers)
-        adapter = ManualResearchAdapter(
-            prompt=lambda _: next(lines, "."), echo=lambda *a: None
-        )
-        return adapter.search(ResearchQuery("q", "manufacturer", "why"))[0]
-
-    # Blank then nonsense then valid: re-prompted twice, resolves correctly.
-    assert run(["https://x", "T", "", "nonsense", "manu", "Fact", "."]).authority \
-        is SourceAuthority.MANUFACTURER
-    # An unambiguous abbreviation resolves.
-    assert run(["https://x", "T", "res", "Fact", "."]).authority is SourceAuthority.RESELLER
-    # Repeated failure records unknown, which donates nothing, rather than guessing.
-    assert run(["https://x", "T", "x", "y", "z", "Fact", "."]).authority \
-        is SourceAuthority.UNKNOWN
-
-    from resell.reasoning.research import DonationScope, MatchStrength, donation_scope
-
-    scope, _ = donation_scope(MatchStrength.IDENTIFIER_ASSERTED, SourceAuthority.UNKNOWN)
-    assert scope is DonationScope.NONE
-
-
 # --- mode declaration --------------------------------------------------------
 
 
@@ -5163,7 +4637,7 @@ def _mode_fixture(tmp_path: Path, name: str, *, identifier=True, negative=None,
     gateway = Gateway(conn, environment="sandbox")
     sku = gateway.ingest_item(purchase_cost_cents=1, identification_effort=effort).sku
     gateway.record_observation(
-        sku, Observation(claim="Interior label reads BROOKS BROTHERS brand",
+        sku, Observation(claim="Interior label reads BROOKS BROTHERS",
                          basis=Basis.TEXT_READ, photo_positions=(3,)),
     )
     if identifier:
@@ -5174,7 +4648,12 @@ def _mode_fixture(tmp_path: Path, name: str, *, identifier=True, negative=None,
     if negative is not None:
         db.kv_set(conn, f"identity_search:{sku}", json.dumps(negative))
     gateway.propose_identification(
-        sku, title="Blazer", category_id="3001", condition_id="NEW"
+        sku, title="Blazer", category_id="3001", condition_id="NEW",
+        # The gate reads the brand off the identification and then looks for an
+        # observation that names it. It used to run `LIKE '%brand%'` over the
+        # observation prose, which is why this fixture's label had to say the word
+        # "brand" to pass and why MP-000057, whose brand really is Dell, scored zero.
+        brand="Brooks Brothers",
     )
     return conn, gateway, sku
 
@@ -5242,60 +4721,6 @@ def test_mode_rationale_keeps_both_the_argument_and_the_verdict(tmp_path: Path):
     assert "the swing tag is unambiguous" in rationale     # what was argued
     assert "[gate]" in rationale                            # what was decided
     assert "which product they denote" in rationale
-
-
-def test_rejudge_reuses_retrieved_candidates_without_a_lookup(tmp_path: Path):
-    """Retrieval and judging fail independently. When the matcher returns nothing
-    usable the documents are still there and already paid for; making the operator
-    search again would charge twice for one mistake."""
-    from resell.gateway import Gateway, candidate_evidence, citable_candidate_evidence
-    from resell.reasoning.research import FactDomain, SourceAuthority
-    from resell.reasoning.research_loop import rejudge
-    from resell.reasoning.schema import Basis, Observation
-
-    conn = db.connect(tmp_path / "rejudge.db")
-    gateway = Gateway(conn, environment="sandbox")
-    sku = gateway.ingest_item(purchase_cost_cents=1).sku
-    observation = gateway.record_observation(
-        sku, Observation(claim="style code SUJT EXP 2BSV SLIM", basis=Basis.TEXT_READ,
-                         photo_positions=(2,)),
-    ).data["evidence_id"]
-    ids = gateway.record_candidate_facts(
-        sku, candidate_ref="cand-a", source_url="https://brand.example/p",
-        authority=str(SourceAuthority.MANUFACTURER),
-        facts=[("Colourway: Navy", str(FactDomain.IDENTITY))],
-    )
-
-    # Nothing citable yet: retrieval happened, judging did not.
-    assert citable_candidate_evidence(conn, sku) == {}
-
-    def match():
-        return {"assessment": {"any_match": True, "rationale": "the code matches"},
-                "claims": [{"candidate_ref": "cand-a", "is_match": True,
-                            "strength": "identifier_asserted",
-                            "rationale": "style code on both",
-                            "item_evidence": [observation],
-                            "candidate_evidence": [ids[0]]}]}
-
-    outcome = rejudge(
-        conn, gateway, sku, model_adapter=_LoopModel(match(), match),
-    )
-    assert outcome.selection.selected is True
-    assert citable_candidate_evidence(conn, sku) == {ids[0]: "attributes_marked"}
-    # No lookup was performed.
-    assert conn.execute("SELECT COUNT(*) FROM research_lookup").fetchone()[0] == 0
-    assert len(candidate_evidence(conn, sku)) == 1
-
-
-def test_rejudge_without_candidates_says_so(tmp_path: Path):
-    from resell.gateway import Gateway
-    from resell.reasoning.research_loop import rejudge
-
-    conn = db.connect(tmp_path / "empty.db")
-    gateway = Gateway(conn, environment="sandbox")
-    sku = gateway.ingest_item(purchase_cost_cents=1).sku
-    outcome = rejudge(conn, gateway, sku, model_adapter=_LoopModel({}))
-    assert outcome.stopped == "no_candidates"
 
 
 def test_identity_resolution_is_computed_from_the_record(tmp_path: Path):

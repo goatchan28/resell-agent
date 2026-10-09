@@ -41,5 +41,10 @@
     <button type="submit" class="c-big-button" data-busy="Uploading…">
       {{ submit_label | default('Start') }}
     </button>
+
+    {# Where an interrupted upload lands, instead of the browser's error page.
+       Empty and hidden until something goes wrong; `aria-live` so a screen
+       reader hears it without the focus moving. #}
+    <p class="c-upload-problem" data-upload-problem hidden aria-live="polite"></p>
   </div>
 </form>

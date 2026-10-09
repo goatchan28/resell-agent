@@ -142,3 +142,249 @@ week left a **live** listing on the account that the application never knew
 existed. A reconciliation path that can answer *"what does eBay think we have?"*
 belongs in V2 as a first-class operation, not as an investigation someone runs by
 hand after noticing something odd in a UI.
+
+---
+
+## 3. Condition: the next deterministic candidate
+
+**From the MP-000056/57/58 model-call audit, 2026-08-28.** Not a defect. A note
+about where the next stage boundary should move, recorded now so the reasoning
+survives.
+
+`condition_stage` is built with **`images=()`**. It never sees a photograph. Its
+entire input is the rendered observation text that `observe` already produced,
+plus the list of grades eBay allows for the category. On all three V2 items every
+cited evidence id was an observation `observe` had already written, and all three
+graded `USED_EXCELLENT` on the same reasoning: no packaging, light wear
+consistent with use, no cracks or missing parts.
+
+So the call adds no perception. It is a pure text-to-text function from
+observations onto a category-supplied vocabulary — the same shape as the pricing
+stages V2 replaced with static rules.
+
+**Why it cannot simply move into `observe`.** The allowed grades are eBay's, and
+they are per-category: 1000 is "New with tags" in clothing and "Brand New"
+elsewhere. The category is not known until after identification and aspect
+mapping, and `observe` runs before both. Folding the grade choice into `observe`
+would mean grading against a vocabulary that does not exist yet.
+
+The move is therefore *determinism*, not *merging*: a rule that reads the
+recorded wear/damage/packaging observations and picks from the category's ladder,
+with a model call kept only as a fallback for the cases a rule genuinely cannot
+call. Cost at stake is small — about $0.013 and 6s per item — so this is a
+simplicity and auditability change, not a cost one. Do it after identification.
+
+---
+
+## 4. A response that failed to parse must not be recorded as a usable stage
+
+**From MP-000057, 2026-08-28.** Its `research_plan` response came back with a
+literal `<parameter name="lookups">` tag inside the `assessment` string. The
+parser could not read it, returned `sufficient=False, lookups=0`, and the loop
+correctly stopped at `plan_unusable` without recording anything. Both lookups the
+planner had asked for were discarded.
+
+The ledger records that call as **`completed`**. So the audit trail says a stage
+ran successfully and produced a usable result, when what actually happened was
+that the provider was billed for an unreadable answer.
+
+`CallStatus.PARSE_FAILED` exists for exactly this and is used correctly by
+`observe`, `map_aspects`, `condition` and both drafting stages. The research
+loop's `_run_stage` is the outlier: it finalises `COMPLETED` unconditionally, on
+every path that does not raise `AdapterError`.
+
+This is the same class of defect as the `comp_research_concluded` miscount — a
+stage reporting health it did not have. The rule it violates: **the ledger
+records what the provider did *and* whether we could use it; those are two
+different facts and only one of them is about the provider.** Any stage whose
+parse produced no usable output must finalise `PARSE_FAILED`, which already
+counts as billed, so cost accounting is unaffected.
+
+---
+
+## 5. `RESOLVED` is a pricing decision, so it has to be earned in pricing terms
+
+**From the identity replay of 2026-08-28.** The finding that stopped exact
+resolution shipping, recorded because the *reasoning* that produced the bad rule
+was sound and would be produced again.
+
+The rule: an authoritative source naming the identifier resolves it outright;
+otherwise two independent registrable domains must both name it and agree on
+something else. The argument for it was that *which product this is* and *whose
+description may attach to it* are different questions — a reseller can be right
+about a model number and wrong about a colourway — so corroboration could lift the
+comparability ceiling while `donation_scope` still refused every attribute. That
+argument is still correct. The rule built on it was not.
+
+### What the replay measured
+
+All 54 historical items with usable observations, replayed against the live search
+backend, each reseeded as a fresh item carrying its own observations and its
+negative finding recovered from the stored `observe` response.
+
+| | |
+|---|---|
+| tier 0 / 1 / 2 | 6 / 11 / 37 |
+| resolved | 13 (24% of items, 35% of searched) |
+| **wrong** | **6 of 13** |
+| runtime | 17.1s total, 0.46s mean per searched item, zero model calls |
+
+### The six
+
+`MP-000003` is the one to remember. A Brooks Brothers Explorer Slim suit jacket
+whose style code `SUJT EXP 2BSV SLIM` reduces to the fragment `2bsv`, with no
+brand on the identification to disambiguate it. Three independent plumbing
+suppliers agreed on *barmesa, pump, sewage, stainless*. The agreement was real,
+independent, and about a submersible sewage pump.
+
+Three more (`MP-000010`, `MP-000013`, `MP-000023`) resolved Bowflex `SelectTech`,
+which is a product **line**: the 552 and the 1090 differ by roughly 2x in price, so
+`same_product` between them is a pricing error rather than a rounding one.
+`MP-000017` did the same with `DJI Osmo`, confirmed by pages for an Osmo Pocket 3
+and an Osmo 360. `MP-000005` resolved a bare `A3211` on one reference-authority
+hit; the same string is a New Jersey senate bill and an Aegean Airlines flight.
+
+### The assumption that failed
+
+**That independent sources agreeing is evidence.** The agreement test intersected
+descriptive tokens while excluding only the identifier — so the shared word was
+routinely the *brand the query itself supplied*. Bowflex "agreed on" `bowflex`;
+NERF on `nerf`. The sources agreed by construction, because we had told them what
+to say.
+
+Underneath that: **an identifier that names a product line is indistinguishable
+here from one that names a product**, and nothing in a title tells you which you
+have.
+
+And it failed the other way too. `MP-000018` is an ISBN with a valid check digit
+and nineteen sources unanimously describing the same book — rejected, because the
+intersection has to be unanimous and one title used none of the shared words. The
+whole seven-item Canon group failed the same way, on a manual PDF titled
+`EOS REBEL T6i (W) EOS 750D (W)`.
+
+A rule wrong in both directions is not mistuned. Tuning a threshold would have
+traded one class of error for the other, which is why the replacement is a design
+problem and not a constant.
+
+### What was kept
+
+Everything except the promotion. Tier routing, the single static lookup, the
+recorded sources, the provisional verdict, the structured mode gate, the
+negative-finding persistence — all shipped. `confirm()` still computes what the
+rule concluded and writes it into the record; `_held_closed()` is the single exit
+that refuses to act on it. `is_match` is left `0`, which makes `RESOLVED`
+unreachable through *storage* rather than through a flag someone could flip: a
+future rule has to be written, not enabled.
+
+The corpus is `tests/fixtures/identity_replay_cases.py` — 14 cases, 120 real
+search results, each with the verdict a correct rule should reach.
+
+### Known limitation, left alone deliberately
+
+`mode_evidence` cites the observations that *name* the identification's brand, as a
+literal substring. On 1 of the 42 branded items in the history that fails:
+MP-000024's identification says `Beats by Dr. Dre` and its observations say
+`Beats`. The item falls to `unresolved` rather than `product_family`.
+
+Left as it is. It fails in the safe direction — a mode is withheld, never invented —
+and the fix is a brand-name matching rule, which is the beginning of exactly the
+kind of matching complexity the pricing matcher had to be talked back from twice.
+Worth revisiting alongside the exact-identity rule, where the same question
+(*is this string naming this thing?*) has to be answered properly anyway.
+
+---
+
+## 6. One in five drafting calls arrives malformed
+
+**From the MP-000062/63 audit, 2026-08-28.** Recorded, not acted on.
+
+Across all 100 draft-family calls in the project's history, **20 emitted tool
+arguments with literal `<parameter name="...">` markup run together inside a
+field** — `marketing_copy` swallowing `claims`, `description` swallowing
+`marketing_copy`. MP-000063 hit it twice in one item, on both of its drafts.
+
+Every one was recovered by `unwrap_tool_input`, so nothing was lost and no
+malformed copy reached a listing. That recovery is why this is a note and not a
+defect: the failure is real, its cost today is zero, and the machinery that makes
+it zero is already tested (`tests/test_tool_input_recovery.py`).
+
+What makes it worth writing down is the rate. 20% is not an anomaly to be
+tolerated quietly; it means a fifth of drafting calls depend on a recovery path
+to produce anything at all, and the day that path meets a variant it does not
+recognise, the failure will look like a drafting problem rather than an encoding
+one. It has already appeared in three different stages — the identification
+planner (MP-000005, MP-000057), the drafter (MP-000009), and now both drafts of
+MP-000063 — so it is a property of how the provider encodes arguments and not of
+any one prompt.
+
+Worth measuring against the next model version before spending anything on it.
+The cheap check is a count: how many draft-family calls carry
+`XML run together` in `model_call.error`, over how many calls.
+
+---
+
+## 7. A citation that exists is not a citation that supports the claim
+
+**From MP-000065, 2026-08-28.** Open. Documented rather than fixed, because the
+obvious fix is worse than the defect.
+
+The aspect gate validates a candidate's citations like this:
+
+```python
+ids = [i for i in ids if i in valid_evidence_ids or i in citable_candidates]
+if not ids:
+    ... discard the candidate
+```
+
+That is a **membership** test. It asks whether the evidence id is real and in
+scope for this item. It does not, and cannot, ask whether the cited claim has
+anything to do with the value being proposed.
+
+MP-000065 is a crocheted yarn hacky sack. Its aspect mapper proposed
+`Material: Wood` three times. The first two carried `evidence_ids: []` and were
+correctly discarded. The third cited evidence **2502**:
+
+> *"The item is made of a knitted or crocheted fabric, likely cotton or acrylic
+> yarn."*
+
+The gate accepted it, and the item published to Sandbox as listing
+`110590435801` with **Material: Wood**, justified by an observation that says
+yarn. The citation was real, in scope, and about the right object. It simply did
+not support the value.
+
+### Why the obvious fix is not the fix
+
+The tempting rule is "the value must appear in the cited text". It fails
+immediately on the cases the system is built to serve:
+
+- `Material: Wool` cited to *"crocheted from wool yarn"* passes, but
+  `Material: Cotton/Acrylic Yarn` cited to the same sentence fails on the slash.
+- `Colour: Navy` cited to *"a dark blue jacket"* fails, though it is right.
+- `Type: Digital SLR` cited to *"a DSLR camera"* fails on an abbreviation.
+
+Every one of those is a legitimate mapping from an observation to a marketplace
+vocabulary, which is the stage's entire job. A substring test would refuse the
+work and accept `Wood` anyway if the word ever appeared in a background
+observation -- which is exactly what MP-000063's *"wooden chair backs"* would have
+provided. **It would reject the right answers and admit the wrong one.**
+
+### What the shape of a real fix looks like
+
+The stage already emits `unsupported_reason` alongside its candidates, and on the
+two discarded attempts it said `insufficient_evidence` *while still proposing a
+value*. A candidate that declares insufficient evidence and proposes a value at
+the same time is self-contradictory on its face, and that contradiction is
+checkable without reading either the value or the claim. That is one cheap,
+deterministic signal available today.
+
+Beyond it, the honest options are a second model call asked only "does this claim
+support this value", or a human check on values whose aspect is free text and
+whose citation is an `inference` rather than a `text_read`. Both cost something.
+Neither should be chosen before somebody has counted how often this actually goes
+wrong -- one confirmed instance is not a rate.
+
+**Related but separate:** the free-text rendering fix (§ the `Wood` investigation)
+removed the *pressure* that produced this. Replayed against a corrected form, six
+samples across both hacky sacks proposed `Fabric`, `Cotton/Yarn (Crochet)` and
+similar, and `Wood` not once. That lowers the frequency; it does not close the
+hole.
